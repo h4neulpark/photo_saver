@@ -44,6 +44,7 @@ const navigation = [
   { id: 'incoming', title: 'Incoming Library', icon: 'inbox' },
   { id: 'events', title: '이벤트 관리', icon: 'calendar' },
   { id: 'archive', title: '아카이브 전송', icon: 'transfer' },
+  { id: 'catalog', title: '파일 기록', icon: 'file' },
   { id: 'settings', title: '설정', icon: 'settings' },
 ];
 
@@ -73,9 +74,12 @@ const view = {
   sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '',
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
+  catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
+  catalog: null, catalogTab: 'files', catalogQuery: '', catalogScope: 'all', catalogPage: 1, catalogBusy: false, catalogError: '',
 };
 let refreshTimer;
 let stateRequest = 0;
+let catalogRequest = 0;
 
 const page = document.getElementById('page');
 const nav = document.getElementById('navigation');
@@ -131,6 +135,7 @@ async function syncState() {
     if (jobActive(previousJob) && state.job?.id === previousJob.id && !jobActive()) {
       announce(jobMessage(state.job));
       if (state.job.kind === 'upload' && view.archive && view.page === 'archive') await browseArchive(view.archivePath);
+      if (view.page === 'catalog') await loadCatalog();
     }
     const sourceKeys = new Set(sourceFiles().flatMap(sourceAssetKeys));
     for (const key of view.sourceSelection) if (!sourceKeys.has(key)) view.sourceSelection.delete(key);
@@ -639,6 +644,120 @@ async function browseArchive(path = view.archivePath) {
   }
 }
 
+function catalogTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? '—' : dateTimeFormatter(state.timezone).format(date);
+}
+
+function catalogHash(row) {
+  return `<div class="catalog-hash"><code>${escapeHtml(row.sha || '해시 미기록')}</code>
+    ${row.sha ? button('copy-record-hash', '복사', { glyph: 'copy', extra: `data-value="${escapeHtml(row.sha)}" aria-label="${escapeHtml(row.name)} SHA-256 복사"` }) : ''}</div>`;
+}
+
+function catalogFolderLabel() {
+  const id = view.catalogEvent;
+  if (id === 'all') return '전체 파일';
+  if (id === 'unassigned') return '미배정';
+  const folder = view.catalog?.folders?.find(item => item.id === id);
+  if (!folder) return '이벤트 정보 없음';
+  const parent = view.catalog.folders.find(item => item.id === folder.parent_id);
+  return [parent?.name, folder.name, view.catalogDevice].filter(Boolean).join(' / ');
+}
+
+function catalogFolderTree() {
+  const data = view.catalog;
+  const folders = data?.folders || [];
+  const folderButton = (event, device, label, count, depth = 0) => {
+    const selected = view.catalogEvent === event && view.catalogDevice === device;
+    return `<button type="button" class="catalog-folder${selected ? ' active' : ''}" data-action="catalog-folder" data-value="${escapeHtml(JSON.stringify({ event, device }))}"
+      ${selected ? 'aria-current="location"' : ''} title="${escapeHtml(label)}" style="--folder-depth:${depth}">${icon('folder')}<span>${escapeHtml(label)}</span><span class="catalog-folder-count">${count}</span></button>`;
+  };
+  const branch = (folder, depth = 0) => {
+    const children = folders.filter(item => item.parent_id === folder.id);
+    const count = folder.count + children.reduce((sum, item) => sum + item.count, 0);
+    const expandable = children.length || folder.devices.length;
+    const expanded = view.catalogExpanded.has(folder.id);
+    return `<li><div class="catalog-folder-row" style="--folder-depth:${depth}">
+      ${expandable ? `<button type="button" class="catalog-folder-toggle" data-action="toggle-catalog-folder" data-value="${escapeHtml(folder.id)}" aria-expanded="${expanded}" aria-label="${escapeHtml(folder.name)} 하위 폴더 ${expanded ? '접기' : '펼치기'}">${icon('right')}</button>` : '<span class="catalog-folder-spacer"></span>'}
+      ${folderButton(folder.id, '', folder.name, count, depth)}</div>
+      ${expanded ? `<ul>${children.map(child => branch(child, depth + 1)).join('')}${folder.devices.map(device => `<li>${folderButton(folder.id, device.name, device.name, device.count, depth + 1)}</li>`).join('')}</ul>` : ''}
+    </li>`;
+  };
+  const count = view.catalogTab === 'archives' ? data?.summary.attempts : data?.summary.files;
+  return `<nav class="catalog-folders" aria-label="이벤트 폴더"><div class="catalog-folders-heading"><h2>이벤트</h2><p class="small muted">이벤트 · 소분류 · 장비</p></div>
+    <div class="catalog-folder-list">${folderButton('all', '', '전체 파일', count || 0)}${folderButton('unassigned', '', '미배정', data?.unassigned || 0)}
+      <ul>${folders.filter(folder => !folder.parent_id).map(folder => branch(folder)).join('')}</ul>
+      ${!folders.length ? '<p class="small muted catalog-folders-empty">등록된 이벤트가 없습니다.</p>' : ''}
+    </div></nav>`;
+}
+
+function catalogPage() {
+  const data = view.catalog;
+  const archives = view.catalogTab === 'archives';
+  const summary = data?.summary;
+  const options = archives ? [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']] :
+    [['all', '모든 파일'], ['managed', '보관 파일'], ['incoming', 'Incoming 기록'], ['xmp', 'XMP'], ['verified', '아카이브 검증 기록 있음']];
+  const outcomes = { uploaded: '업로드 검증', skipped: '동일 파일 확인', legacy_verified: '과거 전송 완료', failed: '실패', pending: '진행 대기', unknown: '파일별 결과 미기록' };
+  const statuses = { available: '보관 중', missing: '파일 없음', moving: '이동 중', ready: '이동 대기', duplicate: '중복', review: '검토 필요', moved: '이동됨', deleted: '삭제됨', deleting: '삭제 중' };
+  return `${header('파일 기록', '카탈로그에 저장된 파일 해시와 아카이빙 검증 결과를 조회하세요.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
+    <section class="surface" aria-label="파일 카탈로그">
+      <div class="catalog-tabs" role="group" aria-label="기록 종류">
+        ${button('catalog-tab', '보유 파일', { extra: `data-value="files" aria-pressed="${!archives}"`, primary: !archives })}
+        ${button('catalog-tab', '아카이브 기록', { extra: `data-value="archives" aria-pressed="${archives}"`, primary: archives })}
+      </div>
+      <p class="catalog-summary small muted">${summary ? `파일 기록 ${summary.files}개 · 고유 SHA-256 ${summary.hashes}개 · 아카이브 검증 ${summary.verified}건 · 파일별 실패 ${summary.failed}건` : '기록을 확인하고 있습니다.'}</p>
+      <div class="catalog-layout">${catalogFolderTree()}<div class="catalog-content">
+      <div class="catalog-location" aria-label="현재 이벤트 폴더">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>
+      <form id="catalog-search" class="catalog-tools">
+        <label class="search">${icon('search')}<span class="sr-only">파일 기록 검색</span><input id="catalog-query" name="query" type="search" maxlength="300" placeholder="파일명·경로·SHA-256 검색" value="${escapeHtml(view.catalogQuery)}"></label>
+        <select id="catalog-scope" name="scope" aria-label="파일 기록 필터">${options.map(([value, label]) => `<option value="${value}" ${view.catalogScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+        <button type="submit" class="button" ${view.catalogBusy ? 'disabled' : ''}>검색</button>
+      </form>
+      <p class="catalog-note small muted">${archives ? '전송 시점의 SHA-256 검증 기록입니다. 과거 작업에 목적지 루트나 파일별 결과가 없으면 미기록으로 표시합니다.' : '보관 파일·XMP와 Incoming의 해시 기록을 표시합니다. 같은 해시의 파일도 경로별로 구분합니다.'}</p>
+      ${view.catalogError ? `<p class="archive-error form-error" role="alert">${escapeHtml(view.catalogError)}</p>` : ''}
+      <div aria-busy="${view.catalogBusy}">
+      ${view.catalogBusy ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${archives ? '아카이브 기록' : '파일 해시 기록'}">
+        <thead><tr><th scope="col">파일 / 경로</th><th scope="col">SHA-256</th><th scope="col">${archives ? '아카이브 목적지' : '분류 / 크기'}</th><th scope="col">${archives ? '검증 결과 / 시각' : '파일 상태'}</th></tr></thead>
+        <tbody>${data.rows.map(row => `<tr>
+          <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path">${escapeHtml((archives || row.location === 'managed' ? 'managed/' : 'incoming/') + row.local_path)}</div>
+            ${row.original_path ? `<div class="small muted catalog-path">원본: incoming/${escapeHtml(row.original_path)}</div>` : ''}
+            ${archives ? `<div class="small muted">작업 #${row.job_id} · ${row.kind === 'xmp' ? 'XMP' : '원본'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>` : ''}</td>
+          <td>${catalogHash(row)}</td>
+          <td>${archives ? `<div class="catalog-path mono">${escapeHtml(row.archive_root ? [row.archive_root.replace(/\/$/, ''), row.target].join('/') : row.target || '목적지 미기록')}</div>${!row.archive_root ? '<div class="small muted">아카이브 루트 미기록</div>' : ''}` :
+            `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted">${escapeHtml(row.kind === 'xmp' ? 'XMP' : row.device || '장비 미확인')} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>`}</td>
+          <td>${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
+            `<span class="status ${row.status === 'available' ? 'ready' : 'draft'}">${escapeHtml(statuses[row.status] || row.status)}</span>${row.location === 'managed' ? `<div class="small muted">${row.confirmed ? '배치 확정' : '배치 미확정'}</div>` : ''}${row.has_archive ? '<div class="small muted">아카이브 검증 기록 있음</div>' : ''}`}</td>
+        </tr>`).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : view.catalogEvent !== 'all' || view.catalogQuery || view.catalogScope !== 'all' ? '조건에 맞는 기록이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : 'Incoming Library에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
+      </div>
+      ${data && !view.catalogBusy && !view.catalogError ? `<div class="catalog-pagination"><span class="small muted" role="status">${data.total}개 기록 · ${data.page} / ${data.pages}페이지</span><div>
+        ${button('catalog-page', '이전', { extra: `data-value="${data.page - 1}"`, disabled: data.page <= 1 })}
+        ${button('catalog-page', '다음', { extra: `data-value="${data.page + 1}"`, disabled: data.page >= data.pages })}</div></div>` : ''}
+      </div></div>
+    </section>`;
+}
+
+async function loadCatalog() {
+  const request = ++catalogRequest;
+  view.catalogBusy = true;
+  view.catalogError = '';
+  if (view.page === 'catalog') render();
+  try {
+    const query = new URLSearchParams({ view: view.catalogTab, q: view.catalogQuery, scope: view.catalogScope, page: view.catalogPage, event: view.catalogEvent, device: view.catalogDevice });
+    const result = await api(`catalog?${query}`);
+    if (request !== catalogRequest) return;
+    view.catalog = result;
+    view.catalogPage = result.page;
+  } catch (error) {
+    if (request === catalogRequest) view.catalogError = error.message;
+  } finally {
+    if (request === catalogRequest) {
+      view.catalogBusy = false;
+      if (view.page === 'catalog') render();
+    }
+  }
+}
+
 function settingRow(label, description, controls) {
   return `<div class="setting-row"><div><h3>${label}</h3><p class="small muted">${description}</p></div>
     <div class="setting-controls">${controls}</div></div>`;
@@ -1009,6 +1128,9 @@ function updateEventActions() {
 
 
 function render() {
+  const catalogScroll = page.querySelector('.catalog-table-wrap');
+  const catalogScrollPosition = catalogScroll ? { top: catalogScroll.scrollTop, left: catalogScroll.scrollLeft } : null;
+  const folderScroll = page.querySelector('.catalog-folder-list')?.scrollTop || 0;
   const incomingTable = page.querySelector('#incoming-rows');
   const tableScroll = incomingTable ? { top: incomingTable.scrollTop, left: incomingTable.scrollLeft } : null;
   const xmpScroll = page.querySelector('.xmp-matches')?.scrollTop;
@@ -1017,7 +1139,7 @@ function render() {
   const route = location.hash.slice(1);
   const current = navigation.find(item => item.id === route) || navigation[0];
   const pageChanged = view.page !== current.id;
-  const views = { incoming: incomingPage, events: eventPage, archive: archivePage, settings: settingsPage };
+  const views = { incoming: incomingPage, events: eventPage, archive: archivePage, catalog: catalogPage, settings: settingsPage };
   view.page = current.id;
   nav.innerHTML = navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join('');
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
@@ -1042,6 +1164,8 @@ function render() {
     window.scrollTo(0, 0);
     return;
   }
+  if (catalogScrollPosition) page.querySelector('.catalog-table-wrap')?.scrollTo(catalogScrollPosition);
+  page.querySelector('.catalog-folder-list')?.scrollTo(0, folderScroll);
   if (tableScroll) page.querySelector('#incoming-rows').scrollTo(tableScroll);
   if (xmpScroll) page.querySelector('.xmp-matches')?.scrollTo(0, xmpScroll);
   if (keepFocus) {
@@ -1295,6 +1419,17 @@ const actions = {
     state.job = await api(`archive/transfers/${state.job.id}/cancel`, 'POST');
     await syncState();
   },
+  'catalog-folder'(value) {
+    const folder = JSON.parse(value);
+    view.catalogEvent = folder.event; view.catalogDevice = folder.device; view.catalogPage = 1;
+    view.catalogExpanded.add(folder.event);
+    return loadCatalog();
+  },
+  'toggle-catalog-folder'(id) { if (view.catalogExpanded.has(id)) view.catalogExpanded.delete(id); else view.catalogExpanded.add(id); },
+  'refresh-catalog': loadCatalog,
+  'catalog-tab'(tab) { view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; return loadCatalog(); },
+  'catalog-page'(value) { view.catalogPage = Math.max(1, Number(value)); return loadCatalog(); },
+  async 'copy-record-hash'(value) { await navigator.clipboard.writeText(value); announce('SHA-256을 복사했습니다.'); },
   'connect-archive'() { return browseArchive(); },
   'open-archive'(value) {
     const entry = view.archive?.entries[Number(value)];
@@ -1370,9 +1505,21 @@ page.addEventListener('drop', async event => {
   }
 });
 
+page.addEventListener('submit', event => {
+  if (event.target.id !== 'catalog-search') return;
+  event.preventDefault();
+  const form = new FormData(event.target);
+  view.catalogQuery = String(form.get('query') || '');
+  view.catalogScope = String(form.get('scope') || 'all');
+  view.catalogPage = 1;
+  loadCatalog();
+});
+
 page.addEventListener('change', event => {
   const control = event.target;
-  if (control.dataset.select) {
+  if (control.id === 'catalog-scope') {
+    view.catalogScope = control.value;
+  } else if (control.dataset.select) {
     handleSelection(control);
   } else if (control.id === 'restore-catalog-file') {
     if (control.files[0]) view.restoreFile = control.files[0];
@@ -1398,6 +1545,10 @@ page.addEventListener('change', event => {
 });
 
 page.addEventListener('input', event => {
+  if (event.target.id === 'catalog-query') {
+    view.catalogQuery = event.target.value;
+    return;
+  }
   if (event.target.id === 'event-search') {
     const { selectionStart, selectionEnd, value } = event.target;
     view.eventQuery = value;
@@ -1494,6 +1645,7 @@ document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML 
 function loadRoute() {
   if (mediaPreview.open) mediaPreview.close();
   render();
+  if (view.page === 'catalog') loadCatalog();
   if (view.page === 'settings') loadSettings().then(() => {
     if (view.page === 'settings') render();
   });

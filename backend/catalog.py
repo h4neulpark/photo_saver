@@ -84,6 +84,24 @@ CREATE TABLE IF NOT EXISTS media (
     confirmed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS media_by_hash ON media (sha, status);
+CREATE TABLE IF NOT EXISTS archive_entries (
+    job_id INTEGER NOT NULL REFERENCES jobs(id),
+    item_index INTEGER NOT NULL,
+    media_id TEXT NOT NULL,
+    asset_kind TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    size INTEGER,
+    storage_id TEXT NOT NULL,
+    archive_root TEXT NOT NULL,
+    target TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    verified_at TEXT,
+    recorded_at TEXT NOT NULL,
+    error TEXT,
+    PRIMARY KEY (job_id, item_index)
+);
+CREATE INDEX IF NOT EXISTS archive_by_hash ON archive_entries (sha, outcome);
 """
 
 

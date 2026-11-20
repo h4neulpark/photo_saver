@@ -20,6 +20,7 @@ from media import capture_time, modified_time_from_fingerprint, parse_capture_da
 from settings import router as settings_router
 from archive import router as archive_router
 from transfers import TransferRequest, queue_transfer
+from records import router as records_router
 
 
 @asynccontextmanager
@@ -32,6 +33,7 @@ async def lifespan(_app):
 app = FastAPI(lifespan=lifespan)
 app.include_router(settings_router)
 app.include_router(archive_router)
+app.include_router(records_router)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
 MEDIA_TYPES = {

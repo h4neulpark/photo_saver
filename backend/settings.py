@@ -43,6 +43,7 @@ RESTORE_COLUMNS = {
     "media": {"user_time_source", "original_path", "xmp_path", "xmp_sha", "xmp_metadata"},
     "scan_files": {"thumbnail", "companions"},
     "scan_xmp": set(),
+    "archive_entries": set(),
 }
 JSON_FIELDS = {
     "jobs": {"payload": "object", "result": "object"},
@@ -341,7 +342,7 @@ def restore_columns(source, target):
               if sql and sql.upper().startswith("CREATE TABLE ")}
     columns = {}
     for table, optional in RESTORE_COLUMNS.items():
-        if table == "scan_xmp" and table not in tables:
+        if table in {"scan_xmp", "archive_entries"} and table not in tables:
             continue
         available = {row[1] for row in source.execute(f"PRAGMA table_info({table})")}
         expected = [row["name"] for row in target.execute(f"PRAGMA table_info({table})")]

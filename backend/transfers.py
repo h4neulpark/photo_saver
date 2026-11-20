@@ -172,6 +172,22 @@ def send_file(sftp, base, managed, item, temporary_name, progress):
                 pass
 
 
+def record_archive(job_id, index, item, config, outcome, size=None, error=None):
+    stamp = now()
+    with database(write=True) as db:
+        db.execute(
+            """INSERT INTO archive_entries
+               (job_id,item_index,media_id,asset_kind,local_path,sha,size,storage_id,archive_root,target,outcome,verified_at,recorded_at,error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(job_id,item_index) DO UPDATE SET
+               size=excluded.size,outcome=excluded.outcome,verified_at=excluded.verified_at,
+               recorded_at=excluded.recorded_at,error=excluded.error""",
+            (job_id,index,item["id"],item["kind"],item["local"],item["sha"],size if size is not None else item["size"],
+             config_identity(config),config["root"],item["target"],outcome,
+             stamp if outcome in {"uploaded", "skipped"} else None,stamp,error),
+        )
+
+
 def upload_selection(job, _incoming, managed):
     payload = json.loads(job["payload"])
     result = {"totalFiles": len(payload["files"]), "completedFiles": 0, "uploaded": 0, "skipped": 0, "failed": 0,
@@ -216,6 +232,7 @@ def upload_selection(job, _incoming, managed):
                 save(True)
                 try:
                     outcome, size = send_file(sftp, base, managed, item, f".photo-saver-{payload['token']}-{index}.part", progress)
+                    record_archive(job["id"], index, item, config, outcome, size)
                     result[outcome] += 1
                     completed_bytes += size
                 except UploadCancelled:
@@ -223,6 +240,7 @@ def upload_selection(job, _incoming, managed):
                 except (OSError, ValueError, HTTPException) as error:
                     result["failed"] += 1
                     message = error.detail if isinstance(error, HTTPException) else "파일을 읽거나 업로드하지 못했습니다. 연결 및 파일 권한을 확인하세요."
+                    record_archive(job["id"], index, item, config, "failed", error=message)
                     if len(result["errors"]) < 100:
                         result["errors"].append({"path": item["target"], "message": message})
                 result["completedFiles"] += 1
