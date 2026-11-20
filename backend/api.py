@@ -463,6 +463,24 @@ def check_event_name(db, name, parent_id, start, except_id=None):
         error(409, "같은 날짜와 위치에 동일한 이름의 이벤트가 있습니다." if start else "같은 이름의 소분류가 있습니다.")
 
 
+def event_folder(name, start):
+    if start is None:
+        return name
+    prefix = f"{start:%y%m%d}_"
+    return name if name.startswith(prefix) else prefix + name
+
+
+def check_event_device_folder(db, parent_id, folder):
+    if parent_id is None:
+        return
+    devices = db.execute(
+        """SELECT DISTINCT coalesce(user_device,device) FROM media
+           WHERE event_id=? AND confirmed=1 AND status='available'""", (parent_id,)
+    )
+    if any(path_key(device_folder(row[0])) == path_key(folder) for row in devices):
+        error(409, "이미 사용 중인 장비 폴더와 같은 이름입니다.")
+
+
 @app.post("/api/events", status_code=201)
 def new_event(request: NewEvent):
     name = clean_component(request.name)
@@ -472,16 +490,11 @@ def new_event(request: NewEvent):
             parent = get_event(db, request.parent_id)
             if parent["parent_id"]:
                 error(400, "소분류는 최상위 이벤트에만 추가할 수 있습니다.")
-            devices = db.execute(
-                """SELECT DISTINCT coalesce(user_device,device) FROM media
-                   WHERE event_id=? AND confirmed=1 AND status='available'""", (parent["id"],)
-            )
-            if any(path_key(device_folder(row[0])) == path_key(name) for row in devices):
-                error(409, "이미 사용 중인 장비 폴더와 같은 이름입니다.")
             folder, start, end, zone = name, None, None, None
         else:
             start, end, zone = event_period(request)
-            folder = f"{request.start:%y%m%d}_{name}"
+            folder = event_folder(name, request.start)
+        check_event_device_folder(db, request.parent_id, folder)
         check_event_name(db, name, request.parent_id, start)
         try:
             db.execute(
@@ -501,7 +514,15 @@ def edit_event(event_id: str, request: EventFields):
         event = get_event(db, event_id)
         start, end, zone = (None, None, None) if event["parent_id"] else event_period(request)
         check_event_name(db, name, event["parent_id"], start, except_id=event_id)
-        db.execute("UPDATE events SET name=?, start=?, end=?, zone=? WHERE id=?", (name, start, end, zone, event_id))
+        folder = event_folder(name, None if event["parent_id"] else request.start)
+        check_event_device_folder(db, event["parent_id"], folder)
+        try:
+            db.execute(
+                "UPDATE events SET name=?, folder=?, folder_key=?, start=?, end=?, zone=? WHERE id=?",
+                (name, folder, path_key(folder), start, end, zone, event_id),
+            )
+        except sqlite3.IntegrityError:
+            error(409, "같은 위치의 아카이브 폴더 이름이 이미 사용 중입니다.")
         return view_event(get_event(db, event_id))
 
 

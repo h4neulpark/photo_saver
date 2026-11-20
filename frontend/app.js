@@ -403,7 +403,9 @@ function eventDestinations(event) {
 }
 
 function eventLabel(event) {
-  return event.start ? `${event.start.slice(2).replaceAll('-', '')}_${event.name}` : event.name;
+  if (!event.start) return event.name;
+  const prefix = `${event.start.slice(2).replaceAll('-', '')}_`;
+  return event.name.startsWith(prefix) ? event.name : `${prefix}${event.name}`;
 }
 
 function eventOptionLabel(event) {
@@ -973,6 +975,7 @@ function zoneOptions(selected = state.timezone) {
 function eventFormFields(subcategory, event) {
   return `<label>${subcategory ? '소분류 이름' : '이벤트명'}<input name="name" autofocus required maxlength="60"
       placeholder="${subcategory ? '예시 · 해변 식당' : '예시 · 제주 여행'}" value="${escapeHtml(event?.name || '')}"></label>
+    ${subcategory ? '' : '<p class="small muted">폴더명에 시작일(YYMMDD_)이 자동으로 붙습니다. 이름이 같은 날짜로 시작하면 한 번만 붙습니다.</p>'}
     ${subcategory ? '' : `<div class="date-grid">
       <label>시작일<input name="start" type="date" required value="${escapeHtml(event?.start || '')}"></label>
       <label>종료일<input name="end" type="date" required value="${escapeHtml(event?.end || '')}"></label>
@@ -995,10 +998,13 @@ function createEventDialog(parent) {
 function editEventDialog(event) {
   if (!event) return;
   showDialog(event.parent ? '소분류 수정' : '이벤트 수정', `${eventFormFields(Boolean(event.parent), event)}
-    <p class="small muted">아카이브 폴더 이름은 <strong>${escapeHtml(event.folder)}</strong>으로 유지됩니다.</p>`,
+    <p class="small muted">변경한 이름과 시작일에 맞춰 Source 폴더명과 이후 업로드 경로가 바뀝니다. 이미 예약한 업로드와 OMV에 저장된 폴더는 기존 경로를 유지합니다.</p>`,
   '변경 저장', async form => {
     await api(`events/${event.id}`, 'PUT', Object.fromEntries(form));
     view.eventDate = '';
+    view.sourcePath = [];
+    view.sourceSelection.clear();
+    view.dragSource = null;
     await syncState();
     announce(event.parent ? '소분류를 수정했습니다.' : '이벤트를 수정했습니다.');
   });
