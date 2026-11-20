@@ -2,16 +2,21 @@ import json
 import re
 import sqlite3
 import unicodedata
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from datetime import date, datetime, timezone
-from pathlib import PurePosixPath
+from io import BytesIO
+from pathlib import Path, PurePosixPath
+from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, queue_job
+from media import capture_time, modified_time_from_fingerprint, regular_file, save_image_preview
 
 
 @asynccontextmanager
@@ -23,18 +28,28 @@ async def lifespan(_app):
 
 app = FastAPI(lifespan=lifespan)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
+INCOMING_PREVIEW = Path("/incoming-preview")
+MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".heic": "image/heic", ".heif": "image/heif", ".mp4": "video/mp4", ".mov": "video/quicktime",
+}
+MEDIA_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+STALE_PREVIEW = "파일이 변경되었거나 이동했습니다. Incoming Library를 새로 고침하세요."
 
 
 class Selection(BaseModel):
     ids: list[str] = Field(min_length=1)
 
 
-class NewEvent(BaseModel):
+class EventFields(BaseModel):
     name: str = Field(min_length=1, max_length=60)
-    parent_id: str | None = None
     start: date | None = None
     end: date | None = None
     zone: str = DEFAULT_ZONE
+
+
+class NewEvent(EventFields):
+    parent_id: str | None = None
 
 
 class Assignment(Selection):
@@ -44,6 +59,7 @@ class Assignment(Selection):
 class MediaEdit(Selection):
     device: str | None = Field(default=None, max_length=80)
     captured_at: datetime | None = None
+    time_mode: Literal["metadata", "modified"] | None = None
     zone: str = DEFAULT_ZONE
 
 
@@ -84,6 +100,25 @@ def view_event(row):
     }
 
 
+def metadata_time(row, metadata):
+    if row["time_source"] not in {"EXIF", "영상 메타데이터"} or not row["capture_time"]:
+        return None
+    return {
+        "source": row["time_source"], "time": row["capture_time"],
+        "raw": metadata.get("raw_time"), "verified": bool(row["time_verified"]),
+    }
+
+
+def time_label(row):
+    if not row["user_time"]:
+        return row["time_source"]
+    if row["user_time_source"] == "metadata":
+        return f"{row['time_source']} · 사용자 확인"
+    if row["user_time_source"] == "modified":
+        return "파일 수정 시각 · 사용자 확인"
+    return "사용자 지정"
+
+
 def view_media(row, periods):
     device = row["user_device"] or row["device"]
     metadata = json.loads(row["metadata"])
@@ -99,7 +134,11 @@ def view_media(row, periods):
         "id": row["id"], "name": row["name"], "path": row["path"], "kind": row["kind"],
         "size": display_size(row["size"]), "device": device, "deviceFolder": device_folder(device),
         "time": stamp, "timeVerified": verified, "reviewReason": review_reason,
-        "timeSource": "사용자 지정" if row["user_time"] else row["time_source"],
+        "timeSource": time_label(row),
+        "timeCandidates": {
+            "metadata": metadata_time(row, metadata),
+            "modified": modified_time_from_fingerprint(row["fingerprint"]),
+        },
         "eventId": row["event_id"], "confirmed": bool(row["confirmed"]),
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
         "analysisError": metadata.get("error"),
@@ -113,6 +152,8 @@ def view_scan_file(row):
         "kind": "photo" if path.suffix.lower() in PHOTOS else "video",
         "modifiedAt": row["modified_at"], "size": display_size(row["size"]),
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
+        "preview": f"/api/incoming/{row['id']}/preview" if row["status"] in {"ready", "duplicate"} else None,
+        "original": f"/api/incoming/{row['id']}/original" if row["status"] in {"ready", "duplicate"} else None,
         "status": row["status"], "reason": row["reason"],
     }
 
@@ -129,6 +170,63 @@ def view_job(row):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+def incoming_for_preview(file_id):
+    with database() as db:
+        scan = load_latest_scan(db)
+        row = db.execute(
+            "SELECT path, fingerprint FROM scan_files WHERE scan_id=? AND id=? AND status IN ('ready','duplicate')",
+            (scan["id"], file_id),
+        ).fetchone() if scan else None
+    if not row or not row["fingerprint"]:
+        error(404, STALE_PREVIEW)
+    return row
+
+
+class IncomingOriginal(Response):
+    def __init__(self, row, media_type):
+        super().__init__(media_type=media_type)
+        self.row = row
+
+    async def __call__(self, scope, receive, send):
+        with ExitStack() as stack:
+            try:
+                stream, info = stack.enter_context(regular_file(
+                    INCOMING_PREVIEW, self.row["path"], expected=self.row["fingerprint"], recheck=False,
+                ))
+            except OSError:
+                await JSONResponse({"detail": STALE_PREVIEW}, status_code=409, headers=MEDIA_HEADERS)(scope, receive, send)
+                return
+            # Keep the verified descriptor open while FileResponse handles HTTP range requests.
+            response = FileResponse(
+                f"/proc/self/fd/{stream.fileno()}", stat_result=info, media_type=self.media_type,
+                filename=PurePosixPath(self.row["path"]).name, content_disposition_type="inline", headers=MEDIA_HEADERS,
+            )
+            await response(scope, receive, send)
+
+
+@app.api_route("/api/incoming/{file_id}/original", methods=["GET", "HEAD"])
+def incoming_original(file_id: str):
+    row = incoming_for_preview(file_id)
+    suffix = PurePosixPath(row["path"]).suffix.lower()
+    return IncomingOriginal(row, MEDIA_TYPES[suffix])
+
+
+@app.get("/api/incoming/{file_id}/preview")
+def incoming_preview(file_id: str):
+    row = incoming_for_preview(file_id)
+    suffix = PurePosixPath(row["path"]).suffix.lower()
+    if suffix not in {".heic", ".heif"}:
+        return IncomingOriginal(row, MEDIA_TYPES[suffix])
+    preview = BytesIO()
+    try:
+        with regular_file(INCOMING_PREVIEW, row["path"], expected=row["fingerprint"]) as (stream, _):
+            with Image.open(stream) as image:
+                save_image_preview(image, preview, (2200, 2200))
+    except (OSError, ValueError, Image.DecompressionBombError):
+        error(409, "사진을 미리 볼 수 없습니다. 새로 고침하거나 원본 파일을 확인하세요.")
+    return Response(preview.getvalue(), media_type="image/jpeg", headers=MEDIA_HEADERS)
 
 
 @app.get("/api/state")
@@ -243,6 +341,20 @@ def collect(db, event):
     return {"collected": len(collected), "uncertain": uncertain, "overlapping": overlapping}
 
 
+def event_period(request):
+    if not request.start or not request.end or request.end < request.start:
+        error(400, "시작일과 시작일 이후의 종료일을 지정하세요.")
+    return request.start.isoformat(), request.end.isoformat(), zone_for(request.zone).key
+
+
+def check_event_name(db, name, parent_id, start, except_id=None):
+    siblings = db.execute(
+        "SELECT id,name FROM events WHERE parent_id IS ? AND start IS ?", (parent_id, start)
+    )
+    if any(row["id"] != except_id and path_key(row["name"]) == path_key(name) for row in siblings):
+        error(409, "같은 날짜와 위치에 동일한 이름의 이벤트가 있습니다." if start else "같은 이름의 소분류가 있습니다.")
+
+
 @app.post("/api/events", status_code=201)
 def new_event(request: NewEvent):
     name = clean_component(request.name)
@@ -260,20 +372,43 @@ def new_event(request: NewEvent):
                 error(409, "이미 사용 중인 장비 폴더와 같은 이름입니다.")
             folder, start, end, zone = name, None, None, None
         else:
-            if not request.start or not request.end or request.end < request.start:
-                error(400, "시작일과 시작일 이후의 종료일을 지정하세요.")
-            zone = zone_for(request.zone).key
-            start, end = request.start.isoformat(), request.end.isoformat()
+            start, end, zone = event_period(request)
             folder = f"{request.start:%y%m%d}_{name}"
+        check_event_name(db, name, request.parent_id, start)
         try:
             db.execute(
                 "INSERT INTO events VALUES (?,?,?,?,?,?,?,?)",
                 (event_id, name, folder, path_key(folder), request.parent_id, start, end, zone),
             )
         except sqlite3.IntegrityError:
-            error(409, "같은 위치에 동일한 이름의 이벤트가 있습니다.")
+            error(409, "같은 위치의 아카이브 폴더 이름이 이미 사용 중입니다.")
         event = get_event(db, event_id)
         return {"event": view_event(event), "collection": collect(db, event) if not request.parent_id else None}
+
+
+@app.put("/api/events/{event_id}")
+def edit_event(event_id: str, request: EventFields):
+    name = clean_component(request.name)
+    with database(write=True) as db:
+        event = get_event(db, event_id)
+        start, end, zone = (None, None, None) if event["parent_id"] else event_period(request)
+        check_event_name(db, name, event["parent_id"], start, except_id=event_id)
+        db.execute("UPDATE events SET name=?, start=?, end=?, zone=? WHERE id=?", (name, start, end, zone, event_id))
+        return view_event(get_event(db, event_id))
+
+
+@app.delete("/api/events/{event_id}")
+def delete_event(event_id: str):
+    with database(write=True) as db:
+        event = get_event(db, event_id)
+        affected = db.execute(
+            """UPDATE media SET event_id=?, confirmed=0
+               WHERE event_id=? OR event_id IN (SELECT id FROM events WHERE parent_id=?)""",
+            (event["parent_id"], event_id, event_id),
+        ).rowcount
+        children = db.execute("DELETE FROM events WHERE parent_id=?", (event_id,)).rowcount
+        db.execute("DELETE FROM events WHERE id=?", (event_id,))
+        return {"parentId": event["parent_id"], "affectedFiles": affected, "deletedEvents": children + 1}
 
 
 @app.post("/api/events/{event_id}/collect")
@@ -300,18 +435,39 @@ def assign_files(request: Assignment):
 @app.patch("/api/media")
 def edit_media(request: MediaEdit):
     device = clean_component(request.device) if request.device is not None else None
+    if request.time_mode and request.captured_at is not None:
+        error(400, "촬영 시각 출처를 하나만 선택하세요.")
     captured = request.captured_at
     if captured and captured.tzinfo is None:
         captured = captured.replace(tzinfo=zone_for(request.zone))
     user_time = captured.astimezone(timezone.utc).isoformat() if captured else None
-    if device is None and user_time is None:
+    if device is None and user_time is None and not request.time_mode:
         error(400, "수정할 촬영 장비나 시각을 입력하세요.")
     with database(write=True) as db:
         rows = get_selection(db, request.ids)
+        selected_zone = zone_for(request.zone) if request.time_mode == "metadata" else None
+        updates = []
+        for row in rows:
+            if request.time_mode == "modified":
+                stamp = modified_time_from_fingerprint(row["fingerprint"])
+            elif request.time_mode == "metadata":
+                candidate = metadata_time(row, json.loads(row["metadata"]))
+                if not candidate:
+                    error(400, "선택한 파일 중 사용할 수 있는 메타데이터 시각이 없는 파일이 있습니다.")
+                stamp = candidate["time"] if candidate["verified"] else capture_time(
+                    candidate["raw"], assumed_zone=selected_zone.key,
+                )[0]
+                if not stamp:
+                    error(400, "선택한 파일의 메타데이터 시각을 해석할 수 없습니다.")
+            else:
+                stamp = user_time
+            source = (request.time_mode or "manual") if stamp else None
+            updates.append((device, stamp, source, device, row["id"]))
         db.executemany(
             """UPDATE media SET user_device=coalesce(?,user_device), user_time=coalesce(?,user_time),
+               user_time_source=coalesce(?,user_time_source),
                confirmed=CASE WHEN ? IS NULL THEN confirmed ELSE 0 END WHERE id=?""",
-            [(device, user_time, device, row["id"]) for row in rows],
+            updates,
         )
         return {"count": len(rows)}
 

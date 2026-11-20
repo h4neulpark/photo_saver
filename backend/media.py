@@ -72,23 +72,23 @@ def inspect(root, path):
 
 
 @contextmanager
-def regular_file(root, path):
+def regular_file(root, path, *, expected=None, recheck=True):
     with parent_directory(root, path) as (parent, name):
         fd = os.open(name, FILE_FLAGS, dir_fd=parent)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if fingerprint(info) != fingerprint(regular_stat(parent, name)):
+            snapshot = fingerprint(info)
+            if snapshot != fingerprint(regular_stat(parent, name)) or (expected and snapshot != expected):
                 raise OSError("파일 상태가 변경되었습니다.")
             yield stream, info
-            after = os.fstat(stream.fileno())
-            if fingerprint(info) != fingerprint(after) or fingerprint(info) != fingerprint(regular_stat(parent, name)):
-                raise OSError("파일 상태가 변경되었습니다.")
+            if recheck:
+                after = os.fstat(stream.fileno())
+                if snapshot != fingerprint(after) or snapshot != fingerprint(regular_stat(parent, name)):
+                    raise OSError("파일 상태가 변경되었습니다.")
 
 
 def hash_file(root, path, expected=None):
-    with regular_file(root, path) as (stream, info):
-        if expected and fingerprint(info) != expected:
-            raise OSError("파일 상태가 변경되었습니다.")
+    with regular_file(root, path, expected=expected) as (stream, info):
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     return digest, info
 
@@ -141,7 +141,12 @@ def iso_time(seconds):
     return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
 
 
-def capture_time(raw, offset=None):
+def modified_time_from_fingerprint(snapshot):
+    _, _, _, modified_ns, _ = json.loads(snapshot)
+    return iso_time(modified_ns / 1_000_000_000)
+
+
+def capture_time(raw, offset=None, *, assumed_zone=DEFAULT_ZONE):
     if not raw:
         return None, False
     value = str(raw).strip()
@@ -158,7 +163,7 @@ def capture_time(raw, offset=None):
         return None, False
     verified = captured.tzinfo is not None
     if not verified:
-        captured = captured.replace(tzinfo=ZoneInfo(DEFAULT_ZONE))
+        captured = captured.replace(tzinfo=ZoneInfo(assumed_zone))
     return captured.astimezone(timezone.utc).isoformat(), verified
 
 
@@ -176,12 +181,16 @@ def image_metadata(stream, thumbnail):
         }
         try:
             if thumbnail:
-                upright = ImageOps.exif_transpose(image)
-                upright.thumbnail((360, 240))
-                upright.convert("RGB").save(thumbnail, format="JPEG", quality=84)
+                save_image_preview(image, thumbnail, (360, 240))
         except (OSError, ValueError):
             thumbnail.unlink(missing_ok=True)
         return details, captured, verified, "EXIF"
+
+
+def save_image_preview(image, destination, bounds):
+    upright = ImageOps.exif_transpose(image)
+    upright.thumbnail(bounds, Image.Resampling.LANCZOS)
+    upright.convert("RGB").save(destination, format="JPEG", quality=84)
 
 
 def video_metadata(stream, thumbnail):
@@ -237,9 +246,7 @@ def analyze(root, path, sha, expected):
     temporary = THUMBNAILS / f".{uuid4().hex}.jpg"
     thumbnail = None if destination.is_file() else temporary
     try:
-        with regular_file(root, path) as (stream, info):
-            if fingerprint(info) != expected:
-                raise OSError("분석 전에 파일 상태가 변경되었습니다.")
+        with regular_file(root, path, expected=expected) as (stream, info):
             try:
                 extract = image_metadata if kind == "photo" else video_metadata
                 details, captured, verified, source = extract(stream, thumbnail)

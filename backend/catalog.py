@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS media (
     time_verified INTEGER NOT NULL DEFAULT 0,
     device TEXT,
     user_time TEXT,
+    user_time_source TEXT,
     user_device TEXT,
     event_id TEXT REFERENCES events(id),
     confirmed INTEGER NOT NULL DEFAULT 0
@@ -106,6 +107,9 @@ def initialize():
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(scan_files)")}
         if "thumbnail" not in columns:
             connection.execute("ALTER TABLE scan_files ADD COLUMN thumbnail TEXT")
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(media)")}
+        if "user_time_source" not in columns:
+            connection.execute("ALTER TABLE media ADD COLUMN user_time_source TEXT")
         connection.commit()
     finally:
         connection.close()

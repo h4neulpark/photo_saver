@@ -14,8 +14,12 @@ const icons = {
   photo: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m4 17 5-4 3 2 4-4 4 5"/>',
   video: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3V9Z"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  edit: '<path d="m14 5 5 5M4 20l5-1 12-12-4-4L5 15l-1 5Z"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   right: '<path d="m9 6 6 6-6 6"/>',
+  left: '<path d="m15 6-6 6 6 6"/>',
+  table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 14h18m-12-5v11"/>',
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   up: '<path d="M12 19V5m-6 6 6-6 6 6"/>',
   disk: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18m-14 3h.01m4 0h.01"/>',
 };
@@ -44,9 +48,18 @@ function dateTimeFormatter(timeZone) {
   });
 }
 
+function savedIncomingLayout() {
+  try {
+    return localStorage.getItem('photo-saver-incoming-layout') === 'cards' ? 'cards' : 'table';
+  } catch {
+    return 'table';
+  }
+}
+
 const state = { incoming: [], managed: [], events: [], scan: null, job: null, timezone: 'Asia/Seoul' };
 const view = {
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
+  incomingLayout: savedIncomingLayout(), preview: null,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventDevice: '', eventDate: '',
   eventTarget: '', sourcePath: [],
 };
@@ -56,6 +69,7 @@ let stateRequest = 0;
 const page = document.getElementById('page');
 const nav = document.getElementById('navigation');
 const dialog = document.getElementById('dialog');
+const mediaPreview = document.getElementById('media-preview');
 const notice = document.getElementById('notice');
 let noticeTimeout;
 
@@ -106,6 +120,7 @@ async function syncState() {
     for (const id of view.incomingSelection) {
       if (!selectable.has(id)) view.incomingSelection.delete(id);
     }
+    updatePreviewAfterDelete();
   } catch (error) {
     if (request === stateRequest) view.loadError = error.message;
   } finally {
@@ -119,10 +134,11 @@ async function syncState() {
   }
 }
 
-async function submitJob(kind, payload) {
+async function submitJob(kind, payload, preview = null) {
   const result = await api(`jobs/${kind}`, 'POST', payload);
   state.job = { id: result.id, kind, status: 'queued' };
-  view.incomingSelection.clear();
+  if (preview) preview.jobId = result.id;
+  else view.incomingSelection.clear();
   await syncState();
 }
 
@@ -169,13 +185,21 @@ function sizeLabel(size) {
   return size >= 1000 ? `${(size / 1000).toFixed(2)} GB` : `${Number(size.toFixed(1))} MB`;
 }
 
-function fileCell(file, detail) {
-  const name = escapeHtml(file.name);
-  const picture = file.kind === 'photo' || /\.(jpe?g|png|webp|heic|heif)$/i.test(file.name);
+function fileThumbnail(file, interactive = false, card = false) {
+  const picture = file.kind === 'photo';
   const image = file.thumbnail ? `<img src="${escapeHtml(file.thumbnail)}" alt="" loading="lazy">` : '';
+  const contents = `${icon(picture ? 'photo' : 'video')}${image}`;
+  if (interactive && file.preview) {
+    return `<button type="button" class="thumb" data-action="preview-incoming" data-value="${escapeHtml(file.id)}"
+      aria-label="${escapeHtml(file.name)} 미리보기" ${card ? 'data-card-preview' : ''}>${contents}</button>`;
+  }
+  return `<span class="thumb">${contents}</span>`;
+}
+
+function fileCell(file, detail, interactive = false) {
   return `<div class="file-cell">
-    <span class="thumb">${icon(picture ? 'photo' : 'video')}${image}</span>
-    <div><strong>${name}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}</div>
+    ${fileThumbnail(file, interactive)}
+    <div><strong>${escapeHtml(file.name)}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}</div>
   </div>`;
 }
 
@@ -206,19 +230,36 @@ function checkbox(kind, id, label, selection) {
   return `<input type="checkbox" data-select="${kind}" value="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" ${selection.has(id) ? 'checked' : ''}>`;
 }
 
+function incomingCards(files, selectAll) {
+  return `${selectAll ? `<label class="card-select-all">${selectAll} 표시된 파일 모두 선택</label>` : ''}
+    <ul class="incoming-cards" aria-label="Incoming 카드 목록">${files.map(file => `<li class="incoming-card${view.incomingSelection.has(file.id) ? ' selected' : ''}">
+      <div class="card-image">
+        ${fileThumbnail(file, true, true)}
+        ${canSelectIncoming(file) ? `<label class="card-check">${checkbox('incoming', file.id, `${file.name} 선택`, view.incomingSelection)}</label>` : ''}
+      </div>
+      <div class="card-caption">
+        <strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+        <div class="card-info">${badge(file.status, filterLabels[file.status] || '삭제 중')}<span class="small muted numbers">${sizeLabel(file.size)}</span></div>
+        ${file.reason ? `<p class="small muted card-reason">${escapeHtml(file.reason)}</p>` : ''}
+      </div>
+    </li>`).join('')}</ul>`;
+}
+
 function incomingRows() {
   const files = filteredIncoming();
   if (!files.length) return emptyState('inbox', '표시할 파일이 없습니다.',
     state.scan ? '파일을 추가하거나 검사 결과 필터를 확인하세요.' : 'incoming에 사진이나 영상을 넣고 새로 고침하세요.');
   const available = files.filter(canSelectIncoming);
+  const selectAll = available.length ? checkbox('incoming-all', 'all', '표시된 파일 모두 선택', new Set(available.every(file => view.incomingSelection.has(file.id)) ? ['all'] : [])) : '';
+  if (view.incomingLayout === 'cards') return incomingCards(files, selectAll);
   return `<table aria-label="Incoming 검사 결과">
     <thead><tr>
-      <th scope="col">${available.length ? checkbox('incoming-all', 'all', '표시된 파일 모두 선택', new Set(available.every(file => view.incomingSelection.has(file.id)) ? ['all'] : [])) : ''}</th>
+      <th scope="col">${selectAll}</th>
       <th scope="col">파일</th><th scope="col">수정 일시</th><th scope="col">크기</th><th scope="col">검사 결과</th>
     </tr></thead>
     <tbody>${files.map(file => `<tr class="${view.incomingSelection.has(file.id) ? 'selected' : ''}">
       <td>${canSelectIncoming(file) ? checkbox('incoming', file.id, `${file.name} 선택`, view.incomingSelection) : ''}</td>
-      <td>${fileCell(file, file.folder)}</td>
+      <td>${fileCell(file, file.folder, true)}</td>
       <td class="numbers muted">${file.modifiedAt ? dateTimeFormatter(state.timezone).format(new Date(file.modifiedAt)) : '—'}</td>
       <td class="numbers">${sizeLabel(file.size)}</td>
       <td>${badge(file.status, filterLabels[file.status] || '삭제 중')}${file.reason ? `<div class="small muted file-reason">${escapeHtml(file.reason)}</div>` : ''}</td>
@@ -253,7 +294,12 @@ function incomingPage() {
       <span class="small">${escapeHtml(detail)}</span>
     </div>
     <section class="surface" aria-labelledby="incoming-title">
-      <div class="surface-head"><h2 id="incoming-title">검사 결과</h2><span class="mono muted">/incoming</span></div>
+      <div class="surface-head"><h2 id="incoming-title">검사 결과</h2>
+        <div class="view-switch" role="group" aria-label="보기 방식">
+          <button class="filter" type="button" data-action="incoming-layout" data-value="table" aria-pressed="${view.incomingLayout === 'table'}">${icon('table')} 표 보기</button>
+          <button class="filter" type="button" data-action="incoming-layout" data-value="cards" aria-pressed="${view.incomingLayout === 'cards'}">${icon('grid')} 카드 보기</button>
+        </div>
+      </div>
       <div class="filter-bar">
         <div class="filters" aria-label="검사 결과 필터">
           ${Object.entries(filterLabels).map(([key, label]) => `<button type="button" class="filter" data-action="incoming-filter" data-value="${key}" aria-pressed="${view.incomingFilter === key}">${label}<span>${key === 'all' ? results.length : results.filter(file => file.status === key).length}</span></button>`).join('')}
@@ -295,8 +341,12 @@ function eventDestinations(event) {
   return state.events.filter(option => option.id !== event?.id);
 }
 
+function eventLabel(event) {
+  return event.start ? `${event.start.slice(2).replaceAll('-', '')}_${event.name}` : event.name;
+}
+
 function eventOptionLabel(event) {
-  return event.parent ? `${eventById(event.parent).folder} / ${event.folder}` : event.folder;
+  return event.parent ? `${eventLabel(eventById(event.parent))} / ${eventLabel(event)}` : eventLabel(event);
 }
 
 function eventDateForFile(file) {
@@ -333,16 +383,20 @@ function eventPage() {
           ${state.events.filter(item => !item.parent).map(item => {
             const children = childEvents(item.id);
             const total = footageForEvent(item.id).length + children.reduce((sum, child) => sum + footageForEvent(child.id).length, 0);
-            return eventLink(item.id, item.folder, total) + children.map(child => eventLink(child.id, child.name, footageForEvent(child.id).length, true)).join('');
+            return eventLink(item.id, eventLabel(item), total) + children.map(child => eventLink(child.id, eventLabel(child), footageForEvent(child.id).length, true)).join('');
           }).join('')}
         </div>
       </section>
       <section class="surface" aria-label="이벤트 푸티지">
-        <div class="surface-head">
-          <div><h2>${escapeHtml(event?.folder || '미배정 푸티지')}</h2>
+        <div class="surface-head event-heading">
+          <div><h2>${escapeHtml(event ? eventLabel(event) : '미배정 푸티지')}</h2>
             <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${files.length}개 파일</div>
           </div>
-          ${event && !event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}
+          ${event ? `<div class="event-header-actions">
+            ${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}
+            ${button('edit-event', event.parent ? '소분류 수정' : '이벤트 수정', { glyph: 'edit' })}
+            ${button('delete-event', event.parent ? '소분류 삭제' : '이벤트 삭제', { glyph: 'trash', danger: true })}
+          </div>` : ''}
         </div>
         <div class="event-tools">
           <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>${devices.map(device =>
@@ -359,7 +413,8 @@ function eventPage() {
             <td>${fileCell(file, file.device || '장비 확인 필요')}</td>
             <td class="numbers muted">${file.time ? footageDate.format(new Date(file.time)) : '—'}
               ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
-              ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}</td>
+              ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
+              ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정">촬영 시각 지정</button>` : ''}</td>
             <td>${file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
               badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : event ? '초안' : '미배정')}</td>
           </tr>`).join('')}</tbody>
@@ -466,20 +521,24 @@ function showDialog(title, content, submitLabel, handler, { danger = false } = {
 }
 
 
-function zoneOptions() {
-  return [...new Set([state.timezone, 'Asia/Seoul', 'Asia/Tokyo', 'Asia/Singapore', 'Europe/Paris', 'America/Los_Angeles', 'UTC'])]
-    .map(zone => `<option>${escapeHtml(zone)}</option>`).join('');
+function zoneOptions(selected = state.timezone) {
+  return [...new Set([state.timezone, 'Asia/Seoul', 'Asia/Tokyo', 'Asia/Singapore', 'Europe/Paris', 'America/Los_Angeles', 'UTC', selected])]
+    .map(zone => `<option ${zone === selected ? 'selected' : ''}>${escapeHtml(zone)}</option>`).join('');
+}
+
+function eventFormFields(subcategory, event) {
+  return `<label>${subcategory ? '소분류 이름' : '이벤트명'}<input name="name" autofocus required maxlength="60"
+      placeholder="${subcategory ? '예시 · 해변 식당' : '예시 · 제주 여행'}" value="${escapeHtml(event?.name || '')}"></label>
+    ${subcategory ? '' : `<div class="date-grid">
+      <label>시작일<input name="start" type="date" required value="${escapeHtml(event?.start || '')}"></label>
+      <label>종료일<input name="end" type="date" required value="${escapeHtml(event?.end || '')}"></label>
+    </div>
+    <label>촬영일 기준 시간대<select name="zone">${zoneOptions(event?.zone)}</select></label>`}`;
 }
 
 function createEventDialog(parent) {
-  showDialog(parent ? '소분류 추가' : '이벤트 생성', `
-    <label>${parent ? '소분류 이름' : '이벤트명'}<input name="name" autofocus required maxlength="60" placeholder="${parent ? '예시 · 해변 식당' : '예시 · 제주 여행'}"></label>
-    ${parent ? '' : `<div class="date-grid">
-      <label>시작일<input name="start" type="date" required></label>
-      <label>종료일<input name="end" type="date" required></label>
-    </div>
-    <label>촬영일 기준 시간대<select name="zone">${zoneOptions()}</select></label>`}`,
-  parent ? '소분류 만들기' : '생성하고 파일 모으기', async form => {
+  showDialog(parent ? '소분류 추가' : '이벤트 생성', eventFormFields(Boolean(parent)),
+    parent ? '소분류 만들기' : '생성하고 파일 모으기', async form => {
     const payload = Object.fromEntries(form);
     if (parent) payload.parent_id = parent.id;
     const result = await api('events', 'POST', payload);
@@ -489,19 +548,67 @@ function createEventDialog(parent) {
   });
 }
 
-function editMedia() {
-  const ids = [...view.eventSelection];
-  if (!ids.length) return;
+function editEventDialog(event) {
+  if (!event) return;
+  showDialog(event.parent ? '소분류 수정' : '이벤트 수정', `${eventFormFields(Boolean(event.parent), event)}
+    <p class="small muted">아카이브 폴더 이름은 <strong>${escapeHtml(event.folder)}</strong>으로 유지됩니다.</p>`,
+  '변경 저장', async form => {
+    await api(`events/${event.id}`, 'PUT', Object.fromEntries(form));
+    view.eventDate = '';
+    await syncState();
+    announce(event.parent ? '소분류를 수정했습니다.' : '이벤트를 수정했습니다.');
+  });
+}
+
+function deleteEventDialog(event) {
+  if (!event) return;
+  const parent = eventById(event.parent);
+  const children = childEvents(event.id).length;
+  const name = escapeHtml(eventLabel(event));
+  const eventType = parent ? '소분류' : '이벤트';
+  const destination = parent ? `상위 이벤트 <strong>${escapeHtml(eventLabel(parent))}</strong>로 이동해 초안 상태가 됩니다` : '미배정으로 돌아갑니다';
+  showDialog(`${eventType} 삭제`, `<p><strong>${name}</strong> ${eventType}${children ? `와 하위 소분류 ${children}개` : ''}를 삭제합니다.</p>
+    <p>배정된 사진과 영상은 ${destination}. 원본은 managed에 보관됩니다.</p>`,
+  `${eventType} 삭제`, async () => {
+    const result = await api(`events/${event.id}`, 'DELETE');
+    chooseEvent(result.parentId || 'unassigned');
+    view.sourcePath = [];
+    await syncState();
+    announce(`${eventType} 삭제를 완료했습니다.${result.affectedFiles ? ` ${result.affectedFiles}개 파일의 배정을 변경했습니다.` : ''}`);
+  }, { danger: true });
+}
+
+function editMedia(ids = [...view.eventSelection], suggestSource = false) {
+  const selectedIds = new Set(ids);
+  const files = state.managed.filter(file => selectedIds.has(file.id));
+  if (!files.length) return;
+  const hasMetadata = files.every(file => file.timeCandidates?.metadata);
+  const hasModified = files.every(file => file.timeCandidates?.modified);
+  const metadataLabel = files.every(file => file.kind === 'photo') ? 'EXIF 시각 사용' : '메타데이터 시각 사용';
+  const mode = suggestSource && hasMetadata ? 'metadata' : suggestSource && hasModified ? 'modified' : 'manual';
+  const event = eventById(view.eventId);
+  const root = event?.parent ? eventById(event.parent) : event;
+  const defaultZone = root?.zone || state.timezone;
   showDialog('장비·촬영 시각 수정', `
     <label>촬영 장비<input name="device" maxlength="80" placeholder="예시 · GoPro 또는 unknown"></label>
-    <div class="date-grid"><label>촬영 시각<input type="datetime-local" name="captured_at"></label>
-      <label>촬영 시간대<select name="zone">${zoneOptions()}</select></label></div>`,
+    <label>촬영 시각 출처<select id="media-time-mode" name="time_mode">
+      <option value="manual" ${mode === 'manual' ? 'selected' : ''}>직접 입력</option>
+      <option value="metadata" ${mode === 'metadata' ? 'selected' : ''} ${hasMetadata ? '' : 'disabled'}>${metadataLabel}${hasMetadata ? '' : ' (사용 가능한 값 없음)'}</option>
+      <option value="modified" ${mode === 'modified' ? 'selected' : ''} ${hasModified ? '' : 'disabled'}>파일 수정 시각 사용</option>
+    </select></label>
+    <div class="date-grid" id="media-time-fields">
+      <label id="media-manual-time">촬영 시각<input type="datetime-local" name="captured_at"></label>
+      <label id="media-time-zone">촬영 시간대<select name="zone">${zoneOptions(defaultZone)}</select></label>
+    </div>
+    <p id="media-time-note" class="small muted" role="status" hidden></p>`,
   '변경 저장', async form => {
-    const payload = { ids, zone: form.get('zone') };
+    const timeMode = form.get('time_mode');
+    const payload = { ids: files.map(file => file.id), zone: form.get('zone') || defaultZone };
     const device = form.get('device').trim();
     const time = form.get('captured_at');
     if (device) payload.device = device;
-    if (time) payload.captured_at = time;
+    if (timeMode === 'manual' && time) payload.captured_at = time;
+    if (timeMode !== 'manual') payload.time_mode = timeMode;
     await api('media', 'PATCH', payload);
     view.eventSelection.clear();
     view.eventDevice = '';
@@ -509,6 +616,34 @@ function editMedia() {
     await syncState();
     announce('선택한 파일의 정보를 수정했습니다.');
   });
+  const modeControl = dialog.querySelector('#media-time-mode');
+  const dateField = dialog.querySelector('#media-manual-time');
+  const zoneField = dialog.querySelector('#media-time-zone');
+  const zoneControl = zoneField.querySelector('select');
+  const note = dialog.querySelector('#media-time-note');
+  function updateTimeFields() {
+    const mode = modeControl.value;
+    dateField.hidden = mode !== 'manual';
+    zoneField.hidden = mode === 'modified' || (mode === 'metadata' && files.every(file => file.timeCandidates.metadata.verified));
+    dateField.querySelector('input').disabled = dateField.hidden;
+    zoneControl.disabled = zoneField.hidden;
+    dialog.querySelector('#media-time-fields').hidden = dateField.hidden && zoneField.hidden;
+    note.hidden = mode === 'manual';
+    if (mode === 'manual') return;
+    if (files.length > 1) {
+      note.textContent = mode === 'modified' ? '파일마다 해당 파일의 수정 시각을 사용합니다.' :
+        '파일마다 메타데이터에 기록된 시각을 사용합니다. 시간대 정보가 없는 파일에는 선택한 시간대를 적용합니다.';
+    } else if (mode === 'modified') {
+      note.textContent = `파일 수정 시각 ${dateTimeFormatter(defaultZone).format(new Date(files[0].timeCandidates.modified))} · ${defaultZone}`;
+    } else {
+      const candidate = files[0].timeCandidates.metadata;
+      note.textContent = candidate.verified ? `${candidate.source} ${candidate.raw || candidate.time}` :
+        `${candidate.source} ${candidate.raw} · ${zoneControl.value}로 해석`;
+    }
+  }
+  modeControl.addEventListener('change', updateTimeFields);
+  zoneControl.addEventListener('change', updateTimeFields);
+  updateTimeFields();
 }
 
 function chooseEvent(id) {
@@ -597,6 +732,144 @@ function confirmDeleteIncoming() {
   `사진 ${photos.length}개 삭제`, () => submitJob('delete', { ids: photos.map(file => file.id) }), { danger: true });
 }
 
+function currentPreviewFile() {
+  const preview = view.preview;
+  return preview && state.incoming.find(file => file.id === preview.ids[preview.index]);
+}
+
+function openIncomingPreview(id) {
+  const ids = filteredIncoming().filter(file => file.preview).map(file => file.id);
+  const index = ids.indexOf(id);
+  if (index < 0) return;
+  view.preview = { ids, index, confirming: false, busy: false, jobId: null, message: '' };
+  renderMediaPreview();
+}
+
+function renderMediaPreview() {
+  const file = currentPreviewFile();
+  if (!file) return;
+  const name = escapeHtml(file.name);
+  const src = file.preview ? escapeHtml(file.preview) : '';
+  const media = !src ? '' : file.kind === 'photo' ? `<img src="${src}" alt="${name}" decoding="async">` :
+    `<video src="${src}" ${file.thumbnail ? `poster="${escapeHtml(file.thumbnail)}"` : ''} controls preload="metadata" playsinline></video>`;
+  mediaPreview.innerHTML = `<div class="preview-frame">
+    <header class="preview-header"><div class="preview-title"><h2 id="media-preview-title" tabindex="-1">${name}</h2>
+      <p class="small muted">${escapeHtml(file.folder ? `incoming/${file.folder}` : 'incoming')} · ${sizeLabel(file.size)}</p></div>
+      ${smallButton('close-preview', '미리보기 닫기', 'close')}</header>
+    <div class="preview-stage">
+      ${media}
+      ${src ? '<p class="preview-media-loading" role="status">원본 불러오는 중…</p>' : ''}
+      <p class="preview-media-error" role="status" ${src ? 'hidden' : ''}>미리보기를 열 수 없습니다. 원본 파일을 열거나 Incoming Library를 새로 고침하세요.</p>
+    </div>
+    <footer class="preview-footer"></footer>
+  </div>`;
+  renderPreviewFooter();
+  if (!mediaPreview.open) mediaPreview.showModal();
+  mediaPreview.querySelector('#media-preview-title').focus();
+}
+
+function renderPreviewFooter() {
+  const file = currentPreviewFile();
+  const preview = view.preview;
+  const footer = mediaPreview.querySelector('.preview-footer');
+  if (!file || !footer) return;
+  const canDelete = canDeleteIncoming(file) && !jobActive();
+  const counter = `<span class="numbers preview-count">${preview.index + 1} / ${preview.ids.length}</span>`;
+  if (preview.confirming || preview.busy) {
+    footer.innerHTML = `<p role="status">${preview.busy ? '사진을 삭제하고 있습니다.' :
+      `<strong>${escapeHtml(file.name)}</strong> 파일을 incoming에서 영구 삭제합니다.`}</p>
+      <div class="preview-controls">
+        ${button('cancel-preview-delete', '취소', { disabled: preview.busy })}
+        ${button('perform-preview-delete', '사진 삭제', { primary: true, danger: true, disabled: preview.busy })}
+      </div>`;
+    if (!preview.busy) footer.querySelector('[data-action="perform-preview-delete"]').focus();
+    return;
+  }
+  const original = file.original ? `<a class="button" href="${escapeHtml(file.original)}" target="_blank" rel="noopener">원본 열기</a>` : '';
+  footer.innerHTML = `<div class="preview-controls" role="group" aria-label="파일 이동">
+      ${button('previous-preview', '이전', { glyph: 'left', disabled: preview.index === 0 })}${counter}
+      ${button('next-preview', '다음', { glyph: 'right', disabled: preview.index === preview.ids.length - 1 })}
+    </div>
+    <div class="preview-controls">
+      ${original}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
+    </div>
+    <p class="preview-hint small muted" ${preview.message ? 'role="status"' : ''}>${preview.message ? escapeHtml(preview.message) :
+      `<kbd>←</kbd> <kbd>→</kbd> 이동${canDelete ? ' · <kbd>Delete</kbd> 삭제' : ''}`}</p>`;
+}
+
+function stepPreview(direction) {
+  const preview = view.preview;
+  if (!preview || preview.confirming || preview.busy) return;
+  const next = preview.index + direction;
+  if (next < 0 || next >= preview.ids.length) return;
+  preview.index = next;
+  preview.message = '';
+  renderMediaPreview();
+}
+
+function requestPreviewDelete() {
+  const file = currentPreviewFile();
+  if (!file || jobActive() || !canDeleteIncoming(file) || view.preview.busy) return;
+  view.preview.confirming = true;
+  renderPreviewFooter();
+}
+
+function cancelPreviewDelete() {
+  if (view.preview.busy) return;
+  view.preview.confirming = false;
+  renderPreviewFooter();
+  mediaPreview.querySelector('[data-action="request-preview-delete"]')?.focus();
+}
+
+async function performPreviewDelete() {
+  const preview = view.preview;
+  const file = currentPreviewFile();
+  if (!file || !preview.confirming || preview.busy || jobActive()) return;
+  preview.busy = true;
+  renderPreviewFooter();
+  mediaPreview.querySelector('#media-preview-title').focus();
+  try {
+    await submitJob('delete', { ids: [file.id] }, preview);
+  } catch (error) {
+    preview.busy = false;
+    preview.confirming = false;
+    preview.message = error.message;
+    if (view.preview === preview) renderPreviewFooter();
+  }
+  render();
+}
+
+function updatePreviewAfterDelete() {
+  const preview = view.preview;
+  const job = state.job;
+  if (!preview?.jobId || preview.jobId !== job?.id || jobActive(job)) return;
+  preview.busy = false;
+  preview.confirming = false;
+  preview.jobId = null;
+  if (job.status === 'done' && job.result.deleted) {
+    preview.ids.splice(preview.index, 1);
+    if (!preview.ids.length) {
+      mediaPreview.close();
+      return;
+    }
+    preview.index = Math.min(preview.index, preview.ids.length - 1);
+    preview.message = '선택한 사진을 삭제했습니다.';
+    renderMediaPreview();
+  } else {
+    preview.message = job.status === 'failed' ? job.result.error : '사진이 변경되었거나 삭제할 수 없습니다. 새로 고침 후 다시 확인하세요.';
+    renderPreviewFooter();
+  }
+}
+
+const previewActions = {
+  'previous-preview': () => stepPreview(-1),
+  'next-preview': () => stepPreview(1),
+  'close-preview': () => mediaPreview.close(),
+  'request-preview-delete': requestPreviewDelete,
+  'cancel-preview-delete': cancelPreviewDelete,
+  'perform-preview-delete': performPreviewDelete,
+};
+
 function confirmEvent() {
   const files = footageForEvent(view.eventId).filter(file => view.eventSelection.has(file.id) && !file.confirmed);
   if (!files.length) return;
@@ -613,18 +886,31 @@ function confirmEvent() {
 const actions = {
   scan() { return submitJob('scan'); },
   'incoming-filter'(value) { view.incomingFilter = value; },
+  'incoming-layout'(value) {
+    view.incomingLayout = value;
+    page.querySelector('#incoming-rows').scrollTo(0, 0);
+    try {
+      localStorage.setItem('photo-saver-incoming-layout', value);
+    } catch {
+      // The current page still retains the setting when storage is unavailable.
+    }
+  },
+  'preview-incoming': openIncomingPreview,
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
   'choose-event': chooseEvent,
   'new-event'() { createEventDialog(); },
   'new-child'() { createEventDialog(eventById(view.eventId)); },
+  'edit-event'() { editEventDialog(eventById(view.eventId)); },
+  'delete-event'() { deleteEventDialog(eventById(view.eventId)); },
   async collect() {
     const result = await api(`events/${view.eventId}/collect`, 'POST');
     await syncState();
     announce(collectionMessage(result));
   },
   'move-event': moveEvent,
-  'edit-media': editMedia,
+  'edit-media'() { editMedia(); },
+  'resolve-time'(id) { editMedia([id], true); },
   'confirm-event': confirmEvent,
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); },
   'source-up'() { view.sourcePath.pop(); },
@@ -640,7 +926,7 @@ page.addEventListener('click', async event => {
     announce(error.message);
   } finally {
     control.disabled = false;
-    if (!dialog.open) render();
+    if (!dialog.open && !mediaPreview.open) render();
   }
 });
 
@@ -671,12 +957,91 @@ page.addEventListener('input', event => {
   document.getElementById('incoming-rows').innerHTML = incomingRows();
 });
 
+page.addEventListener('keydown', event => {
+  const card = event.target.closest('[data-card-preview]');
+  if (!card) return;
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    if (!event.repeat) {
+      openIncomingPreview(card.dataset.value);
+      requestPreviewDelete();
+    }
+    return;
+  }
+  const grid = card.closest('.incoming-cards');
+  const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
+  const directions = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -columns, ArrowDown: columns };
+  const direction = directions[event.key];
+  if (!direction) return;
+  event.preventDefault();
+  const cards = [...grid.children];
+  for (let index = cards.indexOf(card.closest('.incoming-card')) + direction; cards[index]; index += direction) {
+    const next = cards[index].querySelector('[data-card-preview]');
+    if (next) {
+      next.focus();
+      break;
+    }
+  }
+});
+
+mediaPreview.addEventListener('click', event => {
+  const action = event.target.closest('button[data-action]')?.dataset.action;
+  if (action) previewActions[action]();
+});
+
+mediaPreview.addEventListener('keydown', event => {
+  const preview = view.preview;
+  if (!preview) return;
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    if (!event.repeat && !preview.confirming) requestPreviewDelete();
+  } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && event.target.tagName !== 'VIDEO') {
+    event.preventDefault();
+    stepPreview(event.key === 'ArrowLeft' ? -1 : 1);
+  }
+});
+
+mediaPreview.addEventListener('cancel', event => {
+  if (view.preview?.confirming && !view.preview.busy) {
+    event.preventDefault();
+    cancelPreviewDelete();
+  }
+});
+
+mediaPreview.addEventListener('close', () => {
+  const id = view.preview?.ids[view.preview.index];
+  view.preview = null;
+  mediaPreview.replaceChildren();
+  if (view.page === 'incoming') {
+    const button = [...page.querySelectorAll('[data-action="preview-incoming"]')].find(element => element.dataset.value === id);
+    (button || page.querySelector('[data-action="incoming-layout"][aria-pressed="true"]'))?.focus();
+  }
+});
+
+mediaPreview.addEventListener('error', event => {
+  if (!event.target.matches('.preview-stage img, .preview-stage video')) return;
+  event.target.hidden = true;
+  event.target.parentElement.querySelector('.preview-media-loading')?.remove();
+  mediaPreview.querySelector('.preview-media-error').hidden = false;
+}, true);
+
+for (const type of ['load', 'loadedmetadata']) {
+  mediaPreview.addEventListener(type, event => {
+    if (event.target.matches('.preview-stage img, .preview-stage video')) {
+      event.target.parentElement.querySelector('.preview-media-loading')?.remove();
+    }
+  }, true);
+}
+
 dialog.addEventListener('click', event => {
   if (event.target.closest('[data-action="close-dialog"]')) dialog.close();
 });
 
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon); });
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => {
+  if (mediaPreview.open) mediaPreview.close();
+  render();
+});
 page.addEventListener('error', event => {
   if (event.target.tagName === 'IMG') event.target.remove();
 }, true);

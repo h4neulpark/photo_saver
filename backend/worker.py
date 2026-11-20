@@ -60,6 +60,7 @@ def store_analysis(file_id, path, sha, info, analysis):
                 event_id=CASE WHEN media.sha=excluded.sha THEN media.event_id END,
                 confirmed=CASE WHEN media.sha=excluded.sha THEN media.confirmed ELSE 0 END,
                 user_time=CASE WHEN media.sha=excluded.sha THEN media.user_time END,
+                user_time_source=CASE WHEN media.sha=excluded.sha THEN media.user_time_source END,
                 user_device=CASE WHEN media.sha=excluded.sha THEN media.user_device END
             """,
             (file_id, path, Path(path).name, kind, sha, info.st_size, snapshot,
@@ -235,13 +236,13 @@ def delete_scanned_photo(row, incoming):
     file_id = row["id"]
     recovering = row["status"] == "deleting"
     try:
-        if not recovering:
-            info = inspect(incoming, row["path"])
-            if fingerprint(info) != row["fingerprint"]:
-                raise OSError("검사 이후 파일이 변경되었습니다. 새로 고침이 필요합니다.")
-            with database(write=True) as db:
-                db.execute("UPDATE scan_files SET status='deleting' WHERE id=?", (file_id,))
         try:
+            sha, _ = hash_file(incoming, row["path"], row["fingerprint"])
+            if sha != row["sha"]:
+                raise OSError("검사 이후 파일이 변경되었습니다. 새로 고침이 필요합니다.")
+            if not recovering:
+                with database(write=True) as db:
+                    db.execute("UPDATE scan_files SET status='deleting' WHERE id=?", (file_id,))
             delete_photo(incoming, row["path"], row["fingerprint"])
         except FileNotFoundError:
             if not recovering:

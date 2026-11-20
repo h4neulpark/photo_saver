@@ -25,6 +25,12 @@ services:
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - catalog:/data
+      - type: bind
+        source: ${PHOTO_LIBRARY_ROOT:-.}/${INCOMING_DIR:-incoming}
+        target: /incoming-preview
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()"]
       interval: 3s
