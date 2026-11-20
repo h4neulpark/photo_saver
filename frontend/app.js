@@ -71,6 +71,7 @@ const view = {
   eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
   settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   sshTestBusy: false, sshTestResult: null,
+  archive: null, archivePath: '', archiveBusy: false, archiveError: '',
 };
 let refreshTimer;
 let stateRequest = 0;
@@ -538,10 +539,49 @@ function archivePage() {
         }).join('')}</ul>` : emptyState('folder', '표시할 파일이 없습니다.', '이벤트 관리에서 배치를 확정하세요.')}
       </section>
       <section class="surface browser" aria-labelledby="destination-title">
-        <div class="surface-head"><div><h2 id="destination-title">${icon('disk')} Destination</h2></div></div>
-        ${emptyState('disk', 'OMV 전송 준비 중')}
+        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} Destination</h2><p class="small muted">원격 아카이브 · 파일 목록 조회</p></div>
+          ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
+            { glyph: 'refresh', primary: !view.archive, disabled: view.archiveBusy })}</div>
+        ${archiveDestination()}
       </section>
     </div>`;
+}
+
+function archiveDestination() {
+  const archive = view.archive;
+  const path = [archive?.root || '', view.archivePath].filter(Boolean).join('/').replace(/\/{2,}/g, '/');
+  return `${archive || view.archivePath ? `<div class="location">
+      ${button('archive-up', '상위 폴더', { glyph: 'up', disabled: view.archiveBusy || !view.archivePath })}
+      <span class="mono archive-path">${escapeHtml(path)}</span>
+    </div>` : ''}
+    ${view.archiveError ? `<p class="archive-error form-error" role="alert">${escapeHtml(view.archiveError)}</p>` : ''}
+    <div aria-busy="${view.archiveBusy}">
+      ${view.archiveBusy ? emptyState('disk', '아카이브를 조회하고 있습니다.') : archive ?
+        `<p class="archive-count small muted" role="status">조회 완료 · ${archive.entries.length}개 항목</p>` +
+        (archive.entries.length ? `<ul class="tree">${archive.entries.map((entry, index) => `<li class="tree-row">
+          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}">${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
+            `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>`}
+        </li>`).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
+        emptyState('disk', view.archiveError ? '파일 목록을 불러오지 못했습니다.' : '원격 아카이브에 연결하세요.',
+          view.archiveError ? '다시 연결하거나 설정에서 SSH 연결 정보를 확인하세요.' : '설정에 저장된 SSH 연결 정보와 저장 절대경로를 사용합니다.')}
+    </div>`;
+}
+
+async function browseArchive(path = view.archivePath) {
+  if (view.archiveBusy) return;
+  view.archiveBusy = true;
+  view.archiveError = '';
+  view.archivePath = path;
+  render();
+  try {
+    view.archive = await api(`archive?path=${encodeURIComponent(path)}`);
+    view.archivePath = view.archive.path;
+  } catch (error) {
+    view.archive = null;
+    view.archiveError = error.message;
+  } finally {
+    view.archiveBusy = false;
+  }
 }
 
 function settingRow(label, description, controls) {
@@ -1177,6 +1217,12 @@ const actions = {
   'confirm-event': confirmEvent,
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); },
   'source-up'() { view.sourcePath.pop(); },
+  'connect-archive'() { return browseArchive(); },
+  'open-archive'(value) {
+    const entry = view.archive?.entries[Number(value)];
+    if (entry?.kind === 'folder') return browseArchive([view.archivePath, entry.name].filter(Boolean).join('/'));
+  },
+  'archive-up'() { return browseArchive(view.archivePath.split('/').slice(0, -1).join('/')); },
 };
 
 page.addEventListener('click', async event => {

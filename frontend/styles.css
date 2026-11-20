@@ -231,6 +231,10 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 }
 .location .mono { flex: 1; min-width: 0; }
 .browser { min-height: 355px; }
+.archive-heading { flex-wrap: wrap; gap: 12px; }
+.archive-path { overflow-wrap: anywhere; }
+.archive-error { margin: 16px; }
+.archive-count { margin: 12px 19px 0; }
 .tree { list-style: none; padding: 7px 0; margin: 0; }
 .tree > li + li { border-top: 1px solid #edf1f7; }
 .tree-row { display: flex; align-items: center; gap: 9px; min-height: 46px; padding: 0 13px; }

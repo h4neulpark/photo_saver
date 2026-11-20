@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, queue_job
 from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
 from settings import router as settings_router
+from archive import router as archive_router
 
 
 @asynccontextmanager
@@ -29,6 +30,7 @@ async def lifespan(_app):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(settings_router)
+app.include_router(archive_router)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
 MEDIA_TYPES = {
