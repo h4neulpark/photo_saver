@@ -1,0 +1,51 @@
+x-backend: &backend
+  image: photo-saver-backend
+  environment:
+    PHOTO_SAVER_TIMEZONE: ${PHOTO_SAVER_TIMEZONE:-Asia/Seoul}
+    INCOMING_DIR: ${INCOMING_DIR:-incoming}
+    MANAGED_DIR: ${MANAGED_DIR:-managed}
+  restart: unless-stopped
+
+services:
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:${PHOTO_SAVER_PORT:-8888}:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./backend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - thumbnails:/thumbnails:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    build: ./backend
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - catalog:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    <<: *backend
+    command: ["python", "worker.py"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - catalog:/data
+      - thumbnails:/thumbnails
+      - type: bind
+        source: ${PHOTO_LIBRARY_ROOT:-.}
+        target: /library
+        bind:
+          create_host_path: false
+
+volumes:
+  catalog:
+  thumbnails:
