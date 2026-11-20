@@ -573,10 +573,11 @@ function settingsPage() {
         button('edit-storage-root', settings?.storageRootConfigured ? '경로 변경' : '경로 등록', { disabled: !settings }))}
       ${settingRow('SSH 계정명', '.env의 PHOTO_SAVER_STORAGE_USER에서 설정',
         maskedSetting(settings ? settings.accountConfigured ? '등록됨' : '미등록' : '확인 중'))}
-      ${settingRow('SSH 공개키', '공개키를 처음 한 번 복사해 스토리지의 SSH 계정에 등록하세요.',
-        maskedSetting(settings ? keyCopied ? '최초 복사 완료' : settings.keyGenerated ? '생성됨' : '미생성' : '확인 중') +
-        (settings?.keyGenerated ? button('copy-public-key', '공개키 복사', { glyph: 'copy', disabled: keyCopied || !view.publicKeyToCopy }) :
-          button('generate-storage-key', '공개키 생성', { glyph: 'key', primary: true, disabled: !settings })))}
+      ${settingRow('SSH 공개키', '키마다 한 번 복사할 수 있습니다. 새로 생성하면 다시 복사할 수 있습니다.',
+        maskedSetting(settings ? keyCopied ? '복사 완료' : settings.keyGenerated ? '생성됨' : '미생성' : '확인 중') +
+        (settings?.keyGenerated ? button('copy-public-key', '공개키 복사', { glyph: 'copy', disabled: keyCopied || !view.publicKeyToCopy || view.sshTestBusy }) +
+          button('regenerate-storage-key', '공개키 재생성', { glyph: 'key', disabled: view.sshTestBusy }) :
+          button('generate-storage-key', '공개키 생성', { glyph: 'key', primary: true, disabled: !settings || view.sshTestBusy })))}
       ${settingRow('SSH 접속 테스트', view.sshTestResult ? `<span role="status" class="${view.sshTestResult.ok ? 'ssh-test-success' : 'form-error'}">${escapeHtml(view.sshTestResult.message)}</span>` :
         '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
         button('test-storage-ssh', view.sshTestBusy ? '테스트 중…' : '접속 테스트', { glyph: 'refresh', disabled: !settings || view.sshTestBusy }))}
@@ -628,9 +629,17 @@ function editStorageRoot() {
 }
 
 async function generateStorageKey() {
-  await api('settings/ssh-key', 'POST');
+  view.settings = await api('settings/ssh-key', 'POST');
+  view.keyCopiedLocally = false;
+  view.publicKeyToCopy = null;
+  view.sshTestResult = null;
   await loadSettings();
   announce('SSH 키를 생성했습니다. 공개키를 복사해 스토리지에 등록하세요.');
+}
+
+function regenerateStorageKey() {
+  showDialog('SSH 공개키 재생성', '<p>기존 SSH 키를 새 키로 교체합니다. 새 공개키를 스토리지 계정에 등록해야 다시 접속할 수 있습니다.</p>',
+    '재생성', generateStorageKey, { danger: true });
 }
 
 async function copyStorageKey() {
@@ -1146,6 +1155,7 @@ const actions = {
   'edit-storage-address': editStorageAddress,
   'edit-storage-root': editStorageRoot,
   'generate-storage-key': generateStorageKey,
+  'regenerate-storage-key': regenerateStorageKey,
   'copy-public-key': copyStorageKey,
   'test-storage-ssh': testStorageSsh,
   'download-catalog': downloadCatalog,

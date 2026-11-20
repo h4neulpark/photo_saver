@@ -143,8 +143,6 @@ def save_storage_root(request: StorageRoot):
 @router.post("/ssh-key", status_code=201)
 def generate_key():
     with settings_lock():
-        if KEY_DIR.exists():
-            fail(409, "이미 생성된 SSH 키가 있습니다.")
         with tempfile.TemporaryDirectory(dir=SETTINGS_DIR) as directory:
             staged = Path(directory) / "ssh"
             staged.mkdir(mode=0o700)
@@ -155,7 +153,15 @@ def generate_key():
                 )
             except (OSError, subprocess.SubprocessError):
                 fail(500, "SSH 키를 생성할 수 없습니다.")
-            staged.rename(KEY_DIR)
+            previous = Path(directory) / "previous-ssh"
+            if KEY_DIR.exists():
+                KEY_DIR.rename(previous)
+            try:
+                staged.rename(KEY_DIR)
+            except OSError:
+                if previous.exists():
+                    previous.rename(KEY_DIR)
+                raise
     return JSONResponse(settings_state(), status_code=201, headers=NO_STORE)
 
 
