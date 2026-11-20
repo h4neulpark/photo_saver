@@ -72,6 +72,7 @@ const view = {
   settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '',
+  sourceSelection: new Set(), uploadStarting: false, dragSource: null,
 };
 let refreshTimer;
 let stateRequest = 0;
@@ -109,7 +110,9 @@ function jobActive(job = state.job) {
 }
 
 function jobMessage(job) {
+  if (job.status === 'cancelled') return job.result.error || '작업을 중지했습니다.';
   if (job.status === 'failed') return job.result.error;
+  if (job.kind === 'upload') return `업로드 ${job.result.uploaded}개 완료 · 동일 파일 ${job.result.skipped}개 건너뜀`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
   if (job.kind === 'xmp-link') return `XMP ${job.result.linked}개를 연결했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
@@ -127,7 +130,10 @@ async function syncState() {
     view.loadError = '';
     if (jobActive(previousJob) && state.job?.id === previousJob.id && !jobActive()) {
       announce(jobMessage(state.job));
+      if (state.job.kind === 'upload' && view.archive && view.page === 'archive') await browseArchive(view.archivePath);
     }
+    const sourceKeys = new Set(sourceFiles().flatMap(sourceAssetKeys));
+    for (const key of view.sourceSelection) if (!sourceKeys.has(key)) view.sourceSelection.delete(key);
     const selectable = new Set(state.incoming.filter(canSelectIncoming).map(file => file.id));
     for (const id of view.incomingSelection) {
       if (!selectable.has(id)) view.incomingSelection.delete(id);
@@ -425,6 +431,9 @@ function eventPage() {
   const destinations = eventDestinations(event);
   const devices = [...new Set(files.map(file => file.device).filter(Boolean))];
   const selected = view.eventSelection.size;
+  const confirmButton = event ? button('confirm-event', '선택 배치 확정', {
+    glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && !file.confirmed),
+  }) : '';
   return `${header('이벤트 관리', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
     button('new-event', '이벤트 생성', { glyph: 'plus', primary: true }))}
     <div class="event-split">
@@ -458,6 +467,7 @@ function eventPage() {
           <select id="event-date" aria-label="촬영일 필터"><option value="">모든 촬영일</option>${dates.map(date =>
             `<option ${view.eventDate === date ? 'selected' : ''}>${date}</option>`).join('')}</select>
           ${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}
+          ${confirmButton}
         </div>
         <div class="table-wrap">${filtered.length ? `<table aria-label="이벤트별 파일">
           <thead><tr><th scope="col">${checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set(filtered.every(file => view.eventSelection.has(file.id)) ? ['all'] : []))}</th>
@@ -479,7 +489,7 @@ function eventPage() {
             ${button('move-event', '이동', { disabled: true })}` : ''}
             ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
           </div>
-          ${event ? button('confirm-event', '선택 배치 확정', { glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && !file.confirmed) }) : ''}
+          ${confirmButton}
         </div>
       </section>
     </div>`;
@@ -497,6 +507,10 @@ function sourceFiles() {
   return state.managed.filter(file => file.confirmed && eventById(file.eventId));
 }
 
+function sourceAssetKeys(file) {
+  return [`${file.id}:media`, ...(file.xmp ? [`${file.id}:xmp`] : [])];
+}
+
 function sourceEntries() {
   const folders = new Map();
   const files = [];
@@ -506,40 +520,49 @@ function sourceEntries() {
     const nextFolder = path[view.sourcePath.length];
     if (!nextFolder) {
       files.push(file);
-      if (file.xmp) files.push({ name: file.xmp.name, kind: 'xmp', size: null });
+      if (file.xmp) files.push({ id: file.id, name: file.xmp.name, kind: 'xmp', size: null });
       continue;
     }
     if (!folders.has(nextFolder)) folders.set(nextFolder, []);
     folders.get(nextFolder).push(file);
   }
-  const folderEntries = Array.from(folders, ([name, members]) => ({ name, members }));
-  return [...folderEntries, ...files.map(file => ({ name: file.name, file }))];
+  const folderEntries = Array.from(folders, ([name, members]) => ({ name, members, assets: members.flatMap(sourceAssetKeys) }));
+  return [...folderEntries, ...files.map(file => ({ name: file.name, file, assets: [`${file.id}:${file.kind === 'xmp' ? 'xmp' : 'media'}`] }))];
 }
 
 
 function archivePage() {
   const entries = sourceEntries();
-  return `${header('아카이브 전송', '확정된 이벤트와 장비별 파일 구조를 확인하세요.', '')}
+  const allAssets = entries.flatMap(entry => entry.assets);
+  const busy = jobActive() || view.uploadStarting;
+  return `${header('아카이브 전송', '파일·폴더를 선택해 업로드하거나 Destination으로 드래그하세요.', '')}
+    ${uploadStatus()}
     <div class="split">
       <section class="surface browser" aria-labelledby="source-title">
-        <div class="surface-head"><div><h2 id="source-title">${icon('folder')} Source</h2><p class="small muted">확정된 이벤트 배치</p></div><span class="small muted">${sourceFiles().length}개 파일</span></div>
+        <div class="surface-head archive-heading"><div><h2 id="source-title">${icon('folder')} Source</h2><p class="small muted">확정된 이벤트 배치</p></div>
+          ${button('upload-archive', view.uploadStarting ? '예약 중…' : '업로드', { glyph: 'upload', primary: true, disabled: busy || !view.archive || view.archiveBusy || !view.sourceSelection.size })}</div>
         <div class="location">
           ${view.sourcePath.length ? smallButton('source-up', '상위 폴더', 'up') : icon('folder')}
-          <span class="mono">${escapeHtml(['/managed', ...view.sourcePath].join('/'))}</span>
+          <span class="mono archive-path">${escapeHtml(['/managed', ...view.sourcePath].join('/'))}</span>
         </div>
+        <div class="source-selection"><label>${checkbox('source-all', 'all', '표시된 Source 항목 모두 선택', new Set(allAssets.length && allAssets.every(key => view.sourceSelection.has(key)) ? ['all'] : []))} 모두 선택</label>
+          <span class="small muted" role="status">${view.sourceSelection.size}개 파일 선택</span></div>
         ${entries.length ? `<ul class="tree">${entries.map((entry, index) => {
           const name = escapeHtml(entry.name);
-          if (entry.file) return `<li class="tree-row">
+          const selected = entry.assets.every(key => view.sourceSelection.has(key));
+          const selection = checkbox('source', String(index), `${entry.name} 업로드 선택`, new Set(selected ? [String(index)] : []));
+          const attributes = `draggable="${!busy}" data-source-index="${index}" class="tree-row${selected ? ' source-selected' : ''}"`;
+          if (entry.file) return `<li ${attributes}>${selection}
             <span class="tree-file">${icon(entry.file.kind === 'xmp' ? 'file' : entry.file.kind)}${name}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
           </li>`;
-          return `<li class="tree-row">
+          return `<li ${attributes}>${selection}
             <button type="button" class="tree-button" data-action="open-source" data-value="${index}">${icon('folder')}<span>${name}</span>${icon('right')}</button>
             <span class="meta">${entry.members.length}개</span>
           </li>`;
         }).join('')}</ul>` : emptyState('folder', '표시할 파일이 없습니다.', '이벤트 관리에서 배치를 확정하세요.')}
       </section>
-      <section class="surface browser" aria-labelledby="destination-title">
-        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} Destination</h2><p class="small muted">원격 아카이브 · 파일 목록 조회</p></div>
+      <section class="surface browser archive-destination" aria-labelledby="destination-title" ${view.archive && !view.archiveBusy && !busy ? `data-archive-drop="${escapeHtml(view.archivePath)}"` : ''}>
+        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} Destination</h2><p class="small muted">${view.archive ? '현재 폴더에 업로드 · 폴더 위에 놓으면 해당 폴더로 전송' : '원격 아카이브 연결'}</p></div>
           ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
             { glyph: 'refresh', primary: !view.archive, disabled: view.archiveBusy })}</div>
         ${archiveDestination()}
@@ -559,12 +582,44 @@ function archiveDestination() {
       ${view.archiveBusy ? emptyState('disk', '아카이브를 조회하고 있습니다.') : archive ?
         `<p class="archive-count small muted" role="status">조회 완료 · ${archive.entries.length}개 항목</p>` +
         (archive.entries.length ? `<ul class="tree">${archive.entries.map((entry, index) => `<li class="tree-row">
-          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}">${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
+          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}" ${!jobActive() && !view.uploadStarting ? `data-archive-drop="${escapeHtml([view.archivePath, entry.name].filter(Boolean).join('/'))}"` : ''}>${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
             `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>`}
         </li>`).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
         emptyState('disk', view.archiveError ? '파일 목록을 불러오지 못했습니다.' : '원격 아카이브에 연결하세요.',
           view.archiveError ? '다시 연결하거나 설정에서 SSH 연결 정보를 확인하세요.' : '설정에 저장된 SSH 연결 정보와 저장 절대경로를 사용합니다.')}
     </div>`;
+}
+
+function uploadStatus() {
+  const job = state.job;
+  if (job?.kind !== 'upload') return '';
+  const result = job.result || {};
+  const active = jobActive(job);
+  const percent = Math.min(100, Math.round((result.transferredBytes || 0) / (result.totalBytes || 1) * 100));
+  return `<section class="surface upload-status" aria-label="아카이브 업로드 상태">
+    <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '업로드 대기 중' : result.phase || '업로드 중' : job.status === 'done' ? '업로드 완료' : job.status === 'cancelled' ? '업로드 중지됨' : '업로드 실패'}</strong>
+      <span class="small muted">${result.completedFiles || 0} / ${result.totalFiles || 0}개 처리 · 업로드 ${result.uploaded || 0}개 · 건너뜀 ${result.skipped || 0}개 · 실패 ${result.failed || 0}개</span>
+      ${active ? button('cancel-archive-upload', result.cancelRequested ? '중지 중…' : '업로드 중지', { disabled: result.cancelRequested }) : ''}</div>
+    ${active ? `<progress max="100" value="${percent}" aria-label="업로드 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '서버에 연결하고 있습니다.')} · ${sizeLabel((result.transferredBytes || 0) / 1_000_000)} / ${sizeLabel((result.totalBytes || 0) / 1_000_000)}</p>` : ''}
+    ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
+    ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
+  </section>`;
+}
+
+async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath) {
+  if (jobActive() || view.uploadStarting || view.archiveBusy || !view.archive || !keys.length) return;
+  if (keys.length > 10000) throw new Error('한 번에 최대 10,000개 파일을 업로드할 수 있습니다. 나누어 선택하세요.');
+  view.uploadStarting = true;
+  render();
+  try {
+    const items = keys.map(key => { const [id, kind] = key.split(':'); return { id, kind }; });
+    const result = await api('archive/transfers', 'POST', { items, source, destination, connection: view.archive.connectionVersion });
+    state.job = { id: result.id, kind: 'upload', status: 'queued', result: { totalFiles: result.count } };
+    await syncState();
+    announce(`${result.count}개 파일의 업로드를 시작합니다.`);
+  } finally {
+    view.uploadStarting = false;
+  }
 }
 
 async function browseArchive(path = view.archivePath) {
@@ -969,6 +1024,20 @@ function render() {
   page.innerHTML = `<main aria-labelledby="page-title">${status}${views[view.page]()}</main>`;
   document.title = `${current.title} · Photo Saver`;
   if (view.page === 'events') updateEventActions();
+  if (view.page === 'archive') {
+    const entries = sourceEntries();
+    page.querySelectorAll('[data-select="source"]').forEach(input => {
+      const keys = entries[Number(input.value)]?.assets || [];
+      input.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
+      input.disabled = jobActive() || view.uploadStarting;
+    });
+    const all = page.querySelector('[data-select="source-all"]');
+    const keys = entries.flatMap(entry => entry.assets);
+    if (all) {
+      all.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
+      all.disabled = !keys.length || jobActive() || view.uploadStarting;
+    }
+  }
   if (pageChanged) {
     window.scrollTo(0, 0);
     return;
@@ -999,6 +1068,10 @@ function handleSelection(control) {
   if (kind === 'incoming' || kind === 'incoming-all') {
     const ids = kind === 'incoming' ? [id] : filteredIncoming().filter(canSelectIncoming).map(file => file.id);
     toggleSelection(view.incomingSelection, ids, control.checked);
+  } else if (kind === 'source' || kind === 'source-all') {
+    const entries = sourceEntries();
+    const keys = kind === 'source-all' ? entries.flatMap(entry => entry.assets) : entries[Number(id)]?.assets || [];
+    toggleSelection(view.sourceSelection, keys, control.checked);
   } else {
     const ids = kind === 'event' ? [id] : filteredEventFiles(footageForEvent(view.eventId)).map(file => file.id);
     toggleSelection(view.eventSelection, ids, control.checked);
@@ -1215,8 +1288,13 @@ const actions = {
   'edit-media'() { editMedia(); },
   'resolve-time'(id) { editMedia([id], true); },
   'confirm-event': confirmEvent,
-  'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); },
-  'source-up'() { view.sourcePath.pop(); },
+  'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); view.sourceSelection.clear(); },
+  'source-up'() { view.sourcePath.pop(); view.sourceSelection.clear(); },
+  'upload-archive'() { return startArchiveUpload(); },
+  async 'cancel-archive-upload'() {
+    state.job = await api(`archive/transfers/${state.job.id}/cancel`, 'POST');
+    await syncState();
+  },
   'connect-archive'() { return browseArchive(); },
   'open-archive'(value) {
     const entry = view.archive?.entries[Number(value)];
@@ -1236,6 +1314,59 @@ page.addEventListener('click', async event => {
   } finally {
     control.disabled = false;
     if (!dialog.open && !mediaPreview.open) render();
+  }
+});
+
+const archiveDragType = 'application/x-photo-saver';
+
+function clearArchiveDrag() {
+  view.dragSource = null;
+  page.classList.remove('source-dragging');
+  page.querySelectorAll('.archive-drop-hover').forEach(element => element.classList.remove('archive-drop-hover'));
+}
+
+page.addEventListener('dragstart', event => {
+  const row = event.target.closest('[data-source-index]');
+  if (!row || jobActive() || view.uploadStarting) return;
+  const entry = sourceEntries()[Number(row.dataset.sourceIndex)];
+  if (!entry) return;
+  const keys = entry.assets.every(key => view.sourceSelection.has(key)) ? [...view.sourceSelection] : entry.assets;
+  view.dragSource = { keys, source: [...view.sourcePath] };
+  event.dataTransfer.setData(archiveDragType, JSON.stringify(view.dragSource));
+  event.dataTransfer.effectAllowed = 'copy';
+  page.classList.add('source-dragging');
+});
+
+page.addEventListener('dragover', event => {
+  const target = event.target.closest('[data-archive-drop]');
+  if (!target || !view.dragSource || jobActive() || view.uploadStarting) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+  page.querySelectorAll('.archive-drop-hover').forEach(element => {
+    if (element !== target) element.classList.remove('archive-drop-hover');
+  });
+  target.classList.add('archive-drop-hover');
+});
+
+page.addEventListener('dragleave', event => {
+  const target = event.target.closest('[data-archive-drop]');
+  if (target && !target.contains(event.relatedTarget)) target.classList.remove('archive-drop-hover');
+});
+
+page.addEventListener('dragend', clearArchiveDrag);
+page.addEventListener('drop', async event => {
+  const target = event.target.closest('[data-archive-drop]');
+  if (!target || !view.dragSource) return;
+  event.preventDefault();
+  const drag = view.dragSource;
+  const destination = target.dataset.archiveDrop;
+  clearArchiveDrag();
+  try {
+    await startArchiveUpload(drag.keys, drag.source, destination);
+  } catch (error) {
+    announce(error.message);
+  } finally {
+    render();
   }
 });
 

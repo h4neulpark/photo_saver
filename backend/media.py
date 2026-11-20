@@ -2,6 +2,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from catalog import DEFAULT_ZONE, PHOTOS, THUMBNAILS
 register_heif_opener()
 VIDEOS = {".mp4", ".mov"}
 SUPPORTED = PHOTOS | VIDEOS
+VIDEO_METADATA_VERSION = 2
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 RENAME_NOREPLACE = 1
@@ -205,6 +207,34 @@ def save_image_preview(image, destination, bounds):
     upright.convert("RGB").save(destination, format="JPEG", quality=84)
 
 
+def gopro_metadata(info, input_path, options):
+    streams = info.get("streams", [])
+    evidence = []
+    for item in [info.get("format", {}), *streams]:
+        for key, value in item.get("tags", {}).items():
+            if key.lower() in {"make", "com.apple.quicktime.make", "encoder", "handler_name"} and re.search(r"\bgopro\b", str(value), re.IGNORECASE):
+                evidence.append(f"{key}: {value}".strip())
+    if any(item.get("codec_tag_string") == "gpmd" for item in streams):
+        evidence.append("GoPro metadata track (gpmd)")
+    if not evidence:
+        return {}
+    result = {"make": "GoPro", "device_evidence": evidence}
+    try:
+        extracted = subprocess.run(
+            ["exiftool", "-j", "-GoPro:Model", "-GoPro:FirmwareVersion", input_path],
+            timeout=15, **options,
+        )
+        tags = json.loads(extracted.stdout)[0]
+        if tags.get("Model"):
+            result["model"] = str(tags["Model"]).strip()
+        if tags.get("FirmwareVersion"):
+            result["firmware"] = str(tags["FirmwareVersion"]).strip()
+    except (OSError, ValueError, IndexError, TypeError, subprocess.SubprocessError):
+        # The encoder/track still identifies GoPro if its model cannot be read.
+        pass
+    return result
+
+
 def video_metadata(stream, thumbnail):
     input_path = f"/proc/self/fd/{stream.fileno()}"
     options = {"pass_fds": (stream.fileno(),), "capture_output": True, "check": True}
@@ -226,7 +256,15 @@ def video_metadata(stream, thumbnail):
         "make": tags.get("com.apple.quicktime.make") or tags.get("make", ""),
         "model": tags.get("com.apple.quicktime.model") or tags.get("model", ""),
         "raw_time": raw_time or "",
+        "video_metadata_version": VIDEO_METADATA_VERSION,
     }
+    gopro = gopro_metadata(info, input_path, options)
+    if gopro and (not details["make"] or details["make"].strip().casefold() == "gopro"):
+        details["make"] = gopro["make"]
+        details["model"] = details["model"] or gopro.get("model", "")
+        details["device_evidence"] = gopro["device_evidence"]
+        if gopro.get("firmware"):
+            details["firmware"] = gopro["firmware"]
     if video and thumbnail:
         try:
             subprocess.run(

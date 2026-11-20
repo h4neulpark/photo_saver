@@ -43,6 +43,9 @@ services:
 
   worker:
     <<: *backend
+    environment:
+      <<: *backend-env
+      PHOTO_SAVER_STORAGE_USER: ${PHOTO_SAVER_STORAGE_USER:-}
     command: ["python", "worker.py"]
     depends_on:
       api:
@@ -50,6 +53,7 @@ services:
     volumes:
       - catalog:/data
       - thumbnails:/thumbnails
+      - settings:/settings:ro
       - type: bind
         source: ${PHOTO_LIBRARY_ROOT:-.}
         target: /library

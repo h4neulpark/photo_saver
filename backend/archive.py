@@ -2,6 +2,9 @@ import errno
 import socket
 import stat
 import time
+import hashlib
+import json
+from contextlib import contextmanager
 from pathlib import PurePosixPath
 
 import paramiko
@@ -49,6 +52,13 @@ def directory_listing(sftp, root, path):
 @router.get("")
 def browse_archive(path: str = ""):
     relative = relative_path(path)
+    with archive_connection() as (sftp, config):
+        result = directory_listing(sftp, config["root"], relative)
+        result["connectionVersion"] = archive_revision(config)
+    return JSONResponse(result, headers=settings.NO_STORE)
+
+
+def archive_config():
     address, account = settings.ssh_target()
     root = settings.read_setting(settings.STORAGE_ROOT_FILE)
     if not root or not PurePosixPath(root).is_absolute() or "\0" in root:
@@ -56,6 +66,26 @@ def browse_archive(path: str = ""):
     known_hosts = settings.known_host_file(address)
     if not known_hosts.is_file():
         settings.fail(409, "설정의 SSH 접속 테스트에서 서버 호스트 키를 먼저 확인하세요.")
+    if not settings.PUBLIC_KEY.is_file():
+        settings.fail(409, "SSH 공개키를 확인할 수 없습니다. 설정에서 키 등록 상태를 확인하세요.")
+    return {
+        "address": address, "account": account, "root": root,
+        "hostKey": settings.read_setting(known_hosts),
+        "identity": hashlib.sha256(settings.PUBLIC_KEY.read_bytes()).hexdigest(),
+    }
+
+
+def archive_revision(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+@contextmanager
+def archive_connection(expected=None):
+    config = archive_config()
+    if expected is not None and config != expected:
+        settings.fail(409, "전송 예약 후 SSH 설정이 변경되었습니다. 다시 업로드하세요.")
+    address, account = config["address"], config["account"]
+    known_hosts = settings.known_host_file(address)
     try:
         trusted = paramiko.HostKeys(str(known_hosts)).lookup(settings.host_alias(address))
         if not trusted:
@@ -70,7 +100,7 @@ def browse_archive(path: str = ""):
             )
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(10)
-                result = directory_listing(sftp, root, relative)
+                yield sftp, config
     except paramiko.BadHostKeyException:
         settings.fail(409, "서버 호스트 키가 저장된 값과 다릅니다. 설정에서 접속 테스트를 실행하세요.")
     except paramiko.AuthenticationException:
@@ -87,4 +117,3 @@ def browse_archive(path: str = ""):
         settings.fail(502, "아카이브에 연결할 수 없습니다. IP와 SSH 서비스 상태를 확인하세요.")
     except (paramiko.SSHException, ValueError):
         settings.fail(502, "SFTP로 파일 목록을 읽을 수 없습니다. 설정의 접속 테스트와 서버의 SFTP 지원을 확인하세요.")
-    return JSONResponse(result, headers=settings.NO_STORE)

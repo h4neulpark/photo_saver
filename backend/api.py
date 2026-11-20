@@ -15,10 +15,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, queue_job
+from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, now, queue_job
 from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
 from settings import router as settings_router
 from archive import router as archive_router
+from transfers import TransferRequest, queue_transfer
 
 
 @asynccontextmanager
@@ -322,6 +323,28 @@ def scan_library():
             return {"id": queue_job(db, "scan", {})}
         except ValueError as exc:
             error(409, str(exc))
+
+
+@app.post("/api/archive/transfers", status_code=202)
+def upload_archive(request: TransferRequest):
+    with database(write=True) as db:
+        return queue_transfer(db, request, device_folder)
+
+
+@app.post("/api/archive/transfers/{job_id}/cancel")
+def cancel_archive_upload(job_id: int):
+    with database(write=True) as db:
+        job = db.execute("SELECT * FROM jobs WHERE id=? AND kind='upload'", (job_id,)).fetchone()
+        if not job:
+            error(404, "전송 작업을 찾을 수 없습니다.")
+        if job["status"] in {"queued", "running"}:
+            result = json.loads(job["result"] or "{}")
+            result["cancelRequested"] = True
+            if job["status"] == "queued":
+                result["error"] = "업로드를 중지했습니다."
+                db.execute("UPDATE jobs SET status='cancelled',finished_at=? WHERE id=?", (now(), job_id))
+            db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id))
+        return view_job(db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
 
 @app.post("/api/jobs/move", status_code=202)

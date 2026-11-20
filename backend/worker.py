@@ -11,9 +11,10 @@ from zoneinfo import ZoneInfo
 from catalog import DATA, DEFAULT_ZONE, PHOTOS, THUMBNAILS, database, initialize, now
 from companions import CAMERA_AUX, COMPANION_EXTENSIONS, XMP, read_xmp, source_candidates, source_index, xmp_owner
 from media import (
-    SUPPORTED, analyze, delete_photo, delete_verified_file, fingerprint, hash_file, inspect, iso_time, move_file,
+    SUPPORTED, VIDEO_METADATA_VERSION, analyze, delete_photo, delete_verified_file, fingerprint, hash_file, inspect, iso_time, move_file,
     preview_thumbnail, relative_parts, scan_tree, thumbnail_path,
 )
+from transfers import upload_selection
 
 log = logging.getLogger(__name__)
 ROOT = Path(os.environ.get("PHOTO_SAVER_LIBRARY", "/library")).resolve()
@@ -89,6 +90,9 @@ def index_managed(managed):
             snapshot = fingerprint(info)
             if old and old["status"] == "available" and old["fingerprint"] == snapshot:
                 sha = old["sha"]
+                if old["kind"] == "video" and json.loads(old["metadata"]).get("video_metadata_version") != VIDEO_METADATA_VERSION:
+                    result = analyze(managed, path, sha, snapshot)
+                    store_analysis(old["id"], path, sha, info, result)
             else:
                 sha, info = hash_file(managed, path, snapshot)
                 snapshot = fingerprint(info)
@@ -500,7 +504,7 @@ def run():
             db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
 
         log.info("수집 워커 시작 · %s → %s", incoming, managed)
-        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection}
+        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection, "upload": upload_selection}
         while True:
             with database(write=True) as db:
                 job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()

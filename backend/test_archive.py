@@ -65,7 +65,7 @@ class ArchiveTests(unittest.TestCase):
             (archive.paramiko.AuthenticationException(), 401),
             (TimeoutError(), 504),
         ]:
-            with self.subTest(failure=failure), patch.object(archive.settings, "ssh_target", return_value=("127.0.0.1", "test")), \
+            with self.subTest(failure=failure), patch.object(archive, "archive_config", return_value={"address": "127.0.0.1", "account": "test", "root": "/archive"}), patch.object(archive.settings, "ssh_target", return_value=("127.0.0.1", "test")), \
                     patch.object(archive.settings, "read_setting", return_value="/archive"), \
                     patch.object(archive.settings, "known_host_file") as known, \
                     patch.object(archive.paramiko, "HostKeys", side_effect=failure):
@@ -75,7 +75,7 @@ class ArchiveTests(unittest.TestCase):
                 self.assertEqual(error.exception.status_code, expected)
 
     def test_uses_saved_host_key_and_private_key_without_agent_or_password(self):
-        with patch.object(archive.settings, "ssh_target", return_value=("127.0.0.1", "test")), \
+        with patch.object(archive, "archive_config", return_value={"address": "127.0.0.1", "account": "test", "root": "/archive"}), patch.object(archive.settings, "ssh_target", return_value=("127.0.0.1", "test")), \
                 patch.object(archive.settings, "read_setting", return_value="/archive"), \
                 patch.object(archive.settings, "known_host_file") as known, \
                 patch.object(archive.paramiko, "HostKeys") as hosts, \
