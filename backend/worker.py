@@ -3,13 +3,15 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from catalog import DATA, DEFAULT_ZONE, PHOTOS, THUMBNAILS, database, initialize, now
+from companions import CAMERA_AUX, COMPANION_EXTENSIONS, XMP, read_xmp, source_candidates, source_index, xmp_owner
 from media import (
-    analyze, delete_photo, fingerprint, hash_file, inspect, iso_time, move_file,
+    SUPPORTED, analyze, delete_photo, delete_verified_file, fingerprint, hash_file, inspect, iso_time, move_file,
     preview_thumbnail, relative_parts, scan_tree, thumbnail_path,
 )
 
@@ -61,7 +63,11 @@ def store_analysis(file_id, path, sha, info, analysis):
                 confirmed=CASE WHEN media.sha=excluded.sha THEN media.confirmed ELSE 0 END,
                 user_time=CASE WHEN media.sha=excluded.sha THEN media.user_time END,
                 user_time_source=CASE WHEN media.sha=excluded.sha THEN media.user_time_source END,
-                user_device=CASE WHEN media.sha=excluded.sha THEN media.user_device END
+                user_device=CASE WHEN media.sha=excluded.sha THEN media.user_device END,
+                original_path=CASE WHEN media.sha=excluded.sha THEN media.original_path END,
+                xmp_path=CASE WHEN media.sha=excluded.sha THEN media.xmp_path END,
+                xmp_sha=CASE WHEN media.sha=excluded.sha THEN media.xmp_sha END,
+                xmp_metadata=CASE WHEN media.sha=excluded.sha THEN media.xmp_metadata END
             """,
             (file_id, path, Path(path).name, kind, sha, info.st_size, snapshot,
              json.dumps(details, ensure_ascii=False), thumbnail, captured, source, int(verified), device),
@@ -103,9 +109,97 @@ def index_managed(managed):
     return known
 
 
+def plan_companions(incoming, companion_files, media_rows):
+    with database(write=True) as db:
+        db.execute("""UPDATE media SET original_path=(SELECT path FROM scan_files WHERE scan_files.id=media.id)
+                      WHERE original_path IS NULL AND id IN (SELECT id FROM scan_files WHERE status='moved')""")
+        known = db.execute("SELECT * FROM media WHERE status='available'").fetchall()
+    incoming_by_path = {row[2]: row for row in media_rows}
+    incoming_index = source_index(incoming_by_path)
+    known_by_origin = defaultdict(list)
+    known_by_path = {row["path"]: row for row in known}
+    known_by_sha = defaultdict(list)
+    for row in known:
+        if row["original_path"]:
+            known_by_origin[row["original_path"]].append(row)
+        known_by_sha[row["sha"]].append(row)
+    known_origin_index = source_index(known_by_origin)
+    known_name_index = source_index(known_by_path, include_folder=False)
+    attached = defaultdict(list)
+    pending = []
+    for path, initial in companion_files:
+        if initial is None:
+            continue
+        suffix = Path(path).suffix.lower()
+        candidates = source_candidates(path, incoming_index)
+        if suffix in CAMERA_AUX:
+            if len(candidates) == 1:
+                attached[candidates[0]].append({"path": path, "fingerprint": fingerprint(initial)})
+            continue
+        try:
+            sidecar = read_xmp(incoming, path, fingerprint(initial))
+        except OSError:
+            log.warning("XMP를 읽을 수 없습니다: %s", path)
+            continue
+        owner = xmp_owner(candidates)
+        options = []
+        if owner:
+            row = incoming_by_path[owner]
+            if row[-2] == "ready":
+                attached[owner].append(sidecar)
+                continue
+            if row[-2] == "duplicate":
+                options = known_by_sha[row[4]]
+        elif not candidates:
+            prior_paths = source_candidates(path, known_origin_index)
+            if prior_paths:
+                options = [row for prior in prior_paths for row in known_by_origin[prior]]
+            else:
+                options = [known_by_path[item] for item in source_candidates(path, known_name_index, include_folder=False)]
+        options = [row for row in options if not row["xmp_path"] or row["xmp_sha"] == sidecar["sha"]]
+        preferred = xmp_owner([row["path"] for row in options])
+        sidecar["recommended"] = next((row["id"] for row in options if row["path"] == preferred), None)
+        pending.append((uuid4().hex, sidecar, [row["id"] for row in options]))
+    return attached, pending
+
+
+def index_managed_xmp(managed):
+    with database() as db:
+        records = db.execute("SELECT id,path,xmp_path,xmp_sha FROM media WHERE status='available'").fetchall()
+    by_path = {row["path"]: row for row in records}
+    assigned = {row["xmp_path"]: row for row in records if row["xmp_path"]}
+    free = {row["path"] for row in records if not row["xmp_path"]}
+    index = source_index(free)
+    seen = set()
+    for path, initial in scan_tree(managed, {XMP}):
+        seen.add(path)
+        owner = assigned.get(path)
+        if not owner:
+            candidate = xmp_owner([item for item in source_candidates(path, index) if item in free])
+            owner = by_path.get(candidate)
+        if not owner or initial is None:
+            continue
+        try:
+            sidecar = read_xmp(managed, path, fingerprint(initial))
+        except OSError:
+            log.warning("보관 중인 XMP를 읽을 수 없습니다: %s", path)
+            continue
+        if owner["xmp_sha"] != sidecar["sha"]:
+            with database(write=True) as db:
+                associate_xmp(db, owner["id"], path, sidecar)
+        free.discard(owner["path"])
+    missing = assigned.keys() - seen
+    if missing:
+        with database(write=True) as db:
+            db.executemany("UPDATE media SET xmp_path=NULL,xmp_sha=NULL,xmp_metadata=NULL WHERE xmp_path=?", [(path,) for path in missing])
+
+
 def scan_incoming(job, incoming, managed):
     known = index_managed(managed)
-    candidates = list(scan_tree(incoming))
+    index_managed_xmp(managed)
+    files = list(scan_tree(incoming, SUPPORTED | COMPANION_EXTENSIONS))
+    candidates = [(path, info) for path, info in files if Path(path).suffix.lower() in SUPPORTED]
+    companion_files = [(path, info) for path, info in files if Path(path).suffix.lower() in COMPANION_EXTENSIONS]
     if candidates:
         time.sleep(0.4)
     in_batch = {}
@@ -130,13 +224,19 @@ def scan_incoming(job, incoming, managed):
             modified = iso_time(initial.st_mtime) if initial else None
             status, reason = "review", "파일이 변경되었거나 읽을 수 없습니다."
         results.append((job["id"], uuid4().hex, path, snapshot, sha, size, modified, thumbnail, status, reason))
+    attached, pending = plan_companions(incoming, companion_files, results)
     with database(write=True) as db:
         db.executemany(
-            """INSERT INTO scan_files (scan_id,id,path,fingerprint,sha,size,modified_at,thumbnail,status,reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            results,
+            """INSERT INTO scan_files (scan_id,id,path,fingerprint,sha,size,modified_at,thumbnail,status,reason,companions)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            [(*row, json.dumps(attached.get(row[2], []), ensure_ascii=False)) for row in results],
         )
+        db.executemany("INSERT INTO scan_xmp (id,scan_id,file,candidates) VALUES (?,?,?,?)", [
+            (file_id, job["id"], json.dumps(sidecar, ensure_ascii=False), json.dumps(options))
+            for file_id, sidecar, options in pending
+        ])
         db.execute("DELETE FROM scan_files WHERE scan_id <> ?", (job["id"],))
+        db.execute("DELETE FROM scan_xmp WHERE scan_id <> ?", (job["id"],))
         finish(db, job["id"], {"checked": len(results)})
 
 
@@ -157,7 +257,56 @@ def set_outcome(file_id, status, reason=""):
             db.execute("UPDATE media SET status='missing' WHERE id=? AND status='moving'", (file_id,))
 
 
-def import_file(row, incoming, managed, known):
+def associate_xmp(db, owner, target, sidecar):
+    db.execute("UPDATE media SET xmp_path=?,xmp_sha=?,xmp_metadata=? WHERE id=?", (
+        target, sidecar["sha"], json.dumps(sidecar["metadata"], ensure_ascii=False), owner,
+    ))
+
+
+def retain_xmp(incoming, managed, owner, sidecar):
+    with database() as db:
+        record = db.execute("SELECT * FROM media WHERE id=? AND status='available'", (owner,)).fetchone()
+    if not record or fingerprint(inspect(managed, record["path"])) != record["fingerprint"]:
+        raise OSError("managed 원본을 다시 확인해야 합니다.")
+    if record["xmp_path"] and record["xmp_sha"] != sidecar["sha"]:
+        raise OSError("원본에 다른 XMP가 이미 연결되어 있습니다.")
+    target = record["xmp_path"] or Path(record["path"]).with_name(Path(sidecar["path"]).name).as_posix()
+    with database() as db:
+        if db.execute("SELECT 1 FROM media WHERE xmp_path=? AND id<>? AND status='available'", (target, owner)).fetchone():
+            raise OSError("다른 원본이 이미 이 경로의 XMP를 사용합니다.")
+    try:
+        existing_sha, _ = hash_file(managed, target)
+    except FileNotFoundError:
+        actual_sha, _ = hash_file(incoming, sidecar["path"], sidecar["fingerprint"])
+        if actual_sha != sidecar["sha"]:
+            raise OSError("검사 이후 XMP 내용이 변경되었습니다.")
+        move_file(incoming, sidecar["path"], managed, target, sidecar["fingerprint"], create_parent=False)
+    else:
+        if existing_sha != sidecar["sha"]:
+            raise OSError("같은 경로에 다른 XMP가 있습니다.")
+    with database(write=True) as db:
+        associate_xmp(db, owner, target, sidecar)
+
+
+def finish_import_companions(row, incoming, managed, counts):
+    for companion in json.loads(row["companions"]):
+        suffix = Path(companion["path"]).suffix.lower()
+        try:
+            if suffix == XMP:
+                retain_xmp(incoming, managed, row["id"], companion)
+                counts["xmp"] = counts.get("xmp", 0) + 1
+            elif suffix in CAMERA_AUX:
+                try:
+                    delete_verified_file(incoming, companion["path"], companion["fingerprint"])
+                except FileNotFoundError:
+                    continue
+                counts["auxDeleted"] = counts.get("auxDeleted", 0) + 1
+        except OSError as exc:
+            log.warning("동반 파일 처리에 확인이 필요합니다: %s: %s", companion["path"], exc)
+            counts["companionReview"] = counts.get("companionReview", 0) + 1
+
+
+def import_file(row, incoming, managed, known, counts):
     file_id, source, sha, snapshot = (row[key] for key in ("id", "path", "sha", "fingerprint"))
     name = Path(source).name
     target = f"{file_id}/{name}"
@@ -165,6 +314,9 @@ def import_file(row, incoming, managed, known):
         intent = db.execute("SELECT status FROM media WHERE id=?", (file_id,)).fetchone()
 
     if intent and intent["status"] == "available":
+        with database(write=True) as db:
+            db.execute("UPDATE media SET original_path=coalesce(original_path,?) WHERE id=?", (source, file_id))
+        finish_import_companions(row, incoming, managed, counts)
         set_outcome(file_id, "moved")
         return
 
@@ -204,6 +356,9 @@ def import_file(row, incoming, managed, known):
     new_snapshot = fingerprint(info)
     analysis = analyze(managed, target, sha, new_snapshot)
     store_analysis(file_id, target, sha, info, analysis)
+    with database(write=True) as db:
+        db.execute("UPDATE media SET original_path=? WHERE id=?", (source, file_id))
+    finish_import_companions(row, incoming, managed, counts)
     known.setdefault(sha, []).append((target, new_snapshot))
     set_outcome(file_id, "moved")
 
@@ -220,7 +375,7 @@ def import_selection(job, incoming, managed):
             continue
         if row["status"] == "ready":
             try:
-                import_file(row, incoming, managed, known)
+                import_file(row, incoming, managed, known, counts)
             except OSError as exc:
                 log.warning("파일 이동에 확인이 필요합니다: %s: %s", row["path"], exc)
                 message = exc.strerror if exc.errno is not None else str(exc)
@@ -228,6 +383,26 @@ def import_selection(job, incoming, managed):
         with database() as db:
             outcome = db.execute("SELECT status FROM scan_files WHERE id=?", (file_id,)).fetchone()["status"]
         counts[outcome] += 1
+    with database(write=True) as db:
+        finish(db, job["id"], counts)
+
+
+def link_xmp_selection(job, incoming, managed):
+    counts = {"linked": 0, "review": 0}
+    for link in json.loads(job["payload"])["links"]:
+        with database() as db:
+            row = db.execute("SELECT * FROM scan_xmp WHERE id=?", (link["id"],)).fetchone()
+        status, reason = (row["status"], row["reason"]) if row else ("review", "XMP 검사 결과가 없습니다.")
+        if status == "pending":
+            try:
+                retain_xmp(incoming, managed, link["media_id"], json.loads(row["file"]))
+                status, reason = "linked", ""
+            except OSError as exc:
+                status = "review"
+                reason = exc.strerror if exc.errno is not None else str(exc)
+            with database(write=True) as db:
+                db.execute("UPDATE scan_xmp SET status=?, reason=? WHERE id=?", (status, reason, row["id"]))
+        counts[status] += 1
     with database(write=True) as db:
         finish(db, job["id"], counts)
 
@@ -325,7 +500,7 @@ def run():
             db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
 
         log.info("수집 워커 시작 · %s → %s", incoming, managed)
-        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection}
+        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection}
         while True:
             with database(write=True) as db:
                 job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()

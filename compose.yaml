@@ -1,6 +1,6 @@
 x-backend: &backend
   image: photo-saver-backend
-  environment:
+  environment: &backend-env
     PHOTO_SAVER_TIMEZONE: ${PHOTO_SAVER_TIMEZONE:-Asia/Seoul}
     INCOMING_DIR: ${INCOMING_DIR:-incoming}
     MANAGED_DIR: ${MANAGED_DIR:-managed}
@@ -22,9 +22,13 @@ services:
   api:
     <<: *backend
     build: ./backend
+    environment:
+      <<: *backend-env
+      PHOTO_SAVER_STORAGE_USER: ${PHOTO_SAVER_STORAGE_USER:-}
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - catalog:/data
+      - settings:/settings
       - type: bind
         source: ${PHOTO_LIBRARY_ROOT:-.}/${INCOMING_DIR:-incoming}
         target: /incoming-preview
@@ -55,3 +59,4 @@ services:
 volumes:
   catalog:
   thumbnails:
+  settings:

@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import sqlite3
@@ -31,10 +32,20 @@ CREATE TABLE IF NOT EXISTS scan_files (
     size INTEGER,
     modified_at TEXT,
     thumbnail TEXT,
+    companions TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS scan_files_by_job ON scan_files (scan_id, path);
+CREATE TABLE IF NOT EXISTS scan_xmp (
+    id TEXT PRIMARY KEY,
+    scan_id INTEGER NOT NULL REFERENCES jobs(id),
+    file TEXT NOT NULL,
+    candidates TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS scan_xmp_by_job ON scan_xmp (scan_id);
 CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -65,6 +76,10 @@ CREATE TABLE IF NOT EXISTS media (
     user_time TEXT,
     user_time_source TEXT,
     user_device TEXT,
+    original_path TEXT,
+    xmp_path TEXT,
+    xmp_sha TEXT,
+    xmp_metadata TEXT,
     event_id TEXT REFERENCES events(id),
     confirmed INTEGER NOT NULL DEFAULT 0
 );
@@ -84,17 +99,25 @@ def open_db():
 
 
 @contextmanager
+def catalog_lock(exclusive=False):
+    with (DATA / "catalog.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+
+
+@contextmanager
 def database(write=False):
-    connection = open_db()
-    try:
-        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-        yield connection
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    with catalog_lock():
+        connection = open_db()
+        try:
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def initialize():
@@ -107,9 +130,14 @@ def initialize():
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(scan_files)")}
         if "thumbnail" not in columns:
             connection.execute("ALTER TABLE scan_files ADD COLUMN thumbnail TEXT")
+        if "companions" not in columns:
+            connection.execute("ALTER TABLE scan_files ADD COLUMN companions TEXT NOT NULL DEFAULT '[]'")
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(media)")}
         if "user_time_source" not in columns:
             connection.execute("ALTER TABLE media ADD COLUMN user_time_source TEXT")
+        for column in ("original_path", "xmp_path", "xmp_sha", "xmp_metadata"):
+            if column not in columns:
+                connection.execute(f"ALTER TABLE media ADD COLUMN {column} TEXT")
         connection.commit()
     finally:
         connection.close()

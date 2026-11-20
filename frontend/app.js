@@ -20,8 +20,14 @@ const icons = {
   left: '<path d="m15 6-6 6 6 6"/>',
   table: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 14h18m-12-5v11"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+  file: '<path d="M5 3h9l5 5v13H5zM14 3v6h5m-11 4h8m-8 4h6"/>',
   up: '<path d="M12 19V5m-6 6 6-6 6 6"/>',
   disk: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18m-14 3h.01m4 0h.01"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.2-1.6l1.6-1.3-1.5-2.6-2 .7a7 7 0 0 0-2.7-1.6L13.8 3h-3.6l-.4 2.6a7 7 0 0 0-2.7 1.6l-2-.7-1.5 2.6 1.6 1.3a7 7 0 0 0 0 3.2l-1.6 1.3 1.5 2.6 2-.7a7 7 0 0 0 2.7 1.6l.4 2.6h3.6l.4-2.6a7 7 0 0 0 2.7-1.6l2 .7 1.5-2.6-1.6-1.3A7 7 0 0 0 19 12Z"/>',
+  download: '<path d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4"/>',
+  upload: '<path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4"/>',
+  key: '<circle cx="8" cy="10" r="4"/><path d="m11 13 8 8m-4-4 3-3m0 6 3-3"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/>',
 };
 
 function icon(name) {
@@ -38,6 +44,7 @@ const navigation = [
   { id: 'incoming', title: 'Incoming Library', icon: 'inbox' },
   { id: 'events', title: '이벤트 관리', icon: 'calendar' },
   { id: 'archive', title: '아카이브 전송', icon: 'transfer' },
+  { id: 'settings', title: '설정', icon: 'settings' },
 ];
 
 
@@ -56,12 +63,14 @@ function savedIncomingLayout() {
   }
 }
 
-const state = { incoming: [], managed: [], events: [], scan: null, job: null, timezone: 'Asia/Seoul' };
+const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, job: null, timezone: 'Asia/Seoul' };
 const view = {
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), preview: null,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventDevice: '', eventDate: '',
-  eventTarget: '', sourcePath: [],
+  eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
+  settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
+  sshTestBusy: false, sshTestResult: null,
 };
 let refreshTimer;
 let stateRequest = 0;
@@ -77,11 +86,12 @@ let noticeTimeout;
 async function api(path, method = 'GET', data) {
   let response;
   try {
+    const binary = data instanceof Blob;
     response = await fetch(`/api/${path}`, {
       method,
       cache: 'no-store',
-      headers: data ? { 'Content-Type': 'application/json' } : undefined,
-      body: data ? JSON.stringify(data) : undefined,
+      headers: data ? { 'Content-Type': binary ? 'application/octet-stream' : 'application/json' } : undefined,
+      body: binary ? data : data ? JSON.stringify(data) : undefined,
     });
   } catch {
     throw new Error('로컬 API에 연결할 수 없습니다.');
@@ -101,7 +111,8 @@ function jobMessage(job) {
   if (job.status === 'failed') return job.result.error;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
-  return `${job.result.moved}개를 managed로 옮겼습니다.${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
+  if (job.kind === 'xmp-link') return `XMP ${job.result.linked}개를 연결했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
+  return `${job.result.moved}개를 managed로 옮겼습니다.${job.result.xmp ? ` XMP ${job.result.xmp}개 보관.` : ''}${job.result.auxDeleted ? ` THM·LRV ${job.result.auxDeleted}개 삭제.` : ''}${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review || job.result.companionReview ? ` 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개.` : ''}`;
 }
 
 async function syncState() {
@@ -217,12 +228,23 @@ function selectedIncoming(predicate) {
   return state.incoming.filter(file => view.incomingSelection.has(file.id) && predicate(file));
 }
 
+function matchesXmp(file, query) {
+  if (!file.xmp) return false;
+  const { title, description, keywords, city, region, country, location, latitude, longitude, date, name } = file.xmp;
+  return ['XMP', name, title, description, ...(keywords || []), city, region, country, location, latitude, longitude, date?.raw]
+    .some(value => value?.toLocaleLowerCase().includes(query));
+}
+
+function companionSummary(file) {
+  return [file.xmp ? 'XMP' : '', file.cameraAuxCount ? `이동 후 THM·LRV ${file.cameraAuxCount}개 삭제` : ''].filter(Boolean).join(' · ');
+}
+
 function filteredIncoming() {
   const query = view.query.trim().toLocaleLowerCase();
   return state.incoming.filter(file =>
     (view.incomingFilter === 'all' || file.status === view.incomingFilter) &&
     (!view.incomingKind || file.kind === view.incomingKind) &&
-    (!query || file.name.toLocaleLowerCase().includes(query) || file.folder.toLocaleLowerCase().includes(query))
+    (!query || file.name.toLocaleLowerCase().includes(query) || file.folder.toLocaleLowerCase().includes(query) || matchesXmp(file, query))
   );
 }
 
@@ -241,6 +263,7 @@ function incomingCards(files, selectAll) {
         <strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
         <div class="card-info">${badge(file.status, filterLabels[file.status] || '삭제 중')}<span class="small muted numbers">${sizeLabel(file.size)}</span></div>
         ${file.reason ? `<p class="small muted card-reason">${escapeHtml(file.reason)}</p>` : ''}
+        ${companionSummary(file) ? `<p class="small muted card-reason">${companionSummary(file)}</p>` : ''}
       </div>
     </li>`).join('')}</ul>`;
 }
@@ -259,7 +282,7 @@ function incomingRows() {
     </tr></thead>
     <tbody>${files.map(file => `<tr class="${view.incomingSelection.has(file.id) ? 'selected' : ''}">
       <td>${canSelectIncoming(file) ? checkbox('incoming', file.id, `${file.name} 선택`, view.incomingSelection) : ''}</td>
-      <td>${fileCell(file, file.folder, true)}</td>
+      <td>${fileCell(file, [file.folder, companionSummary(file)].filter(Boolean).join(' · '), true)}</td>
       <td class="numbers muted">${file.modifiedAt ? dateTimeFormatter(state.timezone).format(new Date(file.modifiedAt)) : '—'}</td>
       <td class="numbers">${sizeLabel(file.size)}</td>
       <td>${badge(file.status, filterLabels[file.status] || '삭제 중')}${file.reason ? `<div class="small muted file-reason">${escapeHtml(file.reason)}</div>` : ''}</td>
@@ -277,12 +300,37 @@ function incomingActions() {
     ${button('move-incoming', moveLabel, { glyph: 'arrow', primary: true, disabled: !movable || jobActive() })}</div>`;
 }
 
+function pendingXmpLinks() {
+  return state.pendingXmp.filter(file => file.status === 'pending').map(file => ({
+    id: file.id, media_id: view.xmpChoices.get(file.id) ?? file.recommended,
+  })).filter(link => link.media_id);
+}
+
+function pendingXmpSection() {
+  if (!state.pendingXmp.length) return '';
+  const selected = pendingXmpLinks();
+  const duplicated = new Set(selected.map(link => link.media_id)).size !== selected.length;
+  return `<section class="surface xmp-section" aria-label="XMP 연결">
+    <div class="surface-head"><h2>XMP 연결 <span class="small muted">${state.pendingXmp.length}개</span></h2></div>
+    <div class="table-wrap xmp-matches"><table aria-label="XMP 원본 후보"><thead><tr><th scope="col">XMP 파일</th><th scope="col">기록된 시각</th><th scope="col">managed 원본</th></tr></thead>
+      <tbody>${state.pendingXmp.map(file => {
+        const chosen = view.xmpChoices.get(file.id) ?? file.recommended;
+        return `<tr><td>${escapeHtml(file.path)}</td><td>${escapeHtml(file.date?.raw || '—')}</td><td>
+          ${file.status === 'pending' && file.candidates.length ? `<select data-xmp-id="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.path)} 원본 후보">
+            <option value="">선택 안 함</option>${file.candidates.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === chosen ? 'selected' : ''}>${escapeHtml(item.originalPath || item.name)} · ${item.kind === 'photo' ? '사진' : '영상'}</option>`).join('')}
+          </select>` : `<span class="muted">${escapeHtml(file.reason || '연결 가능한 원본을 찾지 못했습니다.')}</span>`}</td></tr>`;
+      }).join('')}</tbody></table></div>
+    <div class="action-bar"><span class="small muted">${duplicated ? '같은 원본에 여러 XMP가 선택되었습니다.' : '원본을 확인한 뒤 XMP를 함께 보관합니다.'}</span>
+      ${button('link-xmp', '선택한 XMP 연결', { primary: true, disabled: !selected.length || duplicated || jobActive() })}</div>
+  </section>`;
+}
+
 function incomingPage() {
   const results = state.incoming.filter(file => !view.incomingKind || file.kind === view.incomingKind);
   const active = jobActive();
   const failed = state.job?.status === 'failed';
   const scanning = active && state.job.kind === 'scan';
-  const jobLabels = { scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중' };
+  const jobLabels = { scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중', 'xmp-link': 'XMP 연결 중' };
   const status = active ? jobLabels[state.job.kind] :
     failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
   const detail = failed ? state.job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
@@ -315,7 +363,7 @@ function incomingPage() {
       </div>
       <div class="table-wrap" id="incoming-rows">${incomingRows()}</div>
       <div class="action-bar" id="incoming-actions">${incomingActions()}</div>
-    </section>`;
+    </section>${pendingXmpSection()}`;
 }
 
 function eventById(id) {
@@ -327,6 +375,7 @@ function childEvents(id) {
 }
 
 function footageForEvent(id) {
+  if (id === 'all') return state.managed;
   return state.managed.filter(file => file.eventId === (id === 'unassigned' ? null : id));
 }
 
@@ -359,8 +408,10 @@ function eventDateForFile(file) {
 }
 
 function filteredEventFiles(files) {
+  const query = view.eventQuery.trim().toLocaleLowerCase();
   return files.filter(file => (!view.eventDevice || file.device === view.eventDevice) &&
-    (!view.eventDate || eventDateForFile(file) === view.eventDate));
+    (!view.eventDate || eventDateForFile(file) === view.eventDate) &&
+    (!query || file.name.toLocaleLowerCase().includes(query) || file.device?.toLocaleLowerCase().includes(query) || matchesXmp(file, query)));
 }
 
 function eventPage() {
@@ -379,6 +430,7 @@ function eventPage() {
       <section class="surface" aria-label="이벤트 목록">
         <div class="surface-head"><h2>이벤트</h2></div>
         <div class="event-list">
+          ${eventLink('all', '전체 파일', state.managed.length)}
           ${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}
           ${state.events.filter(item => !item.parent).map(item => {
             const children = childEvents(item.id);
@@ -389,7 +441,7 @@ function eventPage() {
       </section>
       <section class="surface" aria-label="이벤트 푸티지">
         <div class="surface-head event-heading">
-          <div><h2>${escapeHtml(event ? eventLabel(event) : '미배정 푸티지')}</h2>
+          <div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 푸티지')}</h2>
             <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${files.length}개 파일</div>
           </div>
           ${event ? `<div class="event-header-actions">
@@ -399,6 +451,7 @@ function eventPage() {
           </div>` : ''}
         </div>
         <div class="event-tools">
+          <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색" value="${escapeHtml(view.eventQuery)}"></label>
           <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>${devices.map(device =>
             `<option value="${escapeHtml(device)}" ${view.eventDevice === device ? 'selected' : ''}>${escapeHtml(device)}</option>`).join('')}</select>
           <select id="event-date" aria-label="촬영일 필터"><option value="">모든 촬영일</option>${dates.map(date =>
@@ -410,13 +463,13 @@ function eventPage() {
             <th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">배치 상태</th></tr></thead>
           <tbody>${filtered.map(file => `<tr class="${view.eventSelection.has(file.id) ? 'selected' : ''}">
             <td>${checkbox('event', file.id, `${file.name} 선택`, view.eventSelection)}</td>
-            <td>${fileCell(file, file.device || '장비 확인 필요')}</td>
+            <td>${fileCell(file, file.device || '장비 확인 필요')}${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}</td>
             <td class="numbers muted">${file.time ? footageDate.format(new Date(file.time)) : '—'}
               ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
               ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
               ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정">촬영 시각 지정</button>` : ''}</td>
             <td>${file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
-              badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : event ? '초안' : '미배정')}</td>
+              badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정')}</td>
           </tr>`).join('')}</tbody>
         </table>` : emptyState('video', '표시할 푸티지가 없습니다.', event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
         <div class="action-bar">
@@ -452,6 +505,7 @@ function sourceEntries() {
     const nextFolder = path[view.sourcePath.length];
     if (!nextFolder) {
       files.push(file);
+      if (file.xmp) files.push({ name: file.xmp.name, kind: 'xmp', size: null });
       continue;
     }
     if (!folders.has(nextFolder)) folders.set(nextFolder, []);
@@ -475,7 +529,7 @@ function archivePage() {
         ${entries.length ? `<ul class="tree">${entries.map((entry, index) => {
           const name = escapeHtml(entry.name);
           if (entry.file) return `<li class="tree-row">
-            <span class="tree-file">${icon(entry.file.kind === 'photo' ? 'photo' : 'video')}${name}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
+            <span class="tree-file">${icon(entry.file.kind === 'xmp' ? 'file' : entry.file.kind)}${name}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
           </li>`;
           return `<li class="tree-row">
             <button type="button" class="tree-button" data-action="open-source" data-value="${index}">${icon('folder')}<span>${name}</span>${icon('right')}</button>
@@ -488,6 +542,173 @@ function archivePage() {
         ${emptyState('disk', 'OMV 전송 준비 중')}
       </section>
     </div>`;
+}
+
+function settingRow(label, description, controls) {
+  return `<div class="setting-row"><div><h3>${label}</h3><p class="small muted">${description}</p></div>
+    <div class="setting-controls">${controls}</div></div>`;
+}
+
+function maskedSetting(status) {
+  return `<code class="setting-mask">***</code><span class="small muted">${status}</span>`;
+}
+
+function visibleSetting(value) {
+  if (value) return `<code class="setting-value mono">${escapeHtml(value)}</code>`;
+  return `<span class="small muted">${view.settings ? '미등록' : '확인 중'}</span>`;
+}
+
+function settingsPage() {
+  const settings = view.settings;
+  const keyCopied = settings?.keyCopied || view.keyCopiedLocally;
+  return `${header('설정', '스토리지 연결 정보와 카탈로그 백업을 관리하세요.', '')}
+    ${view.settingsError ? `<p class="scan-strip" role="alert">${escapeHtml(view.settingsError)}</p>` : ''}
+    <section class="surface settings-section" aria-label="스토리지 연결">
+      <div class="surface-head"><h2>${icon('disk')} 스토리지 연결</h2></div>
+      ${settingRow('스토리지 IP 주소', '연결할 스토리지의 IPv4 또는 IPv6 주소',
+        visibleSetting(settings?.address) +
+        button('edit-storage-address', settings?.addressConfigured ? 'IP 변경' : 'IP 등록', { disabled: !settings || view.sshTestBusy }))}
+      ${settingRow('저장 절대경로', '원격 스토리지에서 사진과 영상을 보관할 폴더',
+        visibleSetting(settings?.storageRoot) +
+        button('edit-storage-root', settings?.storageRootConfigured ? '경로 변경' : '경로 등록', { disabled: !settings }))}
+      ${settingRow('SSH 계정명', '.env의 PHOTO_SAVER_STORAGE_USER에서 설정',
+        maskedSetting(settings ? settings.accountConfigured ? '등록됨' : '미등록' : '확인 중'))}
+      ${settingRow('SSH 공개키', '공개키를 처음 한 번 복사해 스토리지의 SSH 계정에 등록하세요.',
+        maskedSetting(settings ? keyCopied ? '최초 복사 완료' : settings.keyGenerated ? '생성됨' : '미생성' : '확인 중') +
+        (settings?.keyGenerated ? button('copy-public-key', '공개키 복사', { glyph: 'copy', disabled: keyCopied || !view.publicKeyToCopy }) :
+          button('generate-storage-key', '공개키 생성', { glyph: 'key', primary: true, disabled: !settings })))}
+      ${settingRow('SSH 접속 테스트', view.sshTestResult ? `<span role="status" class="${view.sshTestResult.ok ? 'ssh-test-success' : 'form-error'}">${escapeHtml(view.sshTestResult.message)}</span>` :
+        '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
+        button('test-storage-ssh', view.sshTestBusy ? '테스트 중…' : '접속 테스트', { glyph: 'refresh', disabled: !settings || view.sshTestBusy }))}
+    </section>
+    <section class="surface settings-section" aria-label="DB 백업 및 복원">
+      <div class="surface-head"><h2>${icon('file')} DB 백업 및 복원</h2></div>
+      ${settingRow('카탈로그 백업', '이벤트와 파일 배치가 포함된 SQLite 백업을 다운로드합니다.',
+        button('download-catalog', 'DB 백업 다운로드', { glyph: 'download', disabled: jobActive() }))}
+      ${settingRow('카탈로그 복원', '선택한 백업의 내용으로 현재 카탈로그를 교체합니다.',
+        `<input id="restore-catalog-file" type="file" accept=".sqlite3,.sqlite,.db,application/octet-stream" hidden>` +
+        (view.restoreFile ? maskedSetting('파일 선택됨') : '') + button('pick-catalog-file', '백업 파일 선택') +
+        button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || jobActive() }))}
+    </section>`;
+}
+
+async function loadSettings() {
+  try {
+    view.settings = await api('settings');
+    view.settingsError = '';
+    if (view.keyCopiedLocally && !view.settings.keyCopied) {
+      view.settings = await api('settings/ssh-key/copied', 'POST');
+    }
+    const pending = view.settings.keyGenerated && !view.settings.keyCopied;
+    view.publicKeyToCopy = pending ? (await api('settings/ssh-key/public', 'POST')).publicKey : null;
+  } catch (error) {
+    view.settingsError = error.message;
+  }
+}
+
+function editStorageAddress() {
+  showDialog('스토리지 IP 주소', `<label>새 IP 주소
+      <input name="address" type="text" value="${escapeHtml(view.settings?.address || '')}" placeholder="IPv4 또는 IPv6 주소 입력"
+        autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus>
+    </label>`, 'IP 저장', async form => {
+    view.settings = await api('settings/storage', 'PUT', { address: form.get('address') });
+    view.sshTestResult = null;
+    announce('스토리지 IP 주소를 저장했습니다.');
+  });
+}
+
+function editStorageRoot() {
+  showDialog('스토리지 저장 절대경로', `<label>저장 절대경로
+    <input name="path" type="text" value="${escapeHtml(view.settings?.storageRoot || '')}"
+      placeholder="/srv/media/archive" autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus>
+  </label>`, '경로 저장', async form => {
+    view.settings = await api('settings/storage/root', 'PUT', { path: form.get('path') });
+    announce('원격 스토리지의 저장 경로를 저장했습니다.');
+  });
+}
+
+async function generateStorageKey() {
+  await api('settings/ssh-key', 'POST');
+  await loadSettings();
+  announce('SSH 키를 생성했습니다. 공개키를 복사해 스토리지에 등록하세요.');
+}
+
+async function copyStorageKey() {
+  if (!view.publicKeyToCopy || view.keyCopiedLocally) return;
+  try {
+    await navigator.clipboard.writeText(view.publicKeyToCopy);
+  } catch {
+    throw new Error('클립보드에 복사할 수 없습니다. 브라우저의 클립보드 권한을 확인하세요.');
+  }
+  view.keyCopiedLocally = true;
+  view.publicKeyToCopy = null;
+  view.settings = await api('settings/ssh-key/copied', 'POST');
+  announce('공개키를 복사했습니다. 스토리지의 SSH 계정에 등록하세요.');
+}
+
+function reportSshResult(ok, message) {
+  view.sshTestResult = { ok, message };
+}
+
+async function testStorageSsh() {
+  view.sshTestBusy = true;
+  view.sshTestResult = null;
+  render();
+  try {
+    const result = await api('settings/ssh-test', 'POST');
+    if (result.status === 'confirm_host') {
+      if (view.page !== 'settings') return;
+      showDialog('서버 호스트 키 확인', `<p>스토리지에서 확인한 SSH 호스트 키 지문과 아래 지문을 비교하세요.</p>
+        <p class="mono">${escapeHtml(result.algorithm)}<br>${escapeHtml(result.fingerprint)}</p>`,
+      '지문 확인 및 접속', async () => {
+        try {
+          await api('settings/ssh-test/trust', 'POST', { token: result.token });
+          reportSshResult(true, 'SSH 공개키 인증에 성공했습니다.');
+        } catch (error) {
+          reportSshResult(false, error.message);
+        }
+      });
+    } else {
+      reportSshResult(true, 'SSH 공개키 인증에 성공했습니다.');
+    }
+  } catch (error) {
+    reportSshResult(false, error.message);
+  } finally {
+    view.sshTestBusy = false;
+    render();
+  }
+}
+
+async function downloadCatalog() {
+  const response = await fetch('/api/settings/catalog/backup', { cache: 'no-store' });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.detail || 'DB 백업을 다운로드할 수 없습니다.');
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const download = document.createElement('a');
+  download.href = url;
+  download.download = response.headers.get('content-disposition')?.match(/filename="?([^";]+)/)?.[1] || 'photo-saver.sqlite3';
+  document.body.append(download);
+  download.click();
+  download.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function confirmCatalogRestore() {
+  const file = view.restoreFile;
+  if (!file) return;
+  showDialog('카탈로그 복원', `<p>선택한 백업으로 현재 이벤트와 파일 배치를 교체합니다.</p>
+    <p>원본 사진과 영상은 디스크에 보관됩니다.</p>`, 'DB 복원', async () => {
+    await api('settings/catalog/restore', 'POST', file);
+    view.restoreFile = null;
+    view.incomingSelection.clear();
+    view.xmpChoices.clear();
+    chooseEvent('unassigned');
+    view.sourcePath = [];
+    await syncState();
+    announce('카탈로그를 복원했습니다.');
+  }, { danger: true });
 }
 
 function showDialog(title, content, submitLabel, handler, { danger = false } = {}) {
@@ -583,9 +804,10 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
   const files = state.managed.filter(file => selectedIds.has(file.id));
   if (!files.length) return;
   const hasMetadata = files.every(file => file.timeCandidates?.metadata);
+  const hasXmp = files.every(file => file.timeCandidates?.xmp);
   const hasModified = files.every(file => file.timeCandidates?.modified);
   const metadataLabel = files.every(file => file.kind === 'photo') ? 'EXIF 시각 사용' : '메타데이터 시각 사용';
-  const mode = suggestSource && hasMetadata ? 'metadata' : suggestSource && hasModified ? 'modified' : 'manual';
+  const mode = suggestSource && hasXmp ? 'xmp' : suggestSource && hasMetadata ? 'metadata' : suggestSource && hasModified ? 'modified' : 'manual';
   const event = eventById(view.eventId);
   const root = event?.parent ? eventById(event.parent) : event;
   const defaultZone = root?.zone || state.timezone;
@@ -594,6 +816,7 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
     <label>촬영 시각 출처<select id="media-time-mode" name="time_mode">
       <option value="manual" ${mode === 'manual' ? 'selected' : ''}>직접 입력</option>
       <option value="metadata" ${mode === 'metadata' ? 'selected' : ''} ${hasMetadata ? '' : 'disabled'}>${metadataLabel}${hasMetadata ? '' : ' (사용 가능한 값 없음)'}</option>
+      <option value="xmp" ${mode === 'xmp' ? 'selected' : ''} ${hasXmp ? '' : 'disabled'}>XMP 시각 사용</option>
       <option value="modified" ${mode === 'modified' ? 'selected' : ''} ${hasModified ? '' : 'disabled'}>파일 수정 시각 사용</option>
     </select></label>
     <div class="date-grid" id="media-time-fields">
@@ -623,8 +846,9 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
   const note = dialog.querySelector('#media-time-note');
   function updateTimeFields() {
     const mode = modeControl.value;
+    const metadataMode = mode === 'metadata' || mode === 'xmp';
     dateField.hidden = mode !== 'manual';
-    zoneField.hidden = mode === 'modified' || (mode === 'metadata' && files.every(file => file.timeCandidates.metadata.verified));
+    zoneField.hidden = mode === 'modified' || (metadataMode && files.every(file => file.timeCandidates[mode].verified));
     dateField.querySelector('input').disabled = dateField.hidden;
     zoneControl.disabled = zoneField.hidden;
     dialog.querySelector('#media-time-fields').hidden = dateField.hidden && zoneField.hidden;
@@ -636,9 +860,11 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
     } else if (mode === 'modified') {
       note.textContent = `파일 수정 시각 ${dateTimeFormatter(defaultZone).format(new Date(files[0].timeCandidates.modified))} · ${defaultZone}`;
     } else {
-      const candidate = files[0].timeCandidates.metadata;
-      note.textContent = candidate.verified ? `${candidate.source} ${candidate.raw || candidate.time}` :
+      const candidate = files[0].timeCandidates[mode];
+      const selected = candidate.verified ? `${candidate.source} ${candidate.raw || candidate.time}` :
         `${candidate.source} ${candidate.raw} · ${zoneControl.value}로 해석`;
+      const alternative = files[0].timeCandidates[mode === 'xmp' ? 'metadata' : 'xmp'];
+      note.textContent = alternative ? `${selected} / ${alternative.source} ${alternative.raw || alternative.time}` : selected;
     }
   }
   modeControl.addEventListener('change', updateTimeFields);
@@ -646,11 +872,25 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
   updateTimeFields();
 }
 
+function showXmp(id) {
+  const file = state.managed.find(item => item.id === id);
+  if (!file?.xmp) return;
+  const { name, title, description, date, keywords, location, city, region, country, latitude, longitude, error } = file.xmp;
+  const fields = {
+    '파일': name, '촬영 시각': date?.raw, '제목': title, '설명': description,
+    '키워드': keywords?.join(', '), '장소': [location, city, region, country].filter(Boolean).join(', '),
+    'GPS': [latitude, longitude].filter(Boolean).join(', '), '분석 상태': error,
+  };
+  showDialog('XMP 정보', `<dl class="xmp-data">${Object.entries(fields).filter(([, value]) => value)
+    .map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join('')}</dl>`);
+}
+
 function chooseEvent(id) {
   view.eventId = id;
   view.eventSelection.clear();
   view.eventDevice = '';
   view.eventDate = '';
+  view.eventQuery = '';
   view.eventTarget = '';
 }
 
@@ -667,12 +907,13 @@ function updateEventActions() {
 function render() {
   const incomingTable = page.querySelector('#incoming-rows');
   const tableScroll = incomingTable ? { top: incomingTable.scrollTop, left: incomingTable.scrollLeft } : null;
+  const xmpScroll = page.querySelector('.xmp-matches')?.scrollTop;
   const active = document.activeElement;
   const keepFocus = active && page.contains(active);
   const route = location.hash.slice(1);
   const current = navigation.find(item => item.id === route) || navigation[0];
   const pageChanged = view.page !== current.id;
-  const views = { incoming: incomingPage, events: eventPage, archive: archivePage };
+  const views = { incoming: incomingPage, events: eventPage, archive: archivePage, settings: settingsPage };
   view.page = current.id;
   nav.innerHTML = navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join('');
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
@@ -684,10 +925,12 @@ function render() {
     return;
   }
   if (tableScroll) page.querySelector('#incoming-rows').scrollTo(tableScroll);
+  if (xmpScroll) page.querySelector('.xmp-matches')?.scrollTo(0, xmpScroll);
   if (keepFocus) {
     const replacement = [...page.querySelectorAll('button, input, select')].find(element => {
       if (active.id) return element.id === active.id;
       if (active.dataset.action) return element.dataset.action === active.dataset.action && element.dataset.value === active.dataset.value;
+      if (active.dataset.xmpId) return element.dataset.xmpId === active.dataset.xmpId;
       return active.dataset.select && element.dataset.select === active.dataset.select && element.value === active.value;
     });
     replacement?.focus({ preventScroll: true });
@@ -898,6 +1141,16 @@ const actions = {
   'preview-incoming': openIncomingPreview,
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
+  'link-xmp'() { return submitJob('xmp-link', { links: pendingXmpLinks() }); },
+  'view-xmp': showXmp,
+  'edit-storage-address': editStorageAddress,
+  'edit-storage-root': editStorageRoot,
+  'generate-storage-key': generateStorageKey,
+  'copy-public-key': copyStorageKey,
+  'test-storage-ssh': testStorageSsh,
+  'download-catalog': downloadCatalog,
+  'pick-catalog-file'() { page.querySelector('#restore-catalog-file').click(); },
+  'restore-catalog': confirmCatalogRestore,
   'choose-event': chooseEvent,
   'new-event'() { createEventDialog(); },
   'new-child'() { createEventDialog(eventById(view.eventId)); },
@@ -934,6 +1187,12 @@ page.addEventListener('change', event => {
   const control = event.target;
   if (control.dataset.select) {
     handleSelection(control);
+  } else if (control.id === 'restore-catalog-file') {
+    if (control.files[0]) view.restoreFile = control.files[0];
+    render();
+  } else if (control.dataset.xmpId) {
+    view.xmpChoices.set(control.dataset.xmpId, control.value);
+    render();
   } else if (control.id === 'incoming-kind') {
     view.incomingKind = control.value;
     render();
@@ -952,6 +1211,13 @@ page.addEventListener('change', event => {
 });
 
 page.addEventListener('input', event => {
+  if (event.target.id === 'event-search') {
+    const { selectionStart, selectionEnd, value } = event.target;
+    view.eventQuery = value;
+    render();
+    page.querySelector('#event-search').setSelectionRange(selectionStart, selectionEnd);
+    return;
+  }
   if (event.target.id !== 'file-search') return;
   view.query = event.target.value;
   document.getElementById('incoming-rows').innerHTML = incomingRows();
@@ -1038,12 +1304,16 @@ dialog.addEventListener('click', event => {
 });
 
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon); });
-window.addEventListener('hashchange', () => {
+function loadRoute() {
   if (mediaPreview.open) mediaPreview.close();
   render();
-});
+  if (view.page === 'settings') loadSettings().then(() => {
+    if (view.page === 'settings') render();
+  });
+}
+window.addEventListener('hashchange', loadRoute);
 page.addEventListener('error', event => {
   if (event.target.tagName === 'IMG') event.target.remove();
 }, true);
-render();
+loadRoute();
 syncState().then(render);

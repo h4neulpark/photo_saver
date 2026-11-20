@@ -93,13 +93,14 @@ def hash_file(root, path, expected=None):
     return digest, info
 
 
-def move_file(incoming, source, managed, target, expected):
-    parent_name, _ = relative_parts(target)
-    with directory(managed) as managed_fd:
-        try:
-            os.mkdir(parent_name, dir_fd=managed_fd)
-        except FileExistsError:
-            pass
+def move_file(incoming, source, managed, target, expected, *, create_parent=True):
+    if create_parent:
+        parent_name, _ = relative_parts(target)
+        with directory(managed) as managed_fd:
+            try:
+                os.mkdir(parent_name, dir_fd=managed_fd)
+            except FileExistsError:
+                pass
     with parent_directory(incoming, source) as (source_fd, source_name):
         with parent_directory(managed, target) as (target_fd, target_name):
             if fingerprint(regular_stat(source_fd, source_name)) != expected:
@@ -112,20 +113,24 @@ def move_file(incoming, source, managed, target, expected):
 def delete_photo(incoming, path, expected):
     if not expected or Path(path).suffix.lower() not in PHOTOS:
         raise OSError("검사한 사진만 삭제할 수 있습니다.")
+    delete_verified_file(incoming, path, expected)
+
+
+def delete_verified_file(incoming, path, expected):
     with parent_directory(incoming, path) as (fd, name):
         if fingerprint(regular_stat(fd, name)) != expected:
             raise OSError("검사 이후 파일이 변경되었습니다. 새로 고침이 필요합니다.")
         os.unlink(name, dir_fd=fd)
 
 
-def scan_tree(root):
+def scan_tree(root, extensions=SUPPORTED):
     def fail(error):
         raise error
 
     for path, dirs, names, dir_fd in os.fwalk(root, onerror=fail, follow_symlinks=False):
         dirs[:] = sorted(name for name in dirs if not name.startswith("."))
         for name in sorted(names):
-            if name.startswith(".") or Path(name).suffix.lower() not in SUPPORTED:
+            if name.startswith(".") or Path(name).suffix.lower() not in extensions:
                 continue
             relative = Path(path, name).relative_to(root).as_posix()
             try:
@@ -146,9 +151,9 @@ def modified_time_from_fingerprint(snapshot):
     return iso_time(modified_ns / 1_000_000_000)
 
 
-def capture_time(raw, offset=None, *, assumed_zone=DEFAULT_ZONE):
+def parse_capture_datetime(raw, offset=None):
     if not raw:
-        return None, False
+        return None
     value = str(raw).strip()
     if len(value) >= 10 and value[4] == ":" and value[7] == ":":
         value = value[:10].replace(":", "-") + value[10:]
@@ -157,9 +162,16 @@ def capture_time(raw, offset=None, *, assumed_zone=DEFAULT_ZONE):
     try:
         captured = datetime.fromisoformat(value)
     except ValueError:
-        return None, False
+        return None
     # QuickTime's epoch and old placeholder years cannot establish a recording date.
     if captured.year < 1980:
+        return None
+    return captured
+
+
+def capture_time(raw, offset=None, *, assumed_zone=DEFAULT_ZONE):
+    captured = parse_capture_datetime(raw, offset)
+    if captured is None:
         return None, False
     verified = captured.tzinfo is not None
     if not verified:

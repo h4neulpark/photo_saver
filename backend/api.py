@@ -16,7 +16,8 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, queue_job
-from media import capture_time, modified_time_from_fingerprint, regular_file, save_image_preview
+from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
+from settings import router as settings_router
 
 
 @asynccontextmanager
@@ -27,6 +28,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(settings_router)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
 MEDIA_TYPES = {
@@ -59,8 +61,17 @@ class Assignment(Selection):
 class MediaEdit(Selection):
     device: str | None = Field(default=None, max_length=80)
     captured_at: datetime | None = None
-    time_mode: Literal["metadata", "modified"] | None = None
+    time_mode: Literal["metadata", "modified", "xmp"] | None = None
     zone: str = DEFAULT_ZONE
+
+
+class XmpLink(BaseModel):
+    id: str
+    media_id: str
+
+
+class XmpSelection(BaseModel):
+    links: list[XmpLink] = Field(min_length=1)
 
 
 def error(status, detail):
@@ -116,37 +127,70 @@ def time_label(row):
         return f"{row['time_source']} · 사용자 확인"
     if row["user_time_source"] == "modified":
         return "파일 수정 시각 · 사용자 확인"
+    if row["user_time_source"] == "xmp":
+        return "XMP · 사용자 확인"
     return "사용자 지정"
+
+
+def xmp_time(xmp):
+    return {**xmp["date"], "source": "XMP"} if xmp.get("date") else None
+
+
+def capture_for_event(row, metadata, xmp):
+    if row["user_time"]:
+        return row["user_time"], time_label(row), True, None
+    embedded = metadata_time(row, metadata)
+    sidecar = xmp_time(xmp)
+    if sidecar and not embedded:
+        return sidecar["time"], "XMP", sidecar["verified"], None
+    if sidecar and embedded and sidecar["verified"]:
+        if embedded["verified"]:
+            first = parse_capture_datetime(embedded["time"])
+            second = parse_capture_datetime(sidecar["time"])
+        else:
+            first = parse_capture_datetime(embedded["raw"])
+            second = parse_capture_datetime(sidecar["raw"])
+            if first and second:
+                first, second = first.replace(tzinfo=None), second.replace(tzinfo=None)
+        if first and second and first.replace(microsecond=0) == second.replace(microsecond=0):
+            if not embedded["verified"]:
+                return sidecar["time"], "XMP · 시간대 보완", True, None
+        else:
+            return embedded["time"], embedded["source"], False, "원본과 XMP 시각 불일치"
+    return row["capture_time"], row["time_source"], bool(row["time_verified"]), None
 
 
 def view_media(row, periods):
     device = row["user_device"] or row["device"]
     metadata = json.loads(row["metadata"])
-    stamp = row["user_time"] or row["capture_time"]
-    verified = bool(row["user_time"] or row["time_verified"])
-    review_reason = None
+    xmp = json.loads(row["xmp_metadata"] or "{}")
+    stamp, source, verified, review_reason = capture_for_event(row, metadata, xmp)
     if row["event_id"] is None:
         if not stamp or not verified:
-            review_reason = "촬영 시각 확인 필요"
+            review_reason = review_reason or "촬영 시각 확인 필요"
         elif len(matching_events(stamp, periods)) > 1:
             review_reason = "이벤트 기간 중복"
     return {
         "id": row["id"], "name": row["name"], "path": row["path"], "kind": row["kind"],
         "size": display_size(row["size"]), "device": device, "deviceFolder": device_folder(device),
         "time": stamp, "timeVerified": verified, "reviewReason": review_reason,
-        "timeSource": time_label(row),
+        "timeSource": source,
         "timeCandidates": {
             "metadata": metadata_time(row, metadata),
+            "xmp": xmp_time(xmp),
             "modified": modified_time_from_fingerprint(row["fingerprint"]),
         },
         "eventId": row["event_id"], "confirmed": bool(row["confirmed"]),
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
         "analysisError": metadata.get("error"),
+        "xmp": {**xmp, "name": PurePosixPath(row["xmp_path"]).name} if row["xmp_path"] else None,
     }
 
 
 def view_scan_file(row):
     path = PurePosixPath(row["path"])
+    companions = json.loads(row["companions"])
+    xmp = next((item for item in companions if item.get("metadata") is not None), None)
     return {
         "id": row["id"], "name": path.name, "folder": "" if str(path.parent) == "." else str(path.parent),
         "kind": "photo" if path.suffix.lower() in PHOTOS else "video",
@@ -155,6 +199,19 @@ def view_scan_file(row):
         "preview": f"/api/incoming/{row['id']}/preview" if row["status"] in {"ready", "duplicate"} else None,
         "original": f"/api/incoming/{row['id']}/original" if row["status"] in {"ready", "duplicate"} else None,
         "status": row["status"], "reason": row["reason"],
+        "xmp": {**xmp["metadata"], "name": PurePosixPath(xmp["path"]).name} if xmp else None,
+        "cameraAuxCount": sum(item.get("metadata") is None for item in companions),
+    }
+
+
+def view_pending_xmp(row, available):
+    sidecar = json.loads(row["file"])
+    targets = [available[media_id] for media_id in json.loads(row["candidates"]) if media_id in available]
+    return {
+        "id": row["id"], "path": sidecar["path"], "date": sidecar["metadata"].get("date"),
+        "status": row["status"], "reason": row["reason"], "recommended": sidecar.get("recommended"),
+        "candidates": [{"id": target["id"], "name": target["name"], "kind": target["kind"],
+                        "originalPath": target["original_path"]} for target in targets],
     }
 
 
@@ -239,14 +296,20 @@ def state():
             "SELECT * FROM scan_files WHERE scan_id=? AND status NOT IN ('moved','deleted') ORDER BY path",
             (scan["id"],),
         ).fetchall() if scan else []
+        managed = db.execute(
+            "SELECT * FROM media WHERE status='available' ORDER BY coalesce(user_time, capture_time), name"
+        ).fetchall()
+        available = {row["id"]: row for row in managed}
+        pending = db.execute("SELECT * FROM scan_xmp WHERE scan_id=? AND status<>'linked' ORDER BY id", (scan["id"],)).fetchall() if scan else []
+        media = [view_media(row, periods) for row in managed]
+        media.sort(key=lambda item: (item["time"] or "", item["name"]))
         return {
             "timezone": DEFAULT_ZONE,
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
             "job": view_job(db.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()),
             "events": [view_event(row) for row in events],
-            "managed": [view_media(row, periods) for row in db.execute(
-                "SELECT * FROM media WHERE status='available' ORDER BY coalesce(user_time, capture_time), name"
-            )],
+            "managed": media,
+            "pendingXmp": sorted((view_pending_xmp(row, available) for row in pending), key=lambda item: item["path"]),
         }
 
 
@@ -267,6 +330,24 @@ def move_files(selection: Selection):
 @app.post("/api/jobs/delete", status_code=202)
 def delete_photos(selection: Selection):
     return queue_incoming_selection(selection, "delete")
+
+
+@app.post("/api/jobs/xmp-link", status_code=202)
+def link_xmp(selection: XmpSelection):
+    links = selection.links
+    if len({item.id for item in links}) != len(links) or len({item.media_id for item in links}) != len(links):
+        error(400, "원본과 XMP는 한 번에 하나씩 연결하세요.")
+    with database(write=True) as db:
+        scan = load_latest_scan(db)
+        pending = {row["id"]: json.loads(row["candidates"]) for row in db.execute(
+            "SELECT id,candidates FROM scan_xmp WHERE scan_id=? AND status='pending'", (scan["id"],),
+        )} if scan else {}
+        if any(link.media_id not in pending.get(link.id, ()) for link in links):
+            error(409, "XMP 연결 후보가 변경되었습니다. 새로 고침하세요.")
+        try:
+            return {"id": queue_job(db, "xmp-link", selection.model_dump())}
+        except ValueError as exc:
+            error(409, str(exc))
 
 
 def queue_incoming_selection(selection, kind):
@@ -327,8 +408,8 @@ def collect(db, event):
     periods = root_periods(db.execute("SELECT * FROM events WHERE parent_id IS NULL"))
     collected, uncertain, overlapping = [], 0, 0
     for row in db.execute("SELECT * FROM media WHERE event_id IS NULL AND status='available'"):
-        stamp = row["user_time"] or row["capture_time"]
-        if not stamp or not (row["user_time"] or row["time_verified"]):
+        stamp, _, verified, _ = capture_for_event(row, json.loads(row["metadata"]), json.loads(row["xmp_metadata"] or "{}"))
+        if not stamp or not verified:
             uncertain += 1
             continue
         matches = matching_events(stamp, periods)
@@ -445,13 +526,13 @@ def edit_media(request: MediaEdit):
         error(400, "수정할 촬영 장비나 시각을 입력하세요.")
     with database(write=True) as db:
         rows = get_selection(db, request.ids)
-        selected_zone = zone_for(request.zone) if request.time_mode == "metadata" else None
+        selected_zone = zone_for(request.zone) if request.time_mode in {"metadata", "xmp"} else None
         updates = []
         for row in rows:
             if request.time_mode == "modified":
                 stamp = modified_time_from_fingerprint(row["fingerprint"])
-            elif request.time_mode == "metadata":
-                candidate = metadata_time(row, json.loads(row["metadata"]))
+            elif request.time_mode in {"metadata", "xmp"}:
+                candidate = metadata_time(row, json.loads(row["metadata"])) if request.time_mode == "metadata" else xmp_time(json.loads(row["xmp_metadata"] or "{}"))
                 if not candidate:
                     error(400, "선택한 파일 중 사용할 수 있는 메타데이터 시각이 없는 파일이 있습니다.")
                 stamp = candidate["time"] if candidate["verified"] else capture_time(

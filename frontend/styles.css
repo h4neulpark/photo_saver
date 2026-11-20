@@ -211,6 +211,12 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 .event-tools select, .action-bar select { max-width: 210px; }
 .time-edit-link { display: inline-block; padding: 0; margin-top: 5px; border: 0; background: transparent; color: var(--blue); font-size: 12px; font-weight: 700; text-underline-offset: 3px; }
 .time-edit-link:hover { text-decoration: underline; }
+.xmp-section { margin-top: 16px; }
+.xmp-matches { max-height: 360px; }
+.xmp-matches select { max-width: 340px; }
+.xmp-data { display: grid; grid-template-columns: auto 1fr; gap: 9px 14px; margin: 0; overflow-wrap: anywhere; }
+.xmp-data dt { color: var(--muted); font-weight: 650; }
+.xmp-data dd { margin: 0; }
 .surface-head h2 > svg { color: var(--blue); margin-right: 4px; }
 .location {
   display: flex;
@@ -249,6 +255,13 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 .tree-row .meta { margin-left: auto; flex: 0 0 auto; color: var(--muted); font-size: 12px; }
 .tree-file { min-width: 0; display: flex; gap: 8px; align-items: center; padding: 6px; font-size: 13px; overflow-wrap: anywhere; }
 .transfer-bar { margin-top: 16px; border: 1px solid var(--line); border-radius: 9px; background: white; }
+.settings-section { margin-bottom: 16px; }
+.setting-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 19px; border-top: 1px solid var(--line); }
+.setting-row p { margin-top: 5px; line-height: 1.5; }
+.setting-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.setting-mask { display: inline-grid; place-items: center; width: 43px; height: 27px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: #f5f7fb; }
+.setting-value { min-width: 0; max-width: 100%; padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px; background: #f5f7fb; }
+.ssh-test-success { color: var(--teal); font-weight: 700; }
 dialog { padding: 0; border: 1px solid var(--line); border-radius: 15px; color: var(--ink); width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 36px); box-shadow: 0 18px 48px #00000035; }
 dialog::backdrop { background: #111d34a1; }
 .dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 21px; border-bottom: 1px solid var(--line); }
@@ -305,7 +318,8 @@ dialog::backdrop { background: #111d34a1; }
 @media (max-width: 550px) {
   .split { grid-template-columns: 1fr; }
   .browser { min-height: 230px; }
-  .filter-bar, .surface-head, .action-bar { padding-inline: 12px; }
+  .filter-bar, .surface-head, .action-bar, .setting-row { padding-inline: 12px; }
+  .setting-row { display: grid; }
   .action-bar { align-items: start; flex-wrap: wrap; }
   .filter { padding-inline: 7px; }
   .incoming-cards { --card-width: 130px; gap: 8px; padding-inline: 10px; }
