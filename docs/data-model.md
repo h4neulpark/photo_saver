@@ -25,7 +25,7 @@ erDiagram
 | 필드 | 내용 |
 | --- | --- |
 | `id` | 정수 기본 키 |
-| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `reset-all` |
+| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
@@ -101,10 +101,10 @@ erDiagram
 
 ### `storages`와 `remote_files`: 안정적 스토리지와 현재 원격 상태
 
-- `storages`는 IP·SSH 키 변경과 무관한 저장소 UUID(`/settings/storage-id`)와 최근 `root_hint`, 생성·확인 시각을 보관한다.
-- `remote_files`는 `(storage_id, path)`를 기본 키로 하여 원격 스토리지의 현재 파일 스냅샷(`archive_root`, `sha`, `size`, `mtime_ns`, `status`, `first_seen_at`, `verified_at`, `last_seen_at`)을 보관하며 `remote_files_by_sha(sha, status)` 인덱스를 둔다.
-- 업로드(`uploaded`·`skipped`) 성공 시 `remote_files`를 `present` 상태로 자동 갱신한다. Safe Offload(`offload`) 실행 중 원격 파일이 사라졌거나 크기가 다른 것으로 확인되면 해당 행을 `missing`으로 갱신하고 로컬 원본을 삭제하지 않는다.
-- 기존 `archive_entries`만 있는 카탈로그를 업그레이드하거나 구버전 백업을 복원하면 검증 완료 이력에서 `storages`와 `remote_files`를 자동 백필한다.
+- `storages`는 IP·SSH 키 변경과 무관한 저장소 UUID(`/settings/storage-id`)와 최근 `root_hint`, 생성·확인 시각, 최근 전체 아카이브 루트 인덱싱 시각(`last_indexed_at`)을 보관한다.
+- `remote_files`는 `(storage_id, path)`를 기본 키로 하여 원격 스토리지의 현재 파일 스냅샷(`archive_root`, `sha`, `size`, `mtime_ns`, `status`, `first_seen_at`, `verified_at`, `last_seen_at`)을 보관하며 `remote_files_by_sha(sha, status)`와 `remote_files_by_storage_status(storage_id, archive_root, status, path)` 인덱스를 둔다.
+- 업로드(`uploaded`·`skipped`) 성공과 원격 아카이브 증분 인덱싱(`remote-index`) 해시 완료 시 `remote_files`를 `present` 상태로 갱신한다. `remote-index`가 취소·단절 없이 완료되면 스캔한 범위(전체 루트 또는 선택한 하위 폴더) 내에서 발견되지 않은 기존 `present` 행만 `missing`으로 전환한다. Safe Offload(`offload`) 실행 중 원격 파일이 사라졌거나 크기가 다른 것으로 확인되어도 해당 행을 `missing`으로 갱신하고 로컬 원본을 삭제하지 않는다.
+- 기존 `archive_entries`만 있는 카탈로그를 업그레이드하거나 구버전 백업을 복원하면 `storages.last_indexed_at` 누락 열을 호환 처리하고 검증 완료 이력에서 `storages`와 `remote_files`를 자동 백필한다.
 
 ### `device_names`: 촬영도구 이름 규칙
 

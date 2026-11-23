@@ -16,6 +16,7 @@ from media import (
 )
 from transfers import upload_selection
 from offload import offload_selection
+from remote_index import index_remote_archive
 from resets import reset_local_data
 
 log = logging.getLogger(__name__)
@@ -531,7 +532,8 @@ def run():
         handlers = {
             "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
             "xmp-link": link_xmp_selection, "upload": upload_selection,
-            "offload": offload_selection, "reset-all": reset_local_data,
+            "offload": offload_selection, "remote-index": index_remote_archive,
+            "reset-all": reset_local_data,
         }
         while True:
             with database(write=True) as db:

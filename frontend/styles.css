@@ -234,6 +234,7 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 .location .mono { flex: 1; min-width: 0; }
 .browser { min-height: 355px; }
 .archive-heading { flex-wrap: wrap; gap: 12px; }
+.archive-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .archive-path { overflow-wrap: anywhere; }
 .archive-error { margin: 16px; }
 .archive-count { margin: 12px 19px 0; }
@@ -325,6 +326,7 @@ dialog::backdrop { background: #111d34a1; }
 .dialog-body { display: grid; gap: 13px; padding: 19px 21px; }
 .dialog-body p { line-height: 1.55; }
 .dialog-body label { display: grid; gap: 6px; font-weight: 650; min-width: 0; }
+.dialog-body label.checkbox-row { display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; }
 .dialog-body [hidden] { display: none; }
 .date-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; min-width: 0; }
 .date-grid input { width: 100%; min-width: 0; }

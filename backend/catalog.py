@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS storages (
     label TEXT NOT NULL DEFAULT '기본 아카이브',
     root_hint TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL
+    last_seen_at TEXT NOT NULL,
+    last_indexed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS media (
     id TEXT PRIMARY KEY,
@@ -133,6 +134,7 @@ CREATE TABLE IF NOT EXISTS remote_files (
     PRIMARY KEY (storage_id, path)
 );
 CREATE INDEX IF NOT EXISTS remote_files_by_sha ON remote_files (sha, status);
+CREATE INDEX IF NOT EXISTS remote_files_by_storage_status ON remote_files (storage_id, archive_root, status, path);
 """
 
 
@@ -246,6 +248,9 @@ def initialize():
         for column in ("original_path", "xmp_path", "xmp_sha", "xmp_metadata"):
             if column not in columns:
                 connection.execute(f"ALTER TABLE media ADD COLUMN {column} TEXT")
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(storages)")}
+        if "last_indexed_at" not in columns:
+            connection.execute("ALTER TABLE storages ADD COLUMN last_indexed_at TEXT")
         connection.commit()
     finally:
         connection.close()

@@ -59,7 +59,7 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 
 한 요청은 최대 10,000개 항목이다. 예약하면 목적지, 로컬 경로, SHA-256, 원본 fingerprint를 작업 payload에 고정한다. 설정 원문 대신 연결 버전 해시를 저장하며, 실행 전에 설정이 달라졌으면 실패한다. 이후 이벤트 이름이나 배치를 바꿔도 이미 예약한 목적지는 유지된다.
 
-현재 작업 큐는 검사·이동·사진 삭제·XMP 연결·업로드·로컬 비우기를 통틀어 `queued` 또는 `running` 작업 하나만 허용한다. 업로드·오프로드가 진행되는 동안 새 파일 작업을 예약할 수 없다.
+현재 작업 큐는 검사·이동·사진 삭제·XMP 연결·업로드·로컬 비우기·원격 인덱싱·초기화를 통틀어 `queued` 또는 `running` 작업 하나만 허용한다. 업로드·오프로드·원격 인덱싱이 진행되는 동안 새 파일 작업을 예약할 수 없다.
 
 ## 4. SFTP 전송·검증·다운로드·로컬 원본 비우기
 
@@ -78,6 +78,15 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 - `GET /api/archive/download`는 `path`(현재 저장 절대경로 기준 상대경로) 또는 `media_id`(+`kind=media|xmp`)로 원격 정규 파일을 스트리밍 다운로드한다.
 - 모든 상위 디렉터리와 대상 파일에 `lstat`을 수행해 심볼릭 링크, 디렉터리, 루트 이탈 경로를 차단한다. `media_id` 조회 시 현재 설정된 `archive_root`와 다른 경로에만 보관된 파일은 409로 거부한다.
 - RFC 5987 UTF-8 `Content-Disposition`, `Content-Length`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`를 설정하며, Destination 탐색기·이벤트 관리·파일 기록에서 바로 내려받을 수 있다.
+
+### 원격 아카이브 증분 인덱싱 (`remote-index`)
+
+- `POST /api/archive/index`는 현재 연결 버전이 유효한 원격 저장소에서 전체 아카이브 루트 또는 선택한 하위 폴더를 비동기 스캔한다.
+- 워커는 SFTP `listdir_iter`로 대상 범위를 순회하며 지원 확장자(`.jpg`, `.jpeg`, `.png`, `.webp`, `.heic`, `.heif`, `.mp4`, `.mov`, `.xmp`)의 정규 파일만 수집한다. `.DS_Store`, `._*`, `.AppleDouble`, `.photo-saver-*.part` 등 `.`로 시작하는 숨김 파일·폴더와 심볼릭 링크·비정규 파일은 건너뛴다. 한 번의 스캔 상한은 200,000개다.
+- `full_rehash=false`(기본값)이면 현재 `remote_files`에 `status='present'`와 SHA-256이 기록되어 있고 `(size, mtime_ns)`가 동일한 파일은 원격 해시를 생략하고 `last_seen_at`만 배치 갱신한다.
+- 신규 파일, 크기가 바뀌거나 수정된 파일, 또는 `full_rehash=true` 대상은 업로드와 동일한 SSH 우선(`sha256sum`·`shasum -a 256`) / SFTP `prefetch()` 자동 폴백 경로로 SHA-256을 계산한다. 해시 완료 직후 `lstat`을 다시 확인해 도중에 변경된 파일(TOCTOU)은 기록하지 않고 실패로 보고한다.
+- 취소나 SFTP 연결 단절 없이 범위 순회와 처리가 끝난 경우에만 스캔 범위 내에서 발견되지 않은 기존 `present` 행을 `missing`으로 전환한다. 범위 밖의 형제·상위 폴더 행은 건드리지 않으며, 취소·단절 시에는 이미 기록한 해시만 유지하고 기존 `present` 행을 `missing`으로 바꾸지 않는다. 전체 루트 스캔 완료 시 `storages.last_indexed_at`을 기록한다.
+- 이렇게 인덱싱된 기존 원격 파일은 Photo Saver를 거치지 않고 미리 올려둔 영상이라도 Incoming 중복 차단, 업로드 타 경로 중복 차단, `파일 기록 → 원격 인덱스` 검색·다운로드에 즉시 반영된다.
 
 ### 로컬 원본 비우기 (Safe Offload)
 
@@ -112,6 +121,7 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 
 - **보유 파일**: `managed` 원본, 연결된 XMP, 해시가 기록된 Incoming 검사 항목을 경로별로 표시한다. 파일명·현재/원래 경로·SHA-256·장비·이벤트·파일 ID로 검색하고 위치, XMP, 아카이브 검증 이력으로 필터링한다.
 - **아카이브 기록**: 업로드 항목별 로컬 경로, SHA-256, 크기, 연결 식별자, 당시 원격 루트와 목적지, 결과, 검증·기록 시각, 오류를 표시한다. 이벤트·소분류·장비 트리와 페이지 이동을 제공한다. 기본 페이지 크기는 50개, API 상한은 100개다.
+- **원격 인덱스**: `remote_files` 스냅샷의 모든 파일(업로드·증분 인덱싱으로 등록된 기존 원격 파일 포함)을 원격 경로 2단계 폴더 트리와 함께 조회한다. **보관 중**, **원격 전용 (카탈로그 미등록)**, **누락됨**, **XMP** 필터와 파일명·원격 경로·SHA-256 검색, 현재 활성 저장 루트에 대한 직접 다운로드를 제공한다.
 
 | 파일별 결과 | 의미 |
 | --- | --- |
@@ -143,17 +153,17 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 
 루트 README의 초기 설계 중 다음 항목은 현재 구현에 포함되지 않는다.
 
-- rsync 전송, 원격 해시 보조 스크립트, 원격 파일 전체 인덱싱 및 변경 감지.
-- 다른 원격 경로에서 동일 콘텐츠를 찾아 참조하거나 스토리지 내부에서 복사하는 기능.
+- rsync 전송과 원격 전용 보조 에이전트·데몬.
+- 다른 원격 경로에서 동일 콘텐츠를 찾아 스토리지 내부에서 복사하거나 하드링크로 재사용하는 기능(현재는 중복을 감지·차단하고 선택적 별도 사본 업로드만 지원).
 - 충돌 파일에 해시 접미사를 붙이는 자동 이름 변경과 재승인 미리보기.
 - OMV가 꺼진 동안 자동 대기하고 재시도하는 전송 스케줄러.
 - 분석과 업로드의 병렬 실행.
 
-현재 지원하는 중복 재사용은 **선택한 동일 목적지 경로의 파일**을 전송 시점에 검증해 건너뛰는 동작이다.
+현재 지원하는 중복 재사용은 **선택한 동일 목적지 경로의 파일**을 전송 시점에 검증해 건너뛰는 동작이며, 다른 원격 경로의 중복 파일은 Incoming 수집 및 업로드 예약 단계에서 전역으로 감지·차단한다.
 
 ## 관련 코드와 테스트
 
-- [원격 탐색·연결·다운로드](../backend/archive.py), [SFTP 전송·이력 저장](../backend/transfers.py), [안전 로컬 비우기](../backend/offload.py)
+- [원격 탐색·연결·다운로드](../backend/archive.py), [SFTP 전송·이력 저장](../backend/transfers.py), [원격 증분 인덱싱](../backend/remote_index.py), [안전 로컬 비우기](../backend/offload.py)
 - [설정·SSH 테스트·백업·복원](../backend/settings.py), [파일 기록 조회](../backend/records.py)
 - [워커 재시작 처리](../backend/worker.py), [큐 제약과 스키마](../backend/catalog.py)
-- [탐색·다운로드 테스트](../backend/test_archive.py), [전송 테스트](../backend/test_transfers.py), [로컬 비우기·모델 테스트](../backend/test_offload.py), [파일 기록·백업 호환 테스트](../backend/test_records.py)
+- [탐색·다운로드 테스트](../backend/test_archive.py), [전송 테스트](../backend/test_transfers.py), [원격 인덱싱 테스트](../backend/test_remote_index.py), [로컬 비우기·모델 테스트](../backend/test_offload.py), [파일 기록·백업 호환 테스트](../backend/test_records.py)

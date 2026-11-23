@@ -19,9 +19,10 @@ photo_saver/
 │   ├── settings.py         # SSH·저장소 설정과 DB 백업·복원
 │   ├── archive.py          # SFTP 연결·폴더 탐색·단일 파일 다운로드
 │   ├── transfers.py        # 업로드·검증·취소·이력·remote_files 동기화
+│   ├── remote_index.py     # 원격 아카이브 전체·폴더별 증분 인덱싱
 │   ├── offload.py          # 실시간 SFTP 확인 기반 로컬 원본 비우기(Safe Offload)
 │   ├── devices.py          # 촬영도구 이름 규칙·조회·변경
-│   ├── records.py          # 파일·아카이브 기록 조회
+│   ├── records.py          # 파일·아카이브·원격 인덱스 기록 조회
 │   └── test_*.py           # unittest 테스트
 ├── frontend/
 │   ├── index.html
@@ -54,7 +55,7 @@ docker run --rm --network none \
 
 한 부문만 실행할 때는 마지막 명령을 `python -m unittest test_transfers -v`처럼 지정한다. 테스트는 외부 SSH·OMV 연결을 모의 객체 또는 로컬 SFTP 대역으로 대체한다.
 
-2026-11-23 기준 위의 네트워크 차단·소스 읽기 전용 마운트 명령으로 기존·촬영도구 이름·초기화·일괄 수정·아카이브 모델·로컬 비우기·다운로드·원격 중복 방지·SSH/prefetch 고속 검증 테스트 **84개**가 모두 통과했다. 실제 OMV 연결은 검증하지 않았다. 촬영도구 이름 화면은 별도 임시 서버에서 실제 API 저장·공백 유지·충돌 오류·새로고침 후 유지·빈 목록·오류 재시도와 PC·모바일 배치를 브라우저로 확인했다.
+2026-11-23 기준 위의 네트워크 차단·소스 읽기 전용 마운트 명령으로 기존·촬영도구 이름·초기화·일괄 수정·아카이브 모델·로컬 비우기·다운로드·원격 중복 방지·SSH/prefetch 고속 검증·원격 증분 인덱싱 테스트 **91개**가 모두 통과했다. 실제 OMV 연결은 검증하지 않았다. 촬영도구 이름 화면은 별도 임시 서버에서 실제 API 저장·공백 유지·충돌 오류·새로고침 후 유지·빈 목록·오류 재시도와 PC·모바일 배치를 브라우저로 확인했다.
 
 통합 초기화는 별도 임시 서버에서 단일 버튼·이전 확인 문구 거부·취소·실제 파일 삭제·모든 기록 제거·incoming·SSH·원격 보존·변경 요청 차단·초기화 후 재검사와 PC·모바일 화면을 브라우저로 검증했다. 운영 카탈로그에는 초기화를 실행하지 않았다.
 
@@ -66,6 +67,7 @@ docker run --rm --network none \
 | [test_events.py](../backend/test_events.py) | 날짜 접두사, 이벤트·장비 폴더 충돌, 수정 롤백, 수정 후 경로 갱신, 기존 전송 기록·예약 경로 유지 |
 | [test_gopro.py](../backend/test_gopro.py) | GoPro 인코더·메타데이터 트랙·모델 판정, 추측 방지, 재분석 시 사용자 분류 보존 |
 | [test_transfers.py](../backend/test_transfers.py) | 폴더·XMP 전송, 동일 파일 재전송 생략 및 `remote_files` 고속 스킵, 타 경로 원격 중복 차단·선택 허용, `remote_files` 동기화, SSH 원격 해시(`sha256sum`/`shasum`) 및 SFTP `prefetch` 자동 폴백, 임시 파일 정리, 충돌·심볼릭 링크·원본 변경·검증 오류·취소·연결 단절 조기 중단·설정 변경·잘못된 입력 |
+| [test_remote_index.py](../backend/test_remote_index.py) | 원격 증분 인덱싱 지원 확장자 필터·숨김/심볼릭 링크 제외, 크기·수정시각 증분 스킵 및 `full_rehash`, 범위 제한 `missing` 판정, 취소·연결 단절 시 부분 해시 보존 및 오판 방지, 해시 중 파일 변경(TOCTOU) 감지, 기존 원격 전용 파일의 Incoming/업로드 중복 차단·`원격 인덱스` 조회·다운로드 연동, 구버전 `storages` 백업 복원 |
 | [test_offload.py](../backend/test_offload.py) | 안정적 스토리지 ID 유지, 구버전 백업 `remote_files` 백필 및 `offloading` 복원, 실시간 SFTP 검증 후 원본·XMP 로컬 비우기·썸네일 보존·`archived` 전환, 미업로드 XMP·원격 누락/크기 불일치/링크/로컬 변경 거부, 중단 재개와 연결 단절 중단, 원격 아카이브 기준 Incoming 스캔·이동·삭제 중복 판정 |
 | [test_devices.py](../backend/test_devices.py) | 기존·신규 적용, 재분석·재시작, 수동 이름 우선, 경로·검색 일치, 충돌과 업로드 잠금, 신구 백업 호환 |
 | [test_media_edit.py](../backend/test_media_edit.py) | 기존 장비 일괄 배정, 실제 XMP 읽기·파일별 시각·시간대 적용, 누락 시각 유지, 엄격 검증 호환, 전부 누락·잘못된 플래그 거부, 재검사한 XMP 적용 |

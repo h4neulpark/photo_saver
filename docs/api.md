@@ -103,6 +103,8 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | GET | `/api/archive/download` | 쿼리 `path` 또는 `media_id`(+`kind`) | 원격 아카이브 정규 파일의 SFTP 스트리밍 다운로드 (`attachment`, `no-store`) |
 | POST | `/api/archive/transfers` | 전송 모델 | `202 {"id":작업ID,"count":파일수}` |
 | POST | `/api/archive/transfers/{job_id}/cancel` | 없음 | `upload` 작업의 취소 요청 후 작업 상태 반환 |
+| POST | `/api/archive/index` | `{"connection":"64자 식별자","path":"","full_rehash":false}` | `202 {"id":작업ID,"scope":"상대경로"}`. 원격 아카이브 전체 또는 하위 폴더 증분 인덱싱(`remote-index`) 등록 |
+| POST | `/api/archive/index/{job_id}/cancel` | 없음 | `remote-index` 작업의 취소 요청 후 작업 상태 반환 |
 
 폴더 조회 응답은 `root`, `path`, `entries`, `connectionVersion`을 포함한다. `entries`에는 `name`, `kind` (`folder`·`file`·`link`), `size`, `modified`가 있다. `size`는 일반 파일만 바이트 크기이고 나머지는 `null`이며, `modified`는 원격 수정 시각의 Unix 타임스탬프다. `connectionVersion`은 현재 설정 식별자로 업로드 요청의 `connection`에 전달한다. 루트 밖 경로·상위 경로 이동을 거부한다.
 
@@ -126,22 +128,24 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 - 대상은 `destination + (논리적 파일 경로에서 source 접두 경로를 뺀 부분)`으로 결정한다.
 - `available`이면서 확정된 원본과 그 XMP만 등록할 수 있다. 설정 식별자가 바뀌었거나 대상 경로가 중복되면 409다.
 - 대기 작업 취소는 즉시 `cancelled`로 변경하고, 실행 중이면 `cancelRequested`를 설정해 워커가 확인한다. 이미 종료한 작업에는 상태 변경 없이 응답한다.
+- 원격 인덱싱(`POST /api/archive/index`)은 `connection`이 현재 설정 식별자와 일치해야 하며(불일치 409), `path`가 비어 있으면 전체 저장 루트를, 상대경로이면 해당 폴더 하위만 인덱싱한다. 지원 확장자(사진·영상·XMP) 정규 파일만 색인하며 숨김 항목(`.` 접두)과 심볼릭 링크는 건너뛴다. `full_rehash=false`(기본값)이면 `remote_files`의 `(size, mtime_ns)`가 일치하는 `present` 행은 재해시를 생략한다. 취소 또는 연결 단절로 중단된 경우 이미 완료된 해시는 유지하되 기존 `present` 행을 `missing`으로 바꾸지 않는다.
 
 ## 파일 기록
 
-`GET /api/catalog`는 로컬 파일과 아카이브 이력을 별도 뷰로 조회한다.
+`GET /api/catalog`는 로컬 파일, 아카이브 이력, 원격 인덱스를 별도 뷰로 조회한다.
 
 | 쿼리 | 기본값 | 허용 값·범위 |
 | --- | --- | --- |
-| `view` | `files` | `files`, `archives` |
+| `view` | `files` | `files`, `archives`, `remote` |
 | `q` | 빈 문자열 | 최대 300자 검색어 |
-| `scope` | `all` | `all`, `managed`, `incoming`, `xmp`, `verified`, `failed`, `unknown` |
+| `scope` | `all` | `all`, `managed`, `incoming`, `xmp`, `verified`, `failed`, `unknown`, `present`, `missing`, `remote_only` |
 | `page` | `1` | 1 이상. 마지막 페이지를 초과하면 마지막 페이지로 조정 |
 | `page_size` | `50` | 1~100 |
-| `event` | `all` | `all`, `unassigned`, 이벤트 ID |
-| `device` | 빈 문자열 | 장비 표시 이름. 미확인은 `장비 미확인` |
+| `event` | `all` | `all`, `unassigned`, 이벤트 ID (`files`·`archives` 뷰 전용) |
+| `device` | 빈 문자열 | 장비 표시 이름. 미확인은 `장비 미확인` (`files`·`archives` 뷰 전용) |
+| `folder` | 빈 문자열 | 원격 아카이브 하위 경로 접두 또는 루트 직속 파일용 `__root__` (`remote` 뷰 전용) |
 
-로컬 파일 뷰는 `managed`, `incoming`, `xmp`, `verified` 범위를 적용하고 아카이브 뷰는 `xmp`, `verified`, `failed`, `unknown`을 적용한다. 그 밖의 조합은 추가 범위 조건 없이 조회한다. 반환값은 `view`, `rows`, `total`, `page`, `pages`, `pageSize`, `summary`, `folders`, `unassigned`다. 요약과 폴더 집계는 현재 검색·페이지 조건과 독립된 전체 집계다.
+로컬 파일 뷰는 `managed`, `incoming`, `xmp`, `verified` 범위를, 아카이브 뷰는 `xmp`, `verified`, `failed`, `unknown`을, 원격 인덱스 뷰(`view=remote`)는 `present`, `missing`, `remote_only`(현재 로컬/오프로드 `media`에 없는 원격 전용 파일), `xmp`를 적용한다. 그 밖의 조합은 추가 범위 조건 없이 조회한다. 반환값은 `view`, `rows`, `total`, `page`, `pages`, `pageSize`, `summary`(`remoteTotal`, `remotePresent`, `remoteMissing`, `remoteOnly`, `lastIndexedAt` 포함), `folders`, `unassigned`, `remoteFolders`, `remoteRootCount`다. 요약과 폴더 집계는 현재 검색·페이지 조건과 독립된 전체 집계다. `view=remote`의 각 행은 현재 활성 `archive_root`와 일치하는 `present` 파일에 대해 `can_download: true`를 제공한다.
 
 ## 촬영도구 이름
 
@@ -161,7 +165,7 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | POST | `/api/settings/ssh-key/copied` | 없음 | 공개키 복사 완료 표시 저장 |
 | POST | `/api/settings/ssh-test` | 없음 | 공개키 접속 확인 또는 최초 호스트 키 확인 요청 |
 | POST | `/api/settings/ssh-test/trust` | `{"token":"확인토큰"}` | 유효한 확인 요청의 호스트 키 저장 후 공개키 접속 확인 |
-| DELETE | `/api/settings/ssh-host-key` | 없음 | 현재 IP에 저장된 SSH 호스트 키 초기화 (활성 `upload`·`offload` 작업 중에는 409) |
+| DELETE | `/api/settings/ssh-host-key` | 없음 | 현재 IP에 저장된 SSH 호스트 키 초기화 (활성 `upload`·`offload`·`remote-index` 작업 중에는 409) |
 | GET | `/api/settings/catalog/backup` | 없음 | SQLite 백업 파일 다운로드 |
 | POST | `/api/settings/catalog/reset` | `{"confirmation":"모든 데이터 삭제"}` | `202 {"id":작업ID,"kind":"reset-all","status":"queued"}`. 전체 로컬 데이터 초기화 등록 |
 | POST | `/api/settings/catalog/restore` | SQLite 파일의 원시 요청 본문 | `{"restored":true}`. multipart 업로드가 아님 |
@@ -174,4 +178,4 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 
 incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격 아카이브는 유지한다. 파일 삭제는 되돌릴 수 없고 중간 실패의 파일 롤백은 없다. DB 삭제는 한 트랜잭션으로 처리한다. 실패한 작업은 오류를 기록해 재실행할 수 있게 남는다. 응답은 `no-store`다.
 
-구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [offload.py](../backend/offload.py), [records.py](../backend/records.py).
+구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [remote_index.py](../backend/remote_index.py), [offload.py](../backend/offload.py), [records.py](../backend/records.py).

@@ -58,26 +58,65 @@ WITH archive_history AS (
            CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END AS event_name
     FROM archive_history a LEFT JOIN media m ON m.id=a.file_id
     LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
+), remote_view AS (
+    SELECT 'remote:'||rf.storage_id||':'||rf.path AS record_key,
+           rf.storage_id,rf.path AS remote_path,rf.archive_root,
+           rf.sha,rf.size,rf.mtime_ns,rf.status,
+           rf.first_seen_at,rf.verified_at,rf.last_seen_at,
+           CASE WHEN lower(rf.path) LIKE '%.xmp' THEN 'xmp'
+                WHEN lower(rf.path) LIKE '%.mp4' OR lower(rf.path) LIKE '%.mov' THEN 'video'
+                ELSE 'photo' END AS kind,
+           (EXISTS (SELECT 1 FROM media m WHERE m.sha=rf.sha AND m.status IN ('available','archived'))
+            OR EXISTS (SELECT 1 FROM media m WHERE m.xmp_sha=rf.sha AND m.status IN ('available','archived'))) AS in_catalog
+    FROM remote_files rf
 )
 """
+
+
+def escape_like(value):
+    return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
 def search_clause(columns, query):
     if not query:
         return '1=1', []
-    value = '%' + query.lower().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+    value = '%' + escape_like(query.lower()) + '%'
     return '(' + ' OR '.join(f"lower(coalesce({column},'')) LIKE ? ESCAPE '\\'" for column in columns) + ')', [value] * len(columns)
+
+
+def build_remote_folders(db):
+    root_count = 0
+    top = {}
+    for (path,) in db.execute('SELECT path FROM remote_files'):
+        parts = PurePosixPath(path).parts
+        if len(parts) <= 1:
+            root_count += 1
+            continue
+        first = parts[0]
+        entry = top.setdefault(first, {'path': first, 'name': first, 'count': 0, 'children': {}})
+        entry['count'] += 1
+        if len(parts) >= 3:
+            second_path = f'{first}/{parts[1]}'
+            child = entry['children'].setdefault(second_path, {'path': second_path, 'name': parts[1], 'count': 0})
+            child['count'] += 1
+    folders = []
+    for key in sorted(top, key=lambda item: (item.casefold(), item), reverse=True):
+        entry = top[key]
+        children = sorted(entry['children'].values(), key=lambda item: (item['name'].casefold(), item['name']))
+        folders.append({'path': entry['path'], 'name': entry['name'], 'count': entry['count'], 'children': children})
+    return folders, root_count
 
 
 @router.get('')
 def catalog_records(
-    view: Literal['files', 'archives'] = 'files',
+    view: Literal['files', 'archives', 'remote'] = 'files',
     q: str = Query(default='', max_length=300),
-    scope: Literal['all', 'managed', 'incoming', 'xmp', 'verified', 'failed', 'unknown'] = 'all',
+    scope: Literal['all', 'managed', 'incoming', 'xmp', 'verified', 'failed', 'unknown', 'present', 'missing', 'remote_only'] = 'all',
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
     event: str = 'all',
     device: str = '',
+    folder: str = '',
 ):
     if view == 'files':
         table = 'files'
@@ -90,7 +129,7 @@ def catalog_records(
         elif scope == 'verified':
             where += f" AND {FILE_VERIFIED_SQL}"
         order = 'local_path,record_key'
-    else:
+    elif view == 'archives':
         table = 'archive_files'
         where, params = search_clause(['local_path', 'target', 'archive_root', 'sha', 'file_id', 'event_name', 'device', 'CAST(job_id AS TEXT)'], q.strip())
         if scope == 'verified':
@@ -102,22 +141,45 @@ def catalog_records(
         elif scope == 'xmp':
             where += " AND kind='xmp'"
         order = 'job_id DESC,record_key'
-    if event == 'unassigned':
-        where += ' AND event_id IS NULL'
-    elif event != 'all':
-        where += ' AND (event_id=?' + (')' if device else ' OR parent_id=?)')
-        params.extend([event] if device else [event, event])
-    if device:
-        where += ' AND device=?'
-        params.append('' if device == '장비 미확인' else device)
+    else:
+        table = 'remote_view'
+        where, params = search_clause(['remote_path', 'archive_root', 'sha'], q.strip())
+        if scope == 'present':
+            where += " AND status='present'"
+        elif scope == 'missing':
+            where += " AND status='missing'"
+        elif scope == 'remote_only':
+            where += " AND status='present' AND NOT in_catalog"
+        elif scope == 'xmp':
+            where += " AND kind='xmp'"
+        if folder == '__root__':
+            where += " AND instr(remote_path, '/') = 0"
+        elif folder.strip('/'):
+            where += " AND remote_path LIKE ? ESCAPE '\\'"
+            params.append(f"{escape_like(folder.strip('/'))}/%")
+        order = 'remote_path,record_key'
+    if view != 'remote':
+        if event == 'unassigned':
+            where += ' AND event_id IS NULL'
+        elif event != 'all':
+            where += ' AND (event_id=?' + (')' if device else ' OR parent_id=?)')
+            params.extend([event] if device else [event, event])
+        if device:
+            where += ' AND device=?'
+            params.append('' if device == '장비 미확인' else device)
     with database() as db:
-        folders = [dict(row) for row in db.execute(CTE + f"""SELECT e.id,e.name,e.parent_id,e.start,
-                   count(t.record_key) AS count FROM events e LEFT JOIN {table} t ON t.event_id=e.id
-                   GROUP BY e.id ORDER BY e.start DESC,e.name,e.id""")]
-        device_counts = [dict(row) for row in db.execute(CTE + f"SELECT event_id,device,count(*) AS count FROM {table} GROUP BY event_id,device ORDER BY device")]
-        unassigned = sum(row['count'] for row in device_counts if row['event_id'] is None)
-        for folder in folders:
-            folder['devices'] = [{'name': row['device'] or '장비 미확인', 'count': row['count']} for row in device_counts if row['event_id'] == folder['id']]
+        if view == 'remote':
+            folders, unassigned = [], 0
+            remote_folders, remote_root_count = build_remote_folders(db)
+        else:
+            folders = [dict(row) for row in db.execute(CTE + f"""SELECT e.id,e.name,e.parent_id,e.start,
+                       count(t.record_key) AS count FROM events e LEFT JOIN {table} t ON t.event_id=e.id
+                       GROUP BY e.id ORDER BY e.start DESC,e.name,e.id""")]
+            device_counts = [dict(row) for row in db.execute(CTE + f"SELECT event_id,device,count(*) AS count FROM {table} GROUP BY event_id,device ORDER BY device")]
+            unassigned = sum(row['count'] for row in device_counts if row['event_id'] is None)
+            for item in folders:
+                item['devices'] = [{'name': row['device'] or '장비 미확인', 'count': row['count']} for row in device_counts if row['event_id'] == item['id']]
+            remote_folders, remote_root_count = [], 0
         total = db.execute(CTE + f'SELECT count(*) FROM {table} WHERE {where}', params).fetchone()[0]
         pages = max(1, math.ceil(total / page_size))
         page = min(page, pages)
@@ -135,19 +197,37 @@ def catalog_records(
                 present_remote.setdefault(remote['sha'], remote['path'])
         file_summary = db.execute(CTE + 'SELECT count(*) AS files,count(DISTINCT sha) AS hashes FROM files').fetchone()
         archive_summary = db.execute(CTE + f"SELECT count(*) AS attempts,coalesce(sum(outcome IN {VERIFIED}),0) AS verified,coalesce(sum(outcome='failed'),0) AS failed FROM archive_history").fetchone()
+        remote_summary = db.execute(CTE + """
+            SELECT count(*) AS remoteTotal,
+                   coalesce(sum(status='present'), 0) AS remotePresent,
+                   coalesce(sum(status='missing'), 0) AS remoteMissing,
+                   coalesce(sum(status='present' AND NOT in_catalog), 0) AS remoteOnly
+            FROM remote_view
+        """).fetchone()
+        indexed_row = db.execute(
+            "SELECT last_indexed_at FROM storages WHERE last_indexed_at IS NOT NULL ORDER BY (id=?) DESC, last_indexed_at DESC LIMIT 1",
+            (active_storage_id or '',),
+        ).fetchone()
     for row in rows:
-        row['name'] = row.get('name') or PurePosixPath(row.get('local_path') or row.get('target') or '').name
+        row['name'] = row.get('name') or PurePosixPath(row.get('remote_path') or row.get('local_path') or row.get('target') or '').name
         if view == 'files':
             download_path = present_remote.get(row['sha']) if active_root and row.get('sha') else None
             row['download_path'] = download_path
             row['can_download'] = bool(download_path)
-        else:
+        elif view == 'archives':
             row['can_download'] = bool(
                 active_root and row.get('target') and row.get('archive_root') == active_root
                 and row.get('outcome') in {'uploaded', 'skipped'}
             )
+        else:
+            row['in_catalog'] = bool(row['in_catalog'])
+            row['can_download'] = bool(active_root and row.get('status') == 'present' and row.get('archive_root') == active_root)
     return JSONResponse({
         'view': view, 'rows': rows, 'total': total, 'page': page, 'pages': pages, 'pageSize': page_size,
-        'summary': {**dict(file_summary), **dict(archive_summary)},
+        'summary': {
+            **dict(file_summary), **dict(archive_summary), **dict(remote_summary),
+            'lastIndexedAt': indexed_row['last_indexed_at'] if indexed_row else None,
+        },
         'folders': folders, 'unassigned': unassigned,
+        'remoteFolders': remote_folders, 'remoteRootCount': remote_root_count,
     }, headers=NO_STORE)

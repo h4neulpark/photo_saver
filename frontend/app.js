@@ -75,6 +75,7 @@ const view = {
   archive: null, archivePath: '', archiveBusy: false, archiveError: '',
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
   catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
+  catalogRemoteFolder: '', catalogRemoteExpanded: new Set(),
   catalog: null, catalogTab: 'files', catalogQuery: '', catalogScope: 'all', catalogPage: 1, catalogBusy: false, catalogError: '',
 };
 let refreshTimer;
@@ -122,6 +123,7 @@ function jobMessage(job) {
   if (job.status === 'failed') return job.result.error;
   if (job.kind === 'upload') return `업로드 ${job.result.uploaded}개 완료 · 동일 파일 ${job.result.skipped}개 건너뜀`;
   if (job.kind === 'offload') return `로컬 원본 ${job.result.offloaded || 0}개를 비웠습니다.${job.result.failed ? ` 실패 ${job.result.failed}개.` : ''}`;
+  if (job.kind === 'remote-index') return `원격 인덱싱 완료 · 신규 해시 ${job.result.hashed || 0}개 · 변경 없음 ${job.result.unchanged || 0}개${job.result.missing ? ` · 누락 ${job.result.missing}개` : ''}`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
   if (job.kind === 'xmp-link') return `XMP ${job.result.linked}개를 연결했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
@@ -353,7 +355,7 @@ function incomingPage() {
   const jobLabels = {
     scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중',
     'xmp-link': 'XMP 연결 중', upload: '아카이브 업로드 중', offload: '로컬 원본 비우기 중',
-    'reset-all': '서버 데이터 초기화 중',
+    'remote-index': '원격 아카이브 인덱싱 중', 'reset-all': '서버 데이터 초기화 중',
   };
   const status = active ? (jobLabels[state.job.kind] || '작업 진행 중') :
     failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
@@ -592,7 +594,7 @@ function archivePage() {
   const allAssets = entries.flatMap(entry => entry.assets);
   const busy = jobActive() || view.uploadStarting;
   return `${header('아카이브 전송', '파일·폴더를 선택해 업로드하거나 Destination으로 드래그하세요.', '')}
-    ${uploadStatus()}
+    ${uploadStatus()}${remoteIndexStatus()}
     <div class="split">
       <section class="surface browser" aria-labelledby="source-title">
         <div class="surface-head archive-heading"><div><h2 id="source-title">${icon('folder')} Source</h2><p class="small muted">확정된 이벤트 배치</p></div>
@@ -619,8 +621,11 @@ function archivePage() {
       </section>
       <section class="surface browser archive-destination" aria-labelledby="destination-title" ${view.archive && !view.archiveBusy && !busy ? `data-archive-drop="${escapeHtml(view.archivePath)}"` : ''}>
         <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} Destination</h2><p class="small muted">${view.archive ? '현재 폴더에 업로드 · 폴더 위에 놓으면 해당 폴더로 전송' : '원격 아카이브 연결'}</p></div>
-          ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
-            { glyph: 'refresh', primary: !view.archive, disabled: view.archiveBusy })}</div>
+          <div class="archive-actions">
+            ${view.archive ? button('open-remote-index', '원격 인덱싱', { glyph: 'search', disabled: busy || view.archiveBusy }) : ''}
+            ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
+              { glyph: 'refresh', primary: !view.archive, disabled: view.archiveBusy })}
+          </div></div>
         ${archiveDestination()}
       </section>
     </div>`;
@@ -663,6 +668,46 @@ function uploadStatus() {
     ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
     ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
   </section>`;
+}
+
+function remoteIndexStatus() {
+  const job = state.job;
+  if (job?.kind !== 'remote-index') return '';
+  const result = job.result || {};
+  const active = jobActive(job);
+  const total = result.totalFiles || 0;
+  const percent = total ? Math.min(100, Math.round((result.processedFiles || 0) / total * 100)) : 0;
+  const scopeLabel = result.scope ? `범위: ${result.scope}` : '전체 아카이브 루트';
+  return `<section class="surface upload-status" aria-label="원격 아카이브 인덱싱 상태">
+    <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '원격 인덱싱 대기 중' : result.phase || '원격 인덱싱 중' : job.status === 'done' ? '원격 인덱싱 완료' : job.status === 'cancelled' ? '원격 인덱싱 중지됨' : '원격 인덱싱 실패'}</strong>
+      <span class="small muted">${escapeHtml(scopeLabel)} · ${result.processedFiles || 0} / ${total}개 처리 · 해시 ${result.hashed || 0}개 · 변경 없음 ${result.unchanged || 0}개${result.missing ? ` · 누락 ${result.missing}개` : ''}${result.failed ? ` · 실패 ${result.failed}개` : ''}</span>
+      ${active ? button('cancel-remote-index', result.cancelRequested ? '중지 중…' : '인덱싱 중지', { disabled: result.cancelRequested }) : ''}</div>
+    ${active ? `<progress max="100" value="${percent}" aria-label="원격 인덱싱 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '원격 아카이브에 연결하고 있습니다.')}</p>` : ''}
+    ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
+    ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
+  </section>`;
+}
+
+function openRemoteIndexDialog() {
+  if (!view.archive || jobActive()) return;
+  const currentScope = view.archivePath || '';
+  showDialog('원격 아카이브 인덱싱', `<p>원격 스토리지의 사진·영상·XMP 파일을 증분 스캔해 아카이브 DB(<code>remote_files</code>)에 등록합니다. 이미 기록된 파일 중 크기와 수정 시각이 같은 파일은 재해시를 건너뜁니다.</p>
+    <p class="small muted">인덱싱된 원격 파일은 Incoming 수집 및 업로드 시 전역 중복 차단에 반영되며, 파일 기록의 <strong>원격 인덱스</strong> 탭에서 검색·다운로드할 수 있습니다.</p>
+    <label>스캔 범위<select name="scope">
+      <option value="">전체 아카이브 루트 (${escapeHtml(view.archive.root)})</option>
+      ${currentScope ? `<option value="${escapeHtml(currentScope)}">현재 폴더만 (${escapeHtml(currentScope)})</option>` : ''}
+    </select></label>
+    <label class="checkbox-row"><input type="checkbox" name="full_rehash" value="1"><span>크기·수정 시각이 같은 파일도 전체 해시 다시 검증</span></label>`,
+  '인덱싱 시작', async form => {
+    const scope = String(form.get('scope') || '');
+    const fullRehash = form.get('full_rehash') === '1';
+    const result = await api('archive/index', 'POST', {
+      connection: view.archive.connectionVersion, path: scope, full_rehash: fullRehash,
+    });
+    state.job = { id: result.id, kind: 'remote-index', status: 'queued', result: { scope } };
+    await syncState();
+    announce('원격 아카이브 인덱싱을 시작합니다.');
+  });
 }
 
 function confirmDuplicateUpload(keys, source, destination, data) {
@@ -770,6 +815,11 @@ function catalogHash(row) {
 }
 
 function catalogFolderLabel() {
+  if (view.catalogTab === 'remote') {
+    if (!view.catalogRemoteFolder) return '전체 원격 파일';
+    if (view.catalogRemoteFolder === '__root__') return '아카이브 루트 직속 파일';
+    return view.catalogRemoteFolder;
+  }
   const id = view.catalogEvent;
   if (id === 'all') return '전체 파일';
   if (id === 'unassigned') return '미배정';
@@ -779,7 +829,34 @@ function catalogFolderLabel() {
   return [parent?.name, folder.name, view.catalogDevice].filter(Boolean).join(' / ');
 }
 
+function remoteFolderTree() {
+  const data = view.catalog;
+  const folders = data?.remoteFolders || [];
+  const folderButton = (folderPath, label, count, depth = 0) => {
+    const selected = view.catalogRemoteFolder === folderPath;
+    return `<button type="button" class="catalog-folder${selected ? ' active' : ''}" data-action="catalog-remote-folder" data-value="${escapeHtml(folderPath)}"
+      ${selected ? 'aria-current="location"' : ''} title="${escapeHtml(label)}" style="--folder-depth:${depth}">${icon('folder')}<span>${escapeHtml(label)}</span><span class="catalog-folder-count">${count}</span></button>`;
+  };
+  const branch = folder => {
+    const children = folder.children || [];
+    const expandable = children.length > 0;
+    const expanded = view.catalogRemoteExpanded.has(folder.path);
+    return `<li><div class="catalog-folder-row" style="--folder-depth:0">
+      ${expandable ? `<button type="button" class="catalog-folder-toggle" data-action="toggle-remote-folder" data-value="${escapeHtml(folder.path)}" aria-expanded="${expanded}" aria-label="${escapeHtml(folder.name)} 하위 폴더 ${expanded ? '접기' : '펼치기'}">${icon('right')}</button>` : '<span class="catalog-folder-spacer"></span>'}
+      ${folderButton(folder.path, folder.name, folder.count, 0)}</div>
+      ${expanded ? `<ul>${children.map(child => `<li>${folderButton(child.path, child.name, child.count, 1)}</li>`).join('')}</ul>` : ''}
+    </li>`;
+  };
+  return `<nav class="catalog-folders" aria-label="원격 아카이브 폴더"><div class="catalog-folders-heading"><h2>원격 폴더</h2><p class="small muted">아카이브 경로 기준</p></div>
+    <div class="catalog-folder-list">${folderButton('', '전체 원격 파일', data?.summary.remoteTotal || 0)}
+      ${data?.remoteRootCount ? folderButton('__root__', '루트 직속 파일', data.remoteRootCount) : ''}
+      <ul>${folders.map(branch).join('')}</ul>
+      ${!folders.length && !data?.remoteRootCount ? '<p class="small muted catalog-folders-empty">인덱싱된 원격 파일이 없습니다.</p>' : ''}
+    </div></nav>`;
+}
+
 function catalogFolderTree() {
+  if (view.catalogTab === 'remote') return remoteFolderTree();
   const data = view.catalog;
   const folders = data?.folders || [];
   const folderButton = (event, device, label, count, depth = 0) => {
@@ -809,31 +886,47 @@ function catalogFolderTree() {
 function catalogPage() {
   const data = view.catalog;
   const archives = view.catalogTab === 'archives';
+  const remote = view.catalogTab === 'remote';
   const summary = data?.summary;
-  const options = archives ? [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']] :
-    [['all', '모든 파일'], ['managed', '보관 파일'], ['incoming', 'Incoming 기록'], ['xmp', 'XMP'], ['verified', '아카이브 검증 기록 있음']];
+  const options = remote
+    ? [['all', '모든 원격 파일'], ['present', '보관 중'], ['remote_only', '원격 전용 (카탈로그 미등록)'], ['missing', '누락됨'], ['xmp', 'XMP']]
+    : archives
+      ? [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']]
+      : [['all', '모든 파일'], ['managed', '보관 파일'], ['incoming', 'Incoming 기록'], ['xmp', 'XMP'], ['verified', '아카이브 검증 기록 있음']];
   const outcomes = { uploaded: '업로드 검증', skipped: '동일 파일 확인', legacy_verified: '과거 전송 완료', failed: '실패', pending: '진행 대기', unknown: '파일별 결과 미기록' };
   const statuses = { available: '보관 중', archived: '아카이브 보관', offloading: '로컬 비우기 중', missing: '파일 없음', moving: '이동 중', ready: '이동 대기', duplicate: '중복', review: '검토 필요', moved: '이동됨', deleted: '삭제됨', deleting: '삭제 중' };
-  return `${header('파일 기록', '카탈로그에 저장된 파일 해시와 아카이빙 검증 결과를 조회하세요.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
+  const summaryText = !summary ? '기록을 확인하고 있습니다.' : remote
+    ? `원격 보관 ${summary.remotePresent}개 (원격 전용 ${summary.remoteOnly}개) · 누락 ${summary.remoteMissing}개${summary.lastIndexedAt ? ` · 최근 전체 인덱싱 ${catalogTime(summary.lastIndexedAt)}` : ''}`
+    : `파일 기록 ${summary.files}개 · 고유 SHA-256 ${summary.hashes}개 · 아카이브 검증 ${summary.verified}건 · 원격 인덱스 ${summary.remotePresent}개 · 파일별 실패 ${summary.failed}건`;
+  const hasFilter = remote ? (view.catalogRemoteFolder || view.catalogQuery || view.catalogScope !== 'all')
+    : (view.catalogEvent !== 'all' || view.catalogQuery || view.catalogScope !== 'all');
+  return `${header('파일 기록', '카탈로그에 저장된 파일 해시, 아카이브 전송 이력과 원격 인덱스를 조회하세요.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
     <section class="surface" aria-label="파일 카탈로그">
       <div class="catalog-tabs" role="group" aria-label="기록 종류">
-        ${button('catalog-tab', '보유 파일', { extra: `data-value="files" aria-pressed="${!archives}"`, primary: !archives })}
+        ${button('catalog-tab', '보유 파일', { extra: `data-value="files" aria-pressed="${!archives && !remote}"`, primary: !archives && !remote })}
         ${button('catalog-tab', '아카이브 기록', { extra: `data-value="archives" aria-pressed="${archives}"`, primary: archives })}
+        ${button('catalog-tab', '원격 인덱스', { extra: `data-value="remote" aria-pressed="${remote}"`, primary: remote })}
       </div>
-      <p class="catalog-summary small muted">${summary ? `파일 기록 ${summary.files}개 · 고유 SHA-256 ${summary.hashes}개 · 아카이브 검증 ${summary.verified}건 · 파일별 실패 ${summary.failed}건` : '기록을 확인하고 있습니다.'}</p>
+      <p class="catalog-summary small muted">${summaryText}</p>
       <div class="catalog-layout">${catalogFolderTree()}<div class="catalog-content">
-      <div class="catalog-location" aria-label="현재 이벤트 폴더">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>
+      <div class="catalog-location" aria-label="${remote ? '현재 원격 폴더' : '현재 이벤트 폴더'}">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>
       <form id="catalog-search" class="catalog-tools">
         <label class="search">${icon('search')}<span class="sr-only">파일 기록 검색</span><input id="catalog-query" name="query" type="search" maxlength="300" placeholder="파일명·경로·SHA-256 검색" value="${escapeHtml(view.catalogQuery)}"></label>
         <select id="catalog-scope" name="scope" aria-label="파일 기록 필터">${options.map(([value, label]) => `<option value="${value}" ${view.catalogScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
         <button type="submit" class="button" ${view.catalogBusy ? 'disabled' : ''}>검색</button>
       </form>
-      <p class="catalog-note small muted">${archives ? '전송 시점의 SHA-256 검증 기록입니다. 과거 작업에 목적지 루트나 파일별 결과가 없으면 미기록으로 표시합니다.' : '보관 파일·XMP와 Incoming의 해시 기록을 표시합니다. 같은 해시의 파일도 경로별로 구분합니다.'}</p>
+      <p class="catalog-note small muted">${remote ? '원격 스토리지에 인덱싱된 파일 스냅샷입니다. Photo Saver 밖에서 미리 올려둔 기존 영상도 중복 차단과 다운로드에 사용됩니다.' : archives ? '전송 시점의 SHA-256 검증 기록입니다. 과거 작업에 목적지 루트나 파일별 결과가 없으면 미기록으로 표시합니다.' : '보관 파일·XMP와 Incoming의 해시 기록을 표시합니다. 같은 해시의 파일도 경로별로 구분합니다.'}</p>
       ${view.catalogError ? `<p class="archive-error form-error" role="alert">${escapeHtml(view.catalogError)}</p>` : ''}
       <div aria-busy="${view.catalogBusy}">
-      ${view.catalogBusy ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${archives ? '아카이브 기록' : '파일 해시 기록'}">
-        <thead><tr><th scope="col">파일 / 경로</th><th scope="col">SHA-256</th><th scope="col">${archives ? '아카이브 목적지' : '분류 / 크기'}</th><th scope="col">${archives ? '검증 결과 / 시각' : '파일 상태'}</th></tr></thead>
-        <tbody>${data.rows.map(row => `<tr>
+      ${view.catalogBusy ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
+        <thead><tr><th scope="col">${remote ? '원격 파일 / 경로' : '파일 / 경로'}</th><th scope="col">SHA-256</th><th scope="col">${remote ? '분류 / 크기' : archives ? '아카이브 목적지' : '분류 / 크기'}</th><th scope="col">${remote ? '인덱스 상태 / 검증 시각' : archives ? '검증 결과 / 시각' : '파일 상태'}</th></tr></thead>
+        <tbody>${data.rows.map(row => remote ? `<tr>
+          <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path mono">${escapeHtml(row.remote_path)}</div>
+            ${row.archive_root ? `<div class="small muted catalog-path mono">${escapeHtml(row.archive_root)}</div>` : ''}</td>
+          <td>${catalogHash(row)}</td>
+          <td><div>${row.in_catalog ? '카탈로그 연동됨' : '원격 전용'}</div><div class="small muted">${row.kind === 'xmp' ? 'XMP' : row.kind === 'video' ? '영상' : '사진'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div></td>
+          <td><span class="status ${row.status === 'present' ? 'archived' : 'review'}">${row.status === 'present' ? '보관 중' : '누락됨'}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.last_seen_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.remote_path)}" target="_blank" rel="noopener">다운로드</a>` : ''}</td>
+        </tr>` : `<tr>
           <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path">${escapeHtml((archives || row.location === 'managed' ? 'managed/' : 'incoming/') + row.local_path)}</div>
             ${row.original_path ? `<div class="small muted catalog-path">원본: incoming/${escapeHtml(row.original_path)}</div>` : ''}
             ${archives ? `<div class="small muted">작업 #${row.job_id} · ${row.kind === 'xmp' ? 'XMP' : '원본'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>` : ''}</td>
@@ -842,7 +935,7 @@ function catalogPage() {
             `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted">${escapeHtml(row.kind === 'xmp' ? 'XMP' : row.device || '장비 미확인')} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>`}</td>
           <td>${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.target)}" target="_blank" rel="noopener">다운로드</a>` : ''}${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
             `<span class="status ${row.status === 'available' ? 'ready' : row.status === 'archived' ? 'archived' : 'draft'}">${escapeHtml(statuses[row.status] || row.status)}</span>${row.location === 'managed' && row.status !== 'archived' ? `<div class="small muted">${row.confirmed ? '배치 확정' : '배치 미확정'}</div>` : ''}${row.has_archive ? '<div class="small muted">아카이브 검증 기록 있음</div>' : ''}${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.download_path)}" target="_blank" rel="noopener">아카이브 다운로드</a>` : ''}`}</td>
-        </tr>`).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : view.catalogEvent !== 'all' || view.catalogQuery || view.catalogScope !== 'all' ? '조건에 맞는 기록이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : 'Incoming Library에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
+        </tr>`).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : hasFilter ? '조건에 맞는 기록이 없습니다.' : remote ? '인덱싱된 원격 파일이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', remote ? '아카이브 전송 페이지에서 원격 스토리지에 연결한 뒤 원격 인덱싱을 실행하세요.' : archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : 'Incoming Library에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
       </div>
       ${data && !view.catalogBusy && !view.catalogError ? `<div class="catalog-pagination"><span class="small muted" role="status">${data.total}개 기록 · ${data.page} / ${data.pages}페이지</span><div>
         ${button('catalog-page', '이전', { extra: `data-value="${data.page - 1}"`, disabled: data.page <= 1 })}
@@ -857,7 +950,10 @@ async function loadCatalog() {
   view.catalogError = '';
   if (view.page === 'catalog') render();
   try {
-    const query = new URLSearchParams({ view: view.catalogTab, q: view.catalogQuery, scope: view.catalogScope, page: view.catalogPage, event: view.catalogEvent, device: view.catalogDevice });
+    const query = new URLSearchParams({
+      view: view.catalogTab, q: view.catalogQuery, scope: view.catalogScope, page: view.catalogPage,
+      event: view.catalogEvent, device: view.catalogDevice, folder: view.catalogRemoteFolder,
+    });
     const result = await api(`catalog?${query}`);
     if (request !== catalogRequest) return;
     view.catalog = result;
@@ -910,7 +1006,7 @@ function settingsPage() {
         `<span class="small muted">${settings ? settings.hostKeyTrusted ? '신뢰됨' : '미등록' : '확인 중'}</span>` +
         button('reset-host-key', '호스트 키 초기화', {
           danger: true,
-          disabled: !settings?.hostKeyTrusted || view.sshTestBusy || (jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind)),
+          disabled: !settings?.hostKeyTrusted || view.sshTestBusy || (jobActive() && ['upload', 'offload', 'remote-index', 'reset-all'].includes(state.job?.kind)),
         }))}
       ${settingRow('SSH 접속 테스트', view.sshTestResult ? `<span role="status" class="${view.sshTestResult.ok ? 'ssh-test-success' : 'form-error'}">${escapeHtml(view.sshTestResult.message)}</span>` :
         '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
@@ -1153,6 +1249,7 @@ function clearCatalogViews() {
   view.catalog = null; view.catalogBusy = false; view.catalogError = '';
   view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogQuery = '';
   view.catalogScope = 'all'; view.catalogPage = 1; view.catalogExpanded.clear();
+  view.catalogRemoteFolder = ''; view.catalogRemoteExpanded.clear();
   view.restoreFile = null;
   view.devices = []; view.devicesError = '';
   view.preview = null;
@@ -1727,6 +1824,11 @@ const actions = {
     state.job = await api(`archive/transfers/${state.job.id}/cancel`, 'POST');
     await syncState();
   },
+  'open-remote-index': openRemoteIndexDialog,
+  async 'cancel-remote-index'() {
+    state.job = await api(`archive/index/${state.job.id}/cancel`, 'POST');
+    await syncState();
+  },
   'catalog-folder'(value) {
     const folder = JSON.parse(value);
     view.catalogEvent = folder.event; view.catalogDevice = folder.device; view.catalogPage = 1;
@@ -1734,6 +1836,12 @@ const actions = {
     return loadCatalog();
   },
   'toggle-catalog-folder'(id) { if (view.catalogExpanded.has(id)) view.catalogExpanded.delete(id); else view.catalogExpanded.add(id); },
+  'catalog-remote-folder'(folder) {
+    view.catalogRemoteFolder = folder; view.catalogPage = 1;
+    if (folder && folder !== '__root__') view.catalogRemoteExpanded.add(folder.split('/')[0]);
+    return loadCatalog();
+  },
+  'toggle-remote-folder'(folder) { if (view.catalogRemoteExpanded.has(folder)) view.catalogRemoteExpanded.delete(folder); else view.catalogRemoteExpanded.add(folder); },
   'refresh-catalog': loadCatalog,
   'catalog-tab'(tab) { view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; return loadCatalog(); },
   'catalog-page'(value) { view.catalogPage = Math.max(1, Number(value)); return loadCatalog(); },

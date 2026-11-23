@@ -117,7 +117,7 @@ class CatalogResetTests(unittest.TestCase):
             self.assertIsNotNone(catalog.queue_job(db, 'scan', {}))
 
     def test_blocks_all_active_jobs_without_changing_data(self):
-        for kind in ('scan', 'move', 'delete', 'xmp-link', 'upload', 'offload', 'reset-all'):
+        for kind in ('scan', 'move', 'delete', 'xmp-link', 'upload', 'offload', 'remote-index', 'reset-all'):
             for status in ('queued', 'running'):
                 with self.subTest(kind=kind, status=status):
                     with catalog.database(write=True) as db:

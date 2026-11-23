@@ -44,7 +44,7 @@ RESTORE_COLUMNS = {
     "jobs": set(),
     "events": set(),
     "device_names": set(),
-    "storages": set(),
+    "storages": {"last_indexed_at"},
     "media": {"user_time_source", "original_path", "xmp_path", "xmp_sha", "xmp_metadata"},
     "scan_files": {"thumbnail", "companions"},
     "scan_xmp": set(),
@@ -344,8 +344,8 @@ def trust_and_test_host(request: HostKeyConfirmation):
 @router.delete("/ssh-host-key")
 def reset_host_key():
     with database() as db:
-        if db.execute("SELECT 1 FROM jobs WHERE kind IN ('upload','offload') AND status IN ('queued','running')").fetchone():
-            fail(409, "업로드 또는 로컬 비우기 작업이 끝난 뒤 호스트 키를 초기화하세요.")
+        if db.execute("SELECT 1 FROM jobs WHERE kind IN ('upload','offload','remote-index') AND status IN ('queued','running')").fetchone():
+            fail(409, "업로드·로컬 비우기·원격 인덱싱 작업이 끝난 뒤 호스트 키를 초기화하세요.")
     with settings_lock():
         address = read_setting(ADDRESS_FILE).strip()
         if not address:
