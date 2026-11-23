@@ -40,6 +40,7 @@ NO_STORE = {"Cache-Control": "no-store"}
 RESTORE_COLUMNS = {
     "jobs": set(),
     "events": set(),
+    "device_names": set(),
     "media": {"user_time_source", "original_path", "xmp_path", "xmp_sha", "xmp_metadata"},
     "scan_files": {"thumbnail", "companions"},
     "scan_xmp": set(),
@@ -342,7 +343,7 @@ def restore_columns(source, target):
               if sql and sql.upper().startswith("CREATE TABLE ")}
     columns = {}
     for table, optional in RESTORE_COLUMNS.items():
-        if table in {"scan_xmp", "archive_entries"} and table not in tables:
+        if table in {"scan_xmp", "archive_entries", "device_names"} and table not in tables:
             continue
         available = {row[1] for row in source.execute(f"PRAGMA table_info({table})")}
         expected = [row["name"] for row in target.execute(f"PRAGMA table_info({table})")]

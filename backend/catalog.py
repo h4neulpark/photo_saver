@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS event_folder_per_parent
     ON events (coalesce(parent_id, ''), folder_key);
+CREATE TABLE IF NOT EXISTS device_names (
+    source TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS media (
     id TEXT PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,

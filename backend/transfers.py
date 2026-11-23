@@ -17,6 +17,8 @@ from catalog import database, now, queue_job
 from media import fingerprint, inspect, regular_file
 from settings import fail
 
+from devices import device_names, effective_device
+
 CHUNK = 1024 * 1024
 
 
@@ -45,6 +47,7 @@ def queue_transfer(db, request, device_folder):
     if request.connection != config_identity(config):
         fail(409, "Destination의 연결 설정이 변경되었습니다. 아카이브에 다시 연결하고 업로드하세요.")
     events = {row["id"]: row for row in db.execute("SELECT * FROM events")}
+    names = device_names(db)
     seen, targets, files = set(), set(), []
     for selection in request.items:
         key = (selection.id, selection.kind)
@@ -55,7 +58,7 @@ def queue_transfer(db, request, device_folder):
         if not row or row["status"] != "available" or not row["confirmed"] or row["event_id"] not in events:
             fail(409, "확정된 파일만 업로드할 수 있습니다. 파일 목록을 새로 고침하세요.")
         event = events[row["event_id"]]
-        folders = ([events[event["parent_id"]]["folder"]] if event["parent_id"] else []) + [event["folder"], device_folder(row["user_device"] or row["device"])]
+        folders = ([events[event["parent_id"]]["folder"]] if event["parent_id"] else []) + [event["folder"], device_folder(effective_device(row, names))]
         local = row["xmp_path"] if selection.kind == "xmp" else row["path"]
         sha = row["xmp_sha"] if selection.kind == "xmp" else row["sha"]
         if not local or not sha:

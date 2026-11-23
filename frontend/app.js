@@ -70,7 +70,7 @@ const view = {
   incomingLayout: savedIncomingLayout(), preview: null,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
-  settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
+  devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '',
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
@@ -777,7 +777,7 @@ function visibleSetting(value) {
 function settingsPage() {
   const settings = view.settings;
   const keyCopied = settings?.keyCopied || view.keyCopiedLocally;
-  return `${header('설정', '스토리지 연결 정보와 카탈로그 백업을 관리하세요.', '')}
+  return `${header('설정', '촬영도구 이름, 스토리지 연결과 카탈로그 백업을 관리하세요.', '')}
     ${view.settingsError ? `<p class="scan-strip" role="alert">${escapeHtml(view.settingsError)}</p>` : ''}
     <section class="surface settings-section" aria-label="스토리지 연결">
       <div class="surface-head"><h2>${icon('disk')} 스토리지 연결</h2></div>
@@ -798,6 +798,20 @@ function settingsPage() {
         '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
         button('test-storage-ssh', view.sshTestBusy ? '테스트 중…' : '접속 테스트', { glyph: 'refresh', disabled: !settings || view.sshTestBusy }))}
     </section>
+    <section class="surface settings-section device-names" aria-label="촬영도구 이름">
+      <div class="surface-head"><h2>${icon('aperture')} 촬영도구 이름</h2></div>
+      <p class="device-names-help small muted">기존 파일과 앞으로 들어오는 같은 촬영도구의 파일에 적용합니다. 파일별로 직접 지정한 이름은 유지하며, 기존 원격 폴더는 바꾸지 않습니다.</p>
+      ${view.devicesError ? `<p class="form-error device-names-help" role="alert">${escapeHtml(view.devicesError)}</p>${button('refresh-devices', '목록 다시 불러오기')}` : ''}
+      ${view.devices === null ? '<p class="device-names-help small muted" role="status">촬영도구 목록을 불러오는 중입니다.</p>' :
+        !view.devices.length ? '<p class="device-names-help small muted">감지된 촬영도구가 없습니다. 파일을 managed로 이동하고 검사하면 여기에 표시됩니다.</p>' :
+        view.devices.map((device, index) => `<form class="setting-row device-name-form" data-source="${escapeHtml(device.source)}">
+          <div class="device-name-origin"><label for="device-name-${index}">${escapeHtml(device.source)}</label>
+            <p class="small muted">기존 파일 ${device.count}개와 이후 파일에 적용</p></div>
+          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && state.job?.kind === 'upload' ? 'disabled' : ''}>
+            <button type="submit" class="button" ${jobActive() && state.job?.kind === 'upload' ? 'disabled' : ''}>이름 저장</button></div>
+          <p class="form-error device-name-error" role="alert" hidden></p>
+        </form>`).join('')}
+    </section>
     <section class="surface settings-section" aria-label="DB 백업 및 복원">
       <div class="surface-head"><h2>${icon('file')} DB 백업 및 복원</h2></div>
       ${settingRow('카탈로그 백업', '이벤트와 파일 배치가 포함된 SQLite 백업을 다운로드합니다.',
@@ -810,6 +824,7 @@ function settingsPage() {
 }
 
 async function loadSettings() {
+  await loadDevices();
   try {
     view.settings = await api('settings');
     view.settingsError = '';
@@ -822,6 +837,42 @@ async function loadSettings() {
     view.settingsError = error.message;
   }
 }
+
+async function loadDevices() {
+  try {
+    view.devices = (await api('devices')).devices;
+    view.devicesError = '';
+  } catch (error) {
+    view.devices = [];
+    view.devicesError = error.message;
+  }
+}
+
+page.addEventListener('submit', async event => {
+  const form = event.target;
+  if (!form.matches('.device-name-form')) return;
+  event.preventDefault();
+  const submit = form.querySelector('[type="submit"]');
+  const errorMessage = form.querySelector('.device-name-error');
+  errorMessage.hidden = true;
+  submit.disabled = true;
+  submit.textContent = '저장 중…';
+  try {
+    view.devices = (await api('devices/name', 'PUT', {
+      source: form.dataset.source, name: new FormData(form).get('name'),
+    })).devices;
+    view.eventDevice = ''; view.catalogDevice = ''; view.catalogPage = 1;
+    view.sourcePath = []; view.sourceSelection.clear();
+    await syncState();
+    announce('촬영도구 이름을 저장했습니다. 이후 파일에도 같은 이름을 적용합니다.');
+    render();
+  } catch (error) {
+    errorMessage.textContent = error.message;
+    errorMessage.hidden = false;
+    submit.disabled = false;
+    submit.textContent = '이름 저장';
+  }
+});
 
 function editStorageAddress() {
   showDialog('스토리지 IP 주소', `<label>새 IP 주소
@@ -1395,6 +1446,7 @@ const actions = {
   'delete-incoming': confirmDeleteIncoming,
   'link-xmp'() { return submitJob('xmp-link', { links: pendingXmpLinks() }); },
   'view-xmp': showXmp,
+  'refresh-devices': loadDevices,
   'edit-storage-address': editStorageAddress,
   'edit-storage-root': editStorageRoot,
   'generate-storage-key': generateStorageKey,

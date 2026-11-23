@@ -8,10 +8,11 @@ from fastapi.responses import JSONResponse
 
 from catalog import database
 from settings import NO_STORE
+from devices import device_sql
 
 router = APIRouter(prefix='/api/catalog')
 VERIFIED = "('uploaded','skipped','legacy_verified')"
-CTE = """
+CTE = f"""
 WITH archive_history AS (
     SELECT 'archive:'||a.job_id||':'||a.item_index AS record_key,a.media_id AS file_id,
            a.asset_kind AS kind,a.local_path,a.sha,a.size,a.storage_id,a.archive_root,
@@ -26,18 +27,18 @@ WITH archive_history AS (
                 WHEN j.status IN ('queued','running') THEN 'pending' ELSE 'unknown' END,
            CASE WHEN j.status='done' THEN j.finished_at END,coalesce(j.finished_at,j.created_at),
            NULL,j.id,j.status
-    FROM jobs j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{}' END,'$.files') f
+    FROM jobs j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{{}}' END,'$.files') f
     WHERE j.kind='upload' AND NOT EXISTS (
         SELECT 1 FROM archive_entries a WHERE a.job_id=j.id AND a.item_index=CAST(f.key AS INTEGER))
 ), files AS (
     SELECT 'managed:'||m.id AS record_key,m.id AS file_id,m.kind,'media' AS asset_kind,
            m.name,m.path AS local_path,m.original_path,m.sha,m.size,'managed' AS location,
-           m.status,m.confirmed,coalesce(m.user_device,m.device,'') AS device,
+           m.status,m.confirmed,{device_sql()} AS device,
            CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END AS event_name,m.event_id,e.parent_id AS parent_id
     FROM media m LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
     UNION ALL
     SELECT 'xmp:'||m.id,m.id,'xmp','xmp',NULL,m.xmp_path,NULL,m.xmp_sha,NULL,
-           'managed',m.status,m.confirmed,coalesce(m.user_device,m.device,''),
+           'managed',m.status,m.confirmed,{device_sql()},
            CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END,m.event_id,e.parent_id
     FROM media m LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
     WHERE m.xmp_path IS NOT NULL AND m.xmp_sha IS NOT NULL
@@ -48,7 +49,7 @@ WITH archive_history AS (
     FROM scan_files s WHERE s.sha IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM media m WHERE m.id=s.id AND m.sha=s.sha)
 ), archive_files AS (
-    SELECT a.*,m.event_id,e.parent_id,coalesce(m.user_device,m.device,'') AS device,
+    SELECT a.*,m.event_id,e.parent_id,{device_sql()} AS device,
            CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END AS event_name
     FROM archive_history a LEFT JOIN media m ON m.id=a.file_id
     LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id

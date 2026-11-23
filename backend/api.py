@@ -21,6 +21,7 @@ from settings import router as settings_router
 from archive import router as archive_router
 from transfers import TransferRequest, queue_transfer
 from records import router as records_router
+from devices import router as devices_router, device_names, effective_device, device_sql, device_folder
 
 
 @asynccontextmanager
@@ -34,6 +35,7 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(settings_router)
 app.include_router(archive_router)
 app.include_router(records_router)
+app.include_router(devices_router)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
 MEDIA_TYPES = {
@@ -92,10 +94,6 @@ def clean_component(value):
     if name in {"", ".", ".."} or unsafe_component.search(name):
         error(400, "폴더명에 사용할 수 있는 이름을 입력하세요.")
     return unicodedata.normalize("NFC", name)
-
-
-def device_folder(name):
-    return unsafe_component.sub("_", name).strip(" .") if name else ""
 
 
 def zone_for(name):
@@ -165,8 +163,8 @@ def capture_for_event(row, metadata, xmp):
     return row["capture_time"], row["time_source"], bool(row["time_verified"]), None
 
 
-def view_media(row, periods):
-    device = row["user_device"] or row["device"]
+def view_media(row, periods, names=None):
+    device = effective_device(row, names or {})
     metadata = json.loads(row["metadata"])
     xmp = json.loads(row["xmp_metadata"] or "{}")
     stamp, source, verified, review_reason = capture_for_event(row, metadata, xmp)
@@ -306,7 +304,8 @@ def state():
         ).fetchall()
         available = {row["id"]: row for row in managed}
         pending = db.execute("SELECT * FROM scan_xmp WHERE scan_id=? AND status<>'linked' ORDER BY id", (scan["id"],)).fetchall() if scan else []
-        media = [view_media(row, periods) for row in managed]
+        names = device_names(db)
+        media = [view_media(row, periods, names) for row in managed]
         media.sort(key=lambda item: (item["time"] or "", item["name"]))
         return {
             "timezone": DEFAULT_ZONE,
@@ -474,7 +473,7 @@ def check_event_device_folder(db, parent_id, folder):
     if parent_id is None:
         return
     devices = db.execute(
-        """SELECT DISTINCT coalesce(user_device,device) FROM media
+        f"""SELECT DISTINCT {device_sql()} FROM media m
            WHERE event_id=? AND confirmed=1 AND status='available'""", (parent_id,)
     )
     if any(path_key(device_folder(row[0])) == path_key(folder) for row in devices):
@@ -605,10 +604,11 @@ def edit_media(request: MediaEdit):
 def confirm_placements(selection: Selection):
     with database(write=True) as db:
         rows = get_selection(db, selection.ids)
+        names = device_names(db)
         for row in rows:
             if not row["event_id"]:
                 error(400, "미배정 파일을 이벤트에 넣은 뒤 확정하세요.")
-            folder = device_folder(row["user_device"] or row["device"])
+            folder = device_folder(effective_device(row, names))
             if not folder:
                 error(400, "촬영 장비를 지정하거나 unknown으로 분류한 뒤 확정하세요.")
             event = get_event(db, row["event_id"])
