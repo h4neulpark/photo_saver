@@ -57,7 +57,7 @@ SSH 설정·접속 테스트와 Destination 폴더 조회는 **API 프로세스*
 
 ## 작업과 DB 동시성
 
-지원 작업은 `scan`, `move`, `delete`, `xmp-link`, `upload`다. `jobs`의 부분 유일 인덱스 `one_active_job`과 등록 함수가 전체 작업 중 `queued` 또는 `running`인 작업을 **하나만** 허용한다. 워커는 하나의 루프에서 작업을 순차 실행하며, 작업이 없으면 0.4초 간격으로 확인한다.
+지원 작업은 `scan`, `move`, `delete`, `xmp-link`, `upload`, `reset-all`다. `jobs`의 부분 유일 인덱스 `one_active_job`과 등록 함수가 전체 작업 중 `queued` 또는 `running`인 작업을 **하나만** 허용한다. 워커는 하나의 루프에서 작업을 순차 실행하며, 작업이 없으면 0.4초 간격으로 확인한다.
 
 워커 프로세스는 `/data/worker.lock`에 비차단 배타 잠금을 건다. 재시작 시 `running` 작업을 `queued`로 돌리고 해당 처리기를 다시 실행한다. 파일별 처리 결과와 실제 로컬·원격 파일 상태를 다시 확인하는 방식이며 작업 임대, 자동 네트워크 재시도, 병렬 분석·전송은 구현하지 않았다.
 
@@ -69,6 +69,7 @@ SQLite는 WAL, 외래 키 검사, 10초 연결 대기 시간을 사용한다. �
 | --- | --- |
 | [api.py](../backend/api.py) | 앱 수명주기, 화면 상태, Incoming 미리보기, 이벤트·배치·사용자 보정, 작업 등록·취소 |
 | [devices.py](../backend/devices.py) | 원래 장비명별 이름 규칙, 공통 이름 결정, 조회·변경·충돌 검사 |
+| [resets.py](../backend/resets.py) | incoming·SSH를 보존한 managed·캐시·임시 데이터·카탈로그 삭제, 중단 후 삭제 재개 |
 | [catalog.py](../backend/catalog.py) | DB 스키마·초기화·부분 마이그레이션·트랜잭션·작업 등록 |
 | [worker.py](../backend/worker.py) | 라이브러리 검증, 검사·이동·삭제·XMP 처리, 단일 작업 루프 |
 | [media.py](../backend/media.py) | 안전한 파일 접근·해시·이동, 사진·영상 분석, 썸네일 |

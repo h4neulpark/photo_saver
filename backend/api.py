@@ -11,6 +11,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -36,6 +37,20 @@ app.include_router(settings_router)
 app.include_router(archive_router)
 app.include_router(records_router)
 app.include_router(devices_router)
+
+
+def reset_in_progress():
+    with database() as db:
+        return db.execute("SELECT 1 FROM jobs WHERE kind='reset-all' AND status IN ('queued','running')").fetchone() is not None
+
+
+@app.middleware("http")
+async def guard_reset(request, call_next):
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and await run_in_threadpool(reset_in_progress):
+        return JSONResponse({"detail": "데이터 초기화 중입니다. 완료 후 다시 시도하세요."}, status_code=409)
+    return await call_next(request)
+
+
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
 MEDIA_TYPES = {
@@ -69,6 +84,7 @@ class MediaEdit(Selection):
     device: str | None = Field(default=None, max_length=80)
     captured_at: datetime | None = None
     time_mode: Literal["metadata", "modified", "xmp"] | None = None
+    skip_missing_xmp: bool = False
     zone: str = DEFAULT_ZONE
 
 
@@ -565,6 +581,8 @@ def edit_media(request: MediaEdit):
     device = clean_component(request.device) if request.device is not None else None
     if request.time_mode and request.captured_at is not None:
         error(400, "촬영 시각 출처를 하나만 선택하세요.")
+    if request.skip_missing_xmp and request.time_mode != "xmp":
+        error(400, "XMP 시각 적용에서만 시각 없는 파일을 제외할 수 있습니다.")
     captured = request.captured_at
     if captured and captured.tzinfo is None:
         captured = captured.replace(tzinfo=zone_for(request.zone))
@@ -575,29 +593,37 @@ def edit_media(request: MediaEdit):
         rows = get_selection(db, request.ids)
         selected_zone = zone_for(request.zone) if request.time_mode in {"metadata", "xmp"} else None
         updates = []
+        time_updated, time_skipped = 0, 0
         for row in rows:
             if request.time_mode == "modified":
                 stamp = modified_time_from_fingerprint(row["fingerprint"])
             elif request.time_mode in {"metadata", "xmp"}:
                 candidate = metadata_time(row, json.loads(row["metadata"])) if request.time_mode == "metadata" else xmp_time(json.loads(row["xmp_metadata"] or "{}"))
-                if not candidate:
+                if not candidate and request.time_mode == "xmp" and request.skip_missing_xmp:
+                    stamp = None
+                    time_skipped += 1
+                elif not candidate:
                     error(400, "선택한 파일 중 사용할 수 있는 메타데이터 시각이 없는 파일이 있습니다.")
-                stamp = candidate["time"] if candidate["verified"] else capture_time(
-                    candidate["raw"], assumed_zone=selected_zone.key,
-                )[0]
-                if not stamp:
-                    error(400, "선택한 파일의 메타데이터 시각을 해석할 수 없습니다.")
+                else:
+                    stamp = candidate["time"] if candidate["verified"] else capture_time(
+                        candidate["raw"], assumed_zone=selected_zone.key,
+                    )[0]
+                    if not stamp:
+                        error(400, "선택한 파일의 메타데이터 시각을 해석할 수 없습니다.")
             else:
                 stamp = user_time
             source = (request.time_mode or "manual") if stamp else None
+            time_updated += bool(stamp)
             updates.append((device, stamp, source, device, row["id"]))
+        if request.time_mode == "xmp" and request.skip_missing_xmp and not time_updated:
+            error(400, "선택한 파일에 적용할 수 있는 XMP 촬영 시각이 없습니다.")
         db.executemany(
             """UPDATE media SET user_device=coalesce(?,user_device), user_time=coalesce(?,user_time),
                user_time_source=coalesce(?,user_time_source),
                confirmed=CASE WHEN ? IS NULL THEN confirmed ELSE 0 END WHERE id=?""",
             updates,
         )
-        return {"count": len(rows)}
+        return {"count": len(rows), "timeUpdated": time_updated, "timeSkipped": time_skipped}
 
 
 @app.post("/api/placements/confirm")

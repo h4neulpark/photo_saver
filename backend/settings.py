@@ -13,6 +13,7 @@ import time
 from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
@@ -21,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from catalog import DATA, DEFAULT_ZONE, catalog_lock, now, open_db
+from catalog import DATA, DEFAULT_ZONE, catalog_lock, now, open_db, queue_job, database
 
 router = APIRouter(prefix="/api/settings")
 SETTINGS_DIR = Path("/settings")
@@ -64,6 +65,10 @@ class StorageRoot(BaseModel):
 
 class HostKeyConfirmation(BaseModel):
     token: str
+
+
+class CatalogReset(BaseModel):
+    confirmation: Literal["모든 데이터 삭제"]
 
 
 def fail(status, message):
@@ -317,6 +322,15 @@ def trust_and_test_host(request: HostKeyConfirmation):
 def ensure_catalog_idle(connection):
     if connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
         fail(409, "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요.")
+
+
+@router.post("/catalog/reset", status_code=202)
+def reset_catalog(request: CatalogReset):
+    with database(write=True) as connection:
+        ensure_catalog_idle(connection)
+        job_id = queue_job(connection, "reset-all", {})
+    return JSONResponse({"id": job_id, "kind": "reset-all", "status": "queued"},
+                        status_code=202, headers=NO_STORE)
 
 
 @router.get("/catalog/backup")

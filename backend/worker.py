@@ -15,6 +15,7 @@ from media import (
     preview_thumbnail, relative_parts, scan_tree, thumbnail_path,
 )
 from transfers import upload_selection
+from resets import reset_local_data
 
 log = logging.getLogger(__name__)
 ROOT = Path(os.environ.get("PHOTO_SAVER_LIBRARY", "/library")).resolve()
@@ -504,7 +505,7 @@ def run():
             db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
 
         log.info("수집 워커 시작 · %s → %s", incoming, managed)
-        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection, "upload": upload_selection}
+        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection, "upload": upload_selection, "reset-all": reset_local_data}
         while True:
             with database(write=True) as db:
                 job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()

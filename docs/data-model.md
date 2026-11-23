@@ -24,7 +24,7 @@ erDiagram
 | 필드 | 내용 |
 | --- | --- |
 | `id` | 정수 기본 키 |
-| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload` |
+| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `reset-all` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
@@ -120,3 +120,9 @@ erDiagram
 앱은 시작 시 테이블·인덱스를 생성하고 과거 카탈로그에 `scan_files.thumbnail`, `scan_files.companions`, `media.user_time_source`, 원래 경로·XMP 관련 필드가 없으면 추가한다. 별도 마이그레이션 도구나 스키마 버전 테이블은 없다.
 
 백업·복원은 [settings.py](../backend/settings.py)의 SQLite Backup API와 테이블 복사 로직을 사용한다. 복원 시 스키마·JSON·외래 키 무결성을 확인하고, 오래된 백업의 일부 누락 열과 `scan_xmp`·`archive_entries` 테이블 부재를 허용한다. 현재 활성 작업이 있으면 백업·복원을 거부한다. 복원된 활성 작업은 실패로 종료하고 `moving` 원본은 `missing`, `deleting` 검사 파일은 `review`로 전환한다.
+
+## 사용자 데이터 초기화
+
+`POST /api/settings/catalog/reset`은 `모든 데이터 삭제` 확인 문구로 `reset-all` 작업 하나를 등록한다. 다른 활성 작업이 있으면 거부한다. 워커는 managed·썸네일과 카탈로그 볼륨의 임시 파일을 비운 뒤 `clear_catalog()`로 7개 테이블의 모든 행을 한 트랜잭션에서 삭제한다. 이번 작업의 행도 삭제하므로 성공 후 작업 이력은 0개다. 파일 이동 계획이나 별도 완료 기록은 남기지 않는다.
+
+SQLite 본체·WAL·SHM·카탈로그 및 워커 잠금 파일은 실행을 위해 유지한다. 사용자 레코드는 모두 비워진다. incoming 디렉터리와 그 내용, SSH 설정 볼륨·원격 아카이브는 유지한다. 파일 삭제는 트랜잭션 롤백 대상이 아니며 실패 시 이미 삭제한 파일은 복원되지 않는다. 실패 이력은 재실행을 위해 남고, 다음 성공 시 함께 지워진다. 중단된 running 작업은 재시작 때 다시 실행해 남은 파일을 삭제한다.

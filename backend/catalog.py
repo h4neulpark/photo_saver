@@ -10,6 +10,7 @@ DATA = Path(os.environ.get("PHOTO_SAVER_DATA", "/data"))
 THUMBNAILS = Path(os.environ.get("PHOTO_SAVER_THUMBNAILS", "/thumbnails"))
 DEFAULT_ZONE = os.environ.get("PHOTO_SAVER_TIMEZONE", "Asia/Seoul")
 PHOTOS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+CATALOG_TABLES = ("jobs", "events", "device_names", "media", "scan_files", "scan_xmp", "archive_entries")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -111,6 +112,14 @@ CREATE INDEX IF NOT EXISTS archive_by_hash ON archive_entries (sha, outcome);
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def clear_catalog(connection):
+    deleted = {}
+    for table in reversed(CATALOG_TABLES):
+        cursor = connection.execute(f"DELETE FROM {table}")
+        deleted[table] = cursor.rowcount
+    return deleted
 
 
 def open_db():

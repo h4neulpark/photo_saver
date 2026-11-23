@@ -80,6 +80,7 @@ const view = {
 let refreshTimer;
 let stateRequest = 0;
 let catalogRequest = 0;
+let devicesRequest = 0;
 
 const page = document.getElementById('page');
 const nav = document.getElementById('navigation');
@@ -132,7 +133,10 @@ async function syncState() {
     if (request !== stateRequest) return;
     Object.assign(state, snapshot);
     view.loadError = '';
-    if (jobActive(previousJob) && state.job?.id === previousJob.id && !jobActive()) {
+    if (previousJob?.kind === 'reset-all' && jobActive(previousJob) && !state.job) {
+      clearCatalogViews();
+      announce('incoming과 SSH 연결 설정을 보존하고 managed·캐시·카탈로그를 초기화했습니다.');
+    } else if (jobActive(previousJob) && state.job?.id === previousJob.id && !jobActive()) {
       announce(jobMessage(state.job));
       if (state.job.kind === 'upload' && view.archive && view.page === 'archive') await browseArchive(view.archivePath);
       if (view.page === 'catalog') await loadCatalog();
@@ -342,7 +346,7 @@ function incomingPage() {
   const active = jobActive();
   const failed = state.job?.status === 'failed';
   const scanning = active && state.job.kind === 'scan';
-  const jobLabels = { scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중', 'xmp-link': 'XMP 연결 중' };
+  const jobLabels = { scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중', 'xmp-link': 'XMP 연결 중', 'reset-all': '서버 데이터 초기화 중' };
   const status = active ? jobLabels[state.job.kind] :
     failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
   const detail = failed ? state.job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
@@ -423,7 +427,7 @@ function eventDateForFile(file) {
 
 function filteredEventFiles(files) {
   const query = view.eventQuery.trim().toLocaleLowerCase();
-  return files.filter(file => (!view.eventDevice || file.device === view.eventDevice) &&
+  return files.filter(file => (!view.eventDevice || (view.eventDevice === 'missing' ? !file.device : `device:${file.device}` === view.eventDevice)) &&
     (!view.eventDate || eventDateForFile(file) === view.eventDate) &&
     (!query || file.name.toLocaleLowerCase().includes(query) || file.device?.toLocaleLowerCase().includes(query) || matchesXmp(file, query)));
 }
@@ -432,6 +436,7 @@ function eventPage() {
   const event = eventById(view.eventId);
   const files = footageForEvent(view.eventId);
   const filtered = filteredEventFiles(files);
+  const filtersActive = view.eventDevice || view.eventDate || view.eventQuery.trim();
   const dates = [...new Set(files.map(eventDateForFile).filter(Boolean))].sort();
   const parent = event?.parent ? eventById(event.parent) : event;
   const footageDate = dateTimeFormatter(parent?.zone || state.timezone);
@@ -459,7 +464,7 @@ function eventPage() {
       <section class="surface" aria-label="이벤트 푸티지">
         <div class="surface-head event-heading">
           <div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 푸티지')}</h2>
-            <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${files.length}개 파일</div>
+            <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div>
           </div>
           ${event ? `<div class="event-header-actions">
             ${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}
@@ -469,8 +474,9 @@ function eventPage() {
         </div>
         <div class="event-tools">
           <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색" value="${escapeHtml(view.eventQuery)}"></label>
-          <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>${devices.map(device =>
-            `<option value="${escapeHtml(device)}" ${view.eventDevice === device ? 'selected' : ''}>${escapeHtml(device)}</option>`).join('')}</select>
+          <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>
+            <option value="missing" ${view.eventDevice === 'missing' ? 'selected' : ''}>장비 확인 필요</option>${devices.map(device =>
+            `<option value="device:${escapeHtml(device)}" ${view.eventDevice === `device:${device}` ? 'selected' : ''}>${escapeHtml(device)}</option>`).join('')}</select>
           <select id="event-date" aria-label="촬영일 필터"><option value="">모든 촬영일</option>${dates.map(date =>
             `<option ${view.eventDate === date ? 'selected' : ''}>${date}</option>`).join('')}</select>
           ${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}
@@ -489,7 +495,7 @@ function eventPage() {
             <td>${file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
               badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정')}</td>
           </tr>`).join('')}</tbody>
-        </table>` : emptyState('video', '표시할 푸티지가 없습니다.', event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
+        </table>` : emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
         <div class="action-bar">
           <div>
             ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트"><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>
@@ -807,8 +813,8 @@ function settingsPage() {
         view.devices.map((device, index) => `<form class="setting-row device-name-form" data-source="${escapeHtml(device.source)}">
           <div class="device-name-origin"><label for="device-name-${index}">${escapeHtml(device.source)}</label>
             <p class="small muted">기존 파일 ${device.count}개와 이후 파일에 적용</p></div>
-          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && state.job?.kind === 'upload' ? 'disabled' : ''}>
-            <button type="submit" class="button" ${jobActive() && state.job?.kind === 'upload' ? 'disabled' : ''}>이름 저장</button></div>
+          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && ['upload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>
+            <button type="submit" class="button" ${jobActive() && ['upload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>이름 저장</button></div>
           <p class="form-error device-name-error" role="alert" hidden></p>
         </form>`).join('')}
     </section>
@@ -820,6 +826,12 @@ function settingsPage() {
         `<input id="restore-catalog-file" type="file" accept=".sqlite3,.sqlite,.db,application/octet-stream" hidden>` +
         (view.restoreFile ? maskedSetting('파일 선택됨') : '') + button('pick-catalog-file', '백업 파일 선택') +
         button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || jobActive() }))}
+    </section>
+    <section class="surface settings-section" aria-label="데이터 초기화">
+      <div class="surface-head"><h2>${icon('trash')} 데이터 초기화</h2></div>
+      ${settingRow('managed 및 기록 초기화', 'managed 원본과 부가 파일, 썸네일, 카탈로그·작업 기록을 영구 삭제합니다. incoming과 SSH 연결 설정은 유지합니다.',
+        button('reset-catalog', '데이터 초기화', { danger: true, disabled: jobActive() }))}
+      ${resetStatus()}
     </section>`;
 }
 
@@ -839,10 +851,14 @@ async function loadSettings() {
 }
 
 async function loadDevices() {
+  const request = ++devicesRequest;
   try {
-    view.devices = (await api('devices')).devices;
+    const result = await api('devices');
+    if (request !== devicesRequest) return;
+    view.devices = result.devices;
     view.devicesError = '';
   } catch (error) {
+    if (request !== devicesRequest) return;
     view.devices = [];
     view.devicesError = error.message;
   }
@@ -987,6 +1003,57 @@ function confirmCatalogRestore() {
   }, { danger: true });
 }
 
+function resetStatus() {
+  const job = state.job;
+  if (job?.kind !== 'reset-all') return '';
+  const result = job.result || {};
+  const detail = job.status === 'failed' ? result.error :
+    `${result.phase || '초기화 대기 중'} · 파일 ${result.deletedFiles || 0}개 삭제`;
+  return `<p class="device-names-help ${job.status === 'failed' ? 'form-error' : 'small muted'}" role="${job.status === 'failed' ? 'alert' : 'status'}">${escapeHtml(detail)}</p>`;
+}
+
+function clearCatalogViews() {
+  view.incomingLayout = 'table';
+  try { localStorage.removeItem('photo-saver-incoming-layout'); } catch { /* Storage may be unavailable. */ }
+  view.archive = null; view.archivePath = ''; view.archiveError = ''; view.catalogTab = 'files';
+  ++catalogRequest;
+  ++devicesRequest;
+  view.incomingSelection.clear();
+  view.incomingFilter = 'all'; view.incomingKind = ''; view.query = '';
+  view.xmpChoices.clear();
+  chooseEvent('unassigned');
+  view.sourcePath = []; view.sourceSelection.clear();
+  clearArchiveDrag();
+  view.catalog = null; view.catalogBusy = false; view.catalogError = '';
+  view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogQuery = '';
+  view.catalogScope = 'all'; view.catalogPage = 1; view.catalogExpanded.clear();
+  view.restoreFile = null;
+  view.devices = []; view.devicesError = '';
+  view.preview = null;
+  if (mediaPreview.open) mediaPreview.close();
+}
+
+function confirmCatalogReset() {
+  showDialog('데이터 초기화', `<p><strong>아래 데이터를 영구 삭제합니다.</strong></p>
+    <ul><li>managed 전체: 사진·영상 원본과 부가 파일</li>
+      <li>썸네일, 서버 임시 데이터, 파일·이벤트·전송·작업 기록</li>
+      <li>장비·촬영 시각 보정과 촬영도구 이름 규칙</li></ul>
+    <p><strong>incoming 디렉터리와 그 안의 모든 파일·하위 폴더는 유지합니다.</strong> SSH 연결 설정·키와 원격 아카이브도 유지합니다.</p>
+    <p><strong>삭제한 파일은 복구할 수 없습니다.</strong> DB 백업에는 원본 파일이 포함되지 않습니다.</p>
+    <label><span>확인 문구 <strong>모든 데이터 삭제</strong>를 입력하세요.</span>
+      <input name="confirmation" required autocomplete="off" spellcheck="false"></label>`,
+  '모든 데이터 삭제', async form => {
+    const result = await api('settings/catalog/reset', 'POST', { confirmation: form.get('confirmation') });
+    state.job = { id: result.id, kind: 'reset-all', status: 'queued', result: {} };
+    await syncState();
+    if (jobActive()) announce('서버 데이터 초기화를 시작했습니다. 설정에서 진행 상황을 확인할 수 있습니다.');
+  }, { danger: true });
+  const confirmation = dialog.querySelector('[name="confirmation"]');
+  const submit = dialog.querySelector('[type="submit"]');
+  submit.disabled = true;
+  confirmation.addEventListener('input', () => { submit.disabled = confirmation.value !== '모든 데이터 삭제'; });
+}
+
 function showDialog(title, content, submitLabel, handler, { danger = false } = {}) {
   dialog.innerHTML = `<form id="dialog-form">
     <div class="dialog-head"><h2 id="dialog-title">${title}</h2>${smallButton('close-dialog', '닫기', 'close')}</div>
@@ -1083,70 +1150,108 @@ function editMedia(ids = [...view.eventSelection], suggestSource = false) {
   const selectedIds = new Set(ids);
   const files = state.managed.filter(file => selectedIds.has(file.id));
   if (!files.length) return;
+  const devices = [...new Set(state.managed.map(file => file.device).filter(Boolean))].sort((a, b) => a.localeCompare(b));
   const hasMetadata = files.every(file => file.timeCandidates?.metadata);
-  const hasXmp = files.every(file => file.timeCandidates?.xmp);
+  const xmpFiles = files.filter(file => file.timeCandidates?.xmp);
+  const hasXmp = xmpFiles.length > 0;
   const hasModified = files.every(file => file.timeCandidates?.modified);
   const metadataLabel = files.every(file => file.kind === 'photo') ? 'EXIF 시각 사용' : '메타데이터 시각 사용';
-  const mode = suggestSource && hasXmp ? 'xmp' : suggestSource && hasMetadata ? 'metadata' : suggestSource && hasModified ? 'modified' : 'manual';
+  const mode = suggestSource && hasXmp ? 'xmp' : suggestSource && hasMetadata ? 'metadata' : suggestSource && hasModified ? 'modified' : suggestSource ? 'manual' : 'keep';
   const event = eventById(view.eventId);
   const root = event?.parent ? eventById(event.parent) : event;
   const defaultZone = root?.zone || state.timezone;
   showDialog('장비·촬영 시각 수정', `
-    <label>촬영 장비<input name="device" maxlength="80" placeholder="예시 · GoPro 또는 unknown"></label>
+    <p class="small muted">선택한 파일 ${files.length}개에 적용합니다.</p>
+    <label>촬영 장비<select id="media-device" name="device_choice">
+      <option value="">변경하지 않음</option>${devices.map(device => `<option value="device:${escapeHtml(device)}">${escapeHtml(device)}</option>`).join('')}
+      <option value="custom">직접 입력</option>
+    </select></label>
+    <label id="media-custom-device" hidden>새 촬영 장비<input name="device" maxlength="80" placeholder="예시 · GoPro 또는 unknown" disabled></label>
     <label>촬영 시각 출처<select id="media-time-mode" name="time_mode">
+      <option value="keep" ${mode === 'keep' ? 'selected' : ''}>변경하지 않음</option>
       <option value="manual" ${mode === 'manual' ? 'selected' : ''}>직접 입력</option>
       <option value="metadata" ${mode === 'metadata' ? 'selected' : ''} ${hasMetadata ? '' : 'disabled'}>${metadataLabel}${hasMetadata ? '' : ' (사용 가능한 값 없음)'}</option>
-      <option value="xmp" ${mode === 'xmp' ? 'selected' : ''} ${hasXmp ? '' : 'disabled'}>XMP 시각 사용</option>
+      <option value="xmp" ${mode === 'xmp' ? 'selected' : ''} ${hasXmp ? '' : 'disabled'}>XMP 시각 사용 (${xmpFiles.length}/${files.length}개 가능)</option>
       <option value="modified" ${mode === 'modified' ? 'selected' : ''} ${hasModified ? '' : 'disabled'}>파일 수정 시각 사용</option>
     </select></label>
     <div class="date-grid" id="media-time-fields">
       <label id="media-manual-time">촬영 시각<input type="datetime-local" name="captured_at"></label>
       <label id="media-time-zone">촬영 시간대<select name="zone">${zoneOptions(defaultZone)}</select></label>
     </div>
-    <p id="media-time-note" class="small muted" role="status" hidden></p>`,
+    <p id="media-time-note" class="small muted" role="status" hidden></p>
+    <div id="media-xmp-preview" hidden><p class="small muted">파일별 XMP 촬영 시각</p><ul class="preview-paths"></ul></div>`,
   '변경 저장', async form => {
     const timeMode = form.get('time_mode');
     const payload = { ids: files.map(file => file.id), zone: form.get('zone') || defaultZone };
-    const device = form.get('device').trim();
+    const choice = form.get('device_choice');
+    const device = choice === 'custom' ? (form.get('device') || '').trim() : choice.startsWith('device:') ? choice.slice(7) : '';
+    if (choice === 'custom' && !device) throw new Error('새 촬영 장비 이름을 입력하세요.');
     const time = form.get('captured_at');
     if (device) payload.device = device;
     if (timeMode === 'manual' && time) payload.captured_at = time;
-    if (timeMode !== 'manual') payload.time_mode = timeMode;
-    await api('media', 'PATCH', payload);
+    if (!['keep', 'manual'].includes(timeMode)) payload.time_mode = timeMode;
+    if (timeMode === 'xmp') payload.skip_missing_xmp = true;
+    const result = await api('media', 'PATCH', payload);
     view.eventSelection.clear();
     view.eventDevice = '';
     view.eventDate = '';
     await syncState();
-    announce('선택한 파일의 정보를 수정했습니다.');
+    announce(timeMode === 'xmp' ? `선택한 파일을 수정했습니다. XMP 시각 ${result.timeUpdated}개 적용 · ${result.timeSkipped}개 기존 시각 유지.` : '선택한 파일의 정보를 수정했습니다.');
   });
+  const deviceControl = dialog.querySelector('#media-device');
+  const customField = dialog.querySelector('#media-custom-device');
+  const deviceInput = customField.querySelector('input');
+  const submit = dialog.querySelector('[type="submit"]');
   const modeControl = dialog.querySelector('#media-time-mode');
   const dateField = dialog.querySelector('#media-manual-time');
   const zoneField = dialog.querySelector('#media-time-zone');
   const zoneControl = zoneField.querySelector('select');
   const note = dialog.querySelector('#media-time-note');
+  const preview = dialog.querySelector('#media-xmp-preview');
+  function updateSubmit() {
+    const hasDevice = deviceControl.value === 'custom' ? Boolean(deviceInput.value.trim()) : deviceControl.value.startsWith('device:');
+    const hasTime = modeControl.value === 'manual' ? Boolean(dateField.querySelector('input').value) : modeControl.value !== 'keep';
+    submit.disabled = !(hasDevice || hasTime);
+  }
   function updateTimeFields() {
     const mode = modeControl.value;
     const metadataMode = mode === 'metadata' || mode === 'xmp';
+    const candidates = mode === 'xmp' ? xmpFiles : files;
     dateField.hidden = mode !== 'manual';
-    zoneField.hidden = mode === 'modified' || (metadataMode && files.every(file => file.timeCandidates[mode].verified));
+    zoneField.hidden = ['keep', 'modified'].includes(mode) || (metadataMode && candidates.every(file => file.timeCandidates[mode].verified));
     dateField.querySelector('input').disabled = dateField.hidden;
     zoneControl.disabled = zoneField.hidden;
     dialog.querySelector('#media-time-fields').hidden = dateField.hidden && zoneField.hidden;
-    note.hidden = mode === 'manual';
-    if (mode === 'manual') return;
-    if (files.length > 1) {
+    note.hidden = ['keep', 'manual'].includes(mode);
+    preview.hidden = mode !== 'xmp';
+    updateSubmit();
+    if (note.hidden) return;
+    if (mode === 'xmp') {
+      note.textContent = `XMP 시각 ${xmpFiles.length}개 적용 · ${files.length - xmpFiles.length}개 기존 시각 유지. 파일마다 해당 XMP 시각을 사용하며, 시간대가 없는 값에는 ${zoneControl.value}를 적용합니다.`;
+      preview.querySelector('ul').innerHTML = files.map(file => {
+        const candidate = file.timeCandidates?.xmp;
+        const detail = candidate ? `${candidate.raw || candidate.time} · ${file.xmp?.date?.field || 'XMP'}${candidate.verified ? '' : ` · ${zoneControl.value}`}` : file.xmp ? 'XMP에 촬영 시각 없음 · 기존 시각 유지' : 'XMP 없음 · 기존 시각 유지';
+        return `<li>${escapeHtml(file.name)} — ${escapeHtml(detail)}</li>`;
+      }).join('');
+    } else if (files.length > 1) {
       note.textContent = mode === 'modified' ? '파일마다 해당 파일의 수정 시각을 사용합니다.' :
         '파일마다 메타데이터에 기록된 시각을 사용합니다. 시간대 정보가 없는 파일에는 선택한 시간대를 적용합니다.';
     } else if (mode === 'modified') {
       note.textContent = `파일 수정 시각 ${dateTimeFormatter(defaultZone).format(new Date(files[0].timeCandidates.modified))} · ${defaultZone}`;
     } else {
       const candidate = files[0].timeCandidates[mode];
-      const selected = candidate.verified ? `${candidate.source} ${candidate.raw || candidate.time}` :
+      note.textContent = candidate.verified ? `${candidate.source} ${candidate.raw || candidate.time}` :
         `${candidate.source} ${candidate.raw} · ${zoneControl.value}로 해석`;
-      const alternative = files[0].timeCandidates[mode === 'xmp' ? 'metadata' : 'xmp'];
-      note.textContent = alternative ? `${selected} / ${alternative.source} ${alternative.raw || alternative.time}` : selected;
     }
   }
+  deviceControl.addEventListener('change', () => {
+    customField.hidden = deviceControl.value !== 'custom';
+    deviceInput.disabled = customField.hidden;
+    deviceInput.required = !customField.hidden;
+    updateSubmit();
+  });
+  deviceInput.addEventListener('input', updateSubmit);
+  dateField.querySelector('input').addEventListener('input', updateSubmit);
   modeControl.addEventListener('change', updateTimeFields);
   zoneControl.addEventListener('change', updateTimeFields);
   updateTimeFields();
@@ -1456,6 +1561,7 @@ const actions = {
   'download-catalog': downloadCatalog,
   'pick-catalog-file'() { page.querySelector('#restore-catalog-file').click(); },
   'restore-catalog': confirmCatalogRestore,
+  'reset-catalog': confirmCatalogReset,
   'choose-event': chooseEvent,
   'new-event'() { createEventDialog(); },
   'new-child'() { createEventDialog(eventById(view.eventId)); },

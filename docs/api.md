@@ -61,7 +61,7 @@ Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파�
 | DELETE | `/api/events/{event_id}` | 없음 | `parentId`, `affectedFiles`, `deletedEvents` 반환 |
 | POST | `/api/events/{event_id}/collect` | 없음 | 최상위 이벤트에 기간 수집. `collected`, `uncertain`, `overlapping` 반환 |
 | POST | `/api/placements` | `{"ids":["파일ID"],"event_id":"이벤트ID"}` | 다른 이벤트로 배정한 파일은 `confirmed=0`. `count` 반환 |
-| PATCH | `/api/media` | 선택 파일과 보정 필드 | 장비·촬영 시각 수정. `count` 반환 |
+| PATCH | `/api/media` | 선택 파일과 보정 필드 | 장비·촬영 시각 수정. `count`, `timeUpdated`, `timeSkipped` 반환 |
 | POST | `/api/placements/confirm` | `{"ids":["파일ID"]}` | 이벤트·장비·폴더 충돌 검사 후 확정. `count` 반환 |
 
 최상위 이벤트 생성 예시:
@@ -89,6 +89,10 @@ Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파�
 ```
 
 `device`는 선택 필드이며 최대 80자다. 시각은 `time_mode`의 `metadata`·`modified`·`xmp` 중 하나를 사용하거나 `captured_at`을 직접 준다. `time_mode`와 `captured_at`을 함께 지정하면 400이다. 시간대 없는 직접 입력과 메타데이터에는 `zone`을 적용하고 사용자 시각을 UTC로 저장한다. 장비를 수정하면 확정 상태를 해제한다. API는 유효한 IANA 시간대를 받으며 화면의 선택 목록은 그 일부다.
+
+XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다. `time_mode="xmp"`에 `skip_missing_xmp=true`를 함께 주면 XMP 시각이 있는 파일만 각각의 시각으로 보정하고, 나머지 파일의 기존 시각·출처를 보존한다. 함께 지정한 `device`는 선택 전체에 적용한다. 이 플래그의 기본값은 false로 기존의 전체 검증 방식을 유지한다. 다른 time_mode에 true를 지정하거나, true여도 적용할 XMP 시각이 하나도 없으면 400이며 장비 변경도 수행하지 않는다.
+
+응답의 `timeUpdated`는 보정한 시각 수, `timeSkipped`는 XMP 시각이 없어 기존 시각을 유지한 수다. 장비만 수정하면 둘 다 0이다. 기존 `count`는 선택 파일 수로 유지한다. 장비를 선택하되 시각을 유지하려면 `device`만 보내고 시각 관련 필드는 생략한다.
 
 ## 아카이브 탐색과 전송
 
@@ -154,8 +158,15 @@ Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파�
 | POST | `/api/settings/ssh-test` | 없음 | 공개키 접속 확인 또는 최초 호스트 키 확인 요청 |
 | POST | `/api/settings/ssh-test/trust` | `{"token":"확인토큰"}` | 유효한 확인 요청의 호스트 키 저장 후 공개키 접속 확인 |
 | GET | `/api/settings/catalog/backup` | 없음 | SQLite 백업 파일 다운로드 |
+| POST | `/api/settings/catalog/reset` | `{"confirmation":"모든 데이터 삭제"}` | `202 {"id":작업ID,"kind":"reset-all","status":"queued"}`. 전체 로컬 데이터 초기화 등록 |
 | POST | `/api/settings/catalog/restore` | SQLite 파일의 원시 요청 본문 | `{"restored":true}`. multipart 업로드가 아님 |
 
 최초 접속 테스트는 `status=confirm_host`, `algorithm`, `fingerprint`, `token`을 반환한다. 토큰은 300초 동안 유효하며 IP 변경 시 사용할 수 없다. 인증 성공은 `{"status":"connected"}`다. 설정·원격 탐색·파일 기록·백업 응답은 `Cache-Control: no-store`를 설정한다.
+
+초기화 확인 문구는 **모든 데이터 삭제**다. 이전 문구 `초기화`와 누락·오입력은 422로 거부한다. 다른 활성 작업이 있으면 409다. 초기화 중에는 GET·HEAD·OPTIONS 외의 요청도 409로 차단한다. 기존 `/api/settings/catalog/return-managed`는 제거했다.
+
+워커의 `reset-all` 작업은 managed·썸네일·서버 임시 파일을 삭제한 뒤 DB의 모든 행과 현재 작업 자체를 삭제한다. `/api/state.job.result`에는 처리 중 `phase`, `deletedFiles`, `deletedDirectories`를 제공하며 실패 시 `error`를 기록한다. 성공하면 `job`이 `null`이 되며 완료 이력을 남기지 않는다. 클라이언트는 활성 reset-all 이후 job이 사라지는 것으로 완료를 표시한다. 자동 검사·백업·파일 이동·해시 계산은 수행하지 않는다.
+
+incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격 아카이브는 유지한다. 파일 삭제는 되돌릴 수 없고 중간 실패의 파일 롤백은 없다. DB 삭제는 한 트랜잭션으로 처리한다. 실패한 작업은 오류를 기록해 재실행할 수 있게 남는다. 응답은 `no-store`다.
 
 구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [records.py](../backend/records.py).
