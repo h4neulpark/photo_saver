@@ -114,13 +114,15 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
     {"id": "보관파일ID", "kind": "xmp"}
   ],
   "source": [],
-  "destination": ""
+  "destination": "",
+  "allow_duplicates": false
 }
 ```
 
 - `items`는 1~10,000개다. `kind` 기본값은 `media`이며 XMP는 별도 항목으로 지정한다.
 - `source`는 현재 Source 폴더를 나타내는 문자열 배열이고 최대 3단계다. 항목은 해당 경로 아래에 속해야 한다.
 - `destination`은 원격 루트 아래 상대 폴더다. 기본값은 루트다.
+- `allow_duplicates` 기본값은 `false`다. `kind=media` 항목 중 현재 활성 저장 루트의 `remote_files(status='present')`에 같은 SHA-256이 **다른 원격 경로**에 이미 존재하면 `409`와 함께 `{"detail", "code": "remote_duplicate", "duplicates", "duplicateIds", "newCount"}`를 반환해 중복 업로드를 차단한다. 동일 목적지 경로에 이미 있는 파일과 `kind=xmp` 항목은 이 차단에 걸리지 않으며, `allow_duplicates=true`로 명시 재요청하면 별도 사본 업로드를 허용한다.
 - 대상은 `destination + (논리적 파일 경로에서 source 접두 경로를 뺀 부분)`으로 결정한다.
 - `available`이면서 확정된 원본과 그 XMP만 등록할 수 있다. 설정 식별자가 바뀌었거나 대상 경로가 중복되면 409다.
 - 대기 작업 취소는 즉시 `cancelled`로 변경하고, 실행 중이면 `cancelRequested`를 설정해 워커가 확인한다. 이미 종료한 작업에는 상태 변경 없이 응답한다.

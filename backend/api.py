@@ -20,7 +20,7 @@ from catalog import DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initi
 from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
 from settings import ensure_storage_id, router as settings_router
 from archive import active_storage_scope, router as archive_router
-from transfers import TransferRequest, queue_transfer
+from transfers import RemoteDuplicateError, TransferRequest, queue_transfer
 from offload import OffloadRequest, queue_offload
 from records import router as records_router
 from devices import router as devices_router, device_names, effective_device, device_sql, device_folder
@@ -41,6 +41,17 @@ app.include_router(settings_router)
 app.include_router(archive_router)
 app.include_router(records_router)
 app.include_router(devices_router)
+
+
+@app.exception_handler(RemoteDuplicateError)
+async def handle_remote_duplicate(_request, exc):
+    return JSONResponse(
+        {
+            "detail": exc.detail, "code": "remote_duplicate",
+            "duplicates": exc.duplicates, "duplicateIds": exc.duplicate_ids, "newCount": exc.new_count,
+        },
+        status_code=exc.status_code,
+    )
 
 
 def reset_in_progress():

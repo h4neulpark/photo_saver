@@ -105,7 +105,10 @@ async function api(path, method = 'GET', data) {
   }
   const result = await response.json().catch(() => null);
   if (!response.ok || !result) {
-    throw new Error(typeof result?.detail === 'string' ? result.detail : '요청을 처리하지 못했습니다.');
+    const error = new Error(typeof result?.detail === 'string' ? result.detail : '요청을 처리하지 못했습니다.');
+    error.status = response.status;
+    error.data = result;
+    throw error;
   }
   return result;
 }
@@ -662,19 +665,79 @@ function uploadStatus() {
   </section>`;
 }
 
-async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath) {
+function confirmDuplicateUpload(keys, source, destination, data) {
+  const duplicates = data.duplicates || [];
+  const duplicateIds = new Set(data.duplicateIds || duplicates.map(item => item.id));
+  const filteredKeys = keys.filter(key => !duplicateIds.has(key.split(':')[0]));
+  const list = `<ul class="preview-paths mono">${duplicates.map(item =>
+    `<li>${escapeHtml(item.name)} → ${escapeHtml(item.target)}<br><span class="small muted">기존: ${escapeHtml((item.existingPaths || []).join(', '))}</span></li>`
+  ).join('')}</ul>`;
+  const note = filteredKeys.length
+    ? `<p>중복 파일 ${duplicates.length}개를 제외하고 신규 ${filteredKeys.length}개만 업로드하거나, 별도 사본으로 모두 업로드할 수 있습니다.</p>`
+    : '<p>선택한 파일이 모두 원격 아카이브의 다른 경로에 이미 보관되어 있습니다. 정말 별도 사본을 만들려면 아래에서 진행하세요.</p>';
+  showDialog(
+    '원격 중복 파일 감지',
+    `<p>${escapeHtml(data.detail || '원격 아카이브의 다른 경로에 동일한 파일이 있습니다.')}</p>${note}${list}`,
+    filteredKeys.length ? `중복 제외하고 신규 ${filteredKeys.length}개만 업로드` : '별도 사본으로 모두 업로드',
+    async () => {
+      if (filteredKeys.length) {
+        await startArchiveUpload(filteredKeys, source, destination, false);
+      } else {
+        await startArchiveUpload(keys, source, destination, true);
+      }
+    },
+    { danger: !filteredKeys.length },
+  );
+  if (filteredKeys.length) {
+    const actionsRow = dialog.querySelector('.dialog-actions');
+    const forceButton = document.createElement('button');
+    forceButton.type = 'button';
+    forceButton.className = 'button danger';
+    forceButton.textContent = '별도 사본으로 모두 업로드';
+    forceButton.addEventListener('click', async () => {
+      forceButton.disabled = true;
+      const errorMessage = dialog.querySelector('#dialog-error');
+      errorMessage.hidden = true;
+      try {
+        await startArchiveUpload(keys, source, destination, true);
+        dialog.close();
+        render();
+      } catch (error) {
+        errorMessage.hidden = false;
+        errorMessage.textContent = error.message;
+        forceButton.disabled = false;
+      }
+    });
+    actionsRow.insertBefore(forceButton, actionsRow.querySelector('[type="submit"]'));
+  }
+}
+
+async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath, allowDuplicates = false) {
   if (jobActive() || view.uploadStarting || view.archiveBusy || !view.archive || !keys.length) return;
   if (keys.length > 10000) throw new Error('한 번에 최대 10,000개 파일을 업로드할 수 있습니다. 나누어 선택하세요.');
   view.uploadStarting = true;
   render();
+  let duplicateData = null;
   try {
     const items = keys.map(key => { const [id, kind] = key.split(':'); return { id, kind }; });
-    const result = await api('archive/transfers', 'POST', { items, source, destination, connection: view.archive.connectionVersion });
+    const result = await api('archive/transfers', 'POST', {
+      items, source, destination, connection: view.archive.connectionVersion, allow_duplicates: allowDuplicates,
+    });
     state.job = { id: result.id, kind: 'upload', status: 'queued', result: { totalFiles: result.count } };
     await syncState();
     announce(`${result.count}개 파일의 업로드를 시작합니다.`);
+  } catch (error) {
+    if (!allowDuplicates && error.data?.code === 'remote_duplicate') {
+      duplicateData = error.data;
+    } else {
+      throw error;
+    }
   } finally {
     view.uploadStarting = false;
+  }
+  if (duplicateData) {
+    render();
+    confirmDuplicateUpload(keys, source, destination, duplicateData);
   }
 }
 

@@ -81,7 +81,7 @@ class EventFolderTests(unittest.TestCase):
         api.edit_event('parent', self.fields('260903_나고야'))
         child = api.edit_event('child', api.EventFields(name='식당'))
         self.assertEqual(child['folder'], '식당')
-        second = self.fixture.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}])
+        second = self.fixture.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], allow_duplicates=True)
         targets = [item['target'] for item in json.loads(second['payload'])['files']]
         self.assertEqual(targets, ['260903_나고야/식당/GoPro HERO8 Black/clip.MP4',
                                    '260903_나고야/식당/GoPro HERO8 Black/clip.xmp'])

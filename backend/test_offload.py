@@ -261,6 +261,52 @@ class OffloadAndArchiveModelTests(unittest.TestCase):
         self.assertTrue((self.fixture.managed / "one/clip.MP4").is_file())
         self.assertTrue((self.fixture.managed / "two/second.MP4").is_file())
 
+    def test_incoming_scan_move_and_delete_detect_remote_archive_duplicates(self):
+        incoming = self.root / "incoming"
+        incoming.mkdir()
+        # Upload and offload 'one' so it exists ONLY in remote_files (not in managed).
+        self.upload_all()
+        status, _ = self.run_offload(["one"])
+        self.assertEqual(status, "done")
+        self.assertFalse((self.fixture.managed / "one").exists())
+
+        # Re-introduce identical files (as photos so we can also test delete refresh) into incoming.
+        (incoming / "copy1.JPG").write_bytes(b"first video")
+        (incoming / "copy2.JPG").write_bytes(b"first video")
+        with catalog.database(write=True) as db:
+            scan_id = catalog.queue_job(db, "scan", {})
+            job = dict(db.execute("SELECT * FROM jobs WHERE id=?", (scan_id,)).fetchone())
+        with patch.object(worker.time, "sleep"):
+            worker.scan_incoming(job, incoming, self.fixture.managed)
+        with catalog.database() as db:
+            scanned = {row["path"]: dict(row) for row in db.execute("SELECT * FROM scan_files WHERE scan_id=?", (scan_id,))}
+        for name in ("copy1.JPG", "copy2.JPG"):
+            self.assertEqual(scanned[name]["status"], "duplicate")
+            self.assertIn("원격 아카이브", scanned[name]["reason"])
+            self.assertIn("Trip/Day/GoPro HERO8 Black/clip.MP4", scanned[name]["reason"])
+
+        # Deleting one duplicate copy must NOT promote the remaining copy to 'ready'.
+        with catalog.database(write=True) as db:
+            del_id = catalog.queue_job(db, "delete", {"ids": [scanned["copy1.JPG"]["id"]]})
+            del_job = dict(db.execute("SELECT * FROM jobs WHERE id=?", (del_id,)).fetchone())
+        worker.delete_selection(del_job, incoming, self.fixture.managed)
+        with catalog.database() as db:
+            remaining = db.execute("SELECT status, reason FROM scan_files WHERE id=?", (scanned["copy2.JPG"]["id"],)).fetchone()
+        self.assertEqual(remaining["status"], "duplicate")
+        self.assertIn("원격 아카이브", remaining["reason"])
+
+        # Even if a row was 'ready' before archive finished, import_selection blocks moving it.
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE scan_files SET status='ready', reason='' WHERE id=?", (scanned["copy2.JPG"]["id"],))
+            move_id = catalog.queue_job(db, "move", {"ids": [scanned["copy2.JPG"]["id"]]})
+            move_job = dict(db.execute("SELECT * FROM jobs WHERE id=?", (move_id,)).fetchone())
+        worker.import_selection(move_job, incoming, self.fixture.managed)
+        with catalog.database() as db:
+            moved = db.execute("SELECT status, reason FROM scan_files WHERE id=?", (scanned["copy2.JPG"]["id"],)).fetchone()
+        self.assertEqual(moved["status"], "duplicate")
+        self.assertIn("원격 아카이브", moved["reason"])
+        self.assertTrue((incoming / "copy2.JPG").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

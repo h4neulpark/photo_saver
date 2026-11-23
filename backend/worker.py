@@ -200,8 +200,21 @@ def index_managed_xmp(managed):
             db.executemany("UPDATE media SET xmp_path=NULL,xmp_sha=NULL,xmp_metadata=NULL WHERE xmp_path=?", [(path,) for path in missing])
 
 
+def archived_hashes():
+    known = {}
+    with database() as db:
+        for row in db.execute(
+            """SELECT sha, path FROM remote_files
+               WHERE status='present' AND sha IS NOT NULL
+               ORDER BY coalesce(verified_at, last_seen_at) DESC, path"""
+        ):
+            known.setdefault(row["sha"], []).append(row["path"])
+    return known
+
+
 def scan_incoming(job, incoming, managed):
     known = index_managed(managed)
+    remote_known = archived_hashes()
     index_managed_xmp(managed)
     files = list(scan_tree(incoming, SUPPORTED | COMPANION_EXTENSIONS))
     candidates = [(path, info) for path, info in files if Path(path).suffix.lower() in SUPPORTED]
@@ -220,6 +233,8 @@ def scan_incoming(job, incoming, managed):
             thumbnail = preview_thumbnail(incoming, path, sha, snapshot)
             if sha in known:
                 status, reason = "duplicate", f"managed의 {known[sha][0][0]}와 동일"
+            elif sha in remote_known:
+                status, reason = "duplicate", f"원격 아카이브의 {remote_known[sha][0]}에 이미 보관됨"
             elif sha in in_batch:
                 status, reason = "duplicate", f"이번 검사의 {in_batch[sha]}와 동일"
             else:
@@ -312,7 +327,7 @@ def finish_import_companions(row, incoming, managed, counts):
             counts["companionReview"] = counts.get("companionReview", 0) + 1
 
 
-def import_file(row, incoming, managed, known, counts):
+def import_file(row, incoming, managed, known, counts, remote_known=None):
     file_id, source, sha, snapshot = (row[key] for key in ("id", "path", "sha", "fingerprint"))
     name = Path(source).name
     target = f"{file_id}/{name}"
@@ -343,6 +358,9 @@ def import_file(row, incoming, managed, known, counts):
         if duplicate:
             set_outcome(file_id, "duplicate", f"managed의 {duplicate}와 동일")
             return
+        if remote_known and sha in remote_known:
+            set_outcome(file_id, "duplicate", f"원격 아카이브의 {remote_known[sha][0]}에 이미 보관됨")
+            return
         kind = "photo" if Path(name).suffix.lower() in PHOTOS else "video"
         with database(write=True) as db:
             db.execute(
@@ -371,6 +389,7 @@ def import_file(row, incoming, managed, known, counts):
 
 def import_selection(job, incoming, managed):
     known = index_managed(managed)
+    remote_known = archived_hashes()
     ids = json.loads(job["payload"])["ids"]
     counts = {"moved": 0, "duplicate": 0, "review": 0}
     for file_id in ids:
@@ -381,7 +400,7 @@ def import_selection(job, incoming, managed):
             continue
         if row["status"] == "ready":
             try:
-                import_file(row, incoming, managed, known, counts)
+                import_file(row, incoming, managed, known, counts, remote_known)
             except OSError as exc:
                 log.warning("파일 이동에 확인이 필요합니다: %s: %s", row["path"], exc)
                 message = exc.strerror if exc.errno is not None else str(exc)
@@ -453,11 +472,14 @@ def refresh_deleted_group(managed, sha):
         ).fetchone()
 
     duplicate = live_duplicate(managed, {sha: [(row["path"], row["fingerprint"]) for row in copies]}, sha)
+    remote = archived_hashes().get(sha)
     if remaining:
         with database(write=True) as db:
             for index, row in enumerate(remaining):
                 if duplicate:
                     status, reason = "duplicate", f"managed의 {duplicate}와 동일"
+                elif remote:
+                    status, reason = "duplicate", f"원격 아카이브의 {remote[0]}에 이미 보관됨"
                 elif index:
                     status, reason = "duplicate", f"이번 검사의 {remaining[0]['path']}와 동일"
                 else:

@@ -2,12 +2,14 @@ import hashlib
 import io
 import json
 import os
+import socket
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import paramiko
 from fastapi import HTTPException
 
 import api
@@ -18,8 +20,9 @@ from worker import store_analysis
 
 
 class LocalFile:
-    def __init__(self, stream):
+    def __init__(self, stream, prefetch_log=None):
         self.stream = stream
+        self.prefetch_log = prefetch_log
     def __enter__(self):
         return self
     def __exit__(self, *args):
@@ -28,11 +31,16 @@ class LocalFile:
         return getattr(self.stream, name)
     def set_pipelined(self, _enabled):
         pass
+    def prefetch(self, file_size=None):
+        if self.prefetch_log is not None:
+            self.prefetch_log.append(file_size)
 
 
 class LocalSFTP:
     """Filesystem-backed SFTP contract, including non-overwriting rename."""
     corrupt_reads = False
+    def __init__(self):
+        self.prefetch_calls = []
     def normalize(self, path):
         return str(Path(path).resolve(strict=True))
     def lstat(self, path):
@@ -47,7 +55,7 @@ class LocalSFTP:
     def open(self, path, mode):
         if self.corrupt_reads and mode == 'rb' and path.endswith('.part'):
             return io.BytesIO(b'corrupted')
-        return LocalFile(open(path, 'xb' if mode == 'wx' else mode))
+        return LocalFile(open(path, 'xb' if mode == 'wx' else mode), self.prefetch_calls)
 
 
 class TransferTests(unittest.TestCase):
@@ -94,8 +102,14 @@ class TransferTests(unittest.TestCase):
                 db.execute('UPDATE media SET xmp_path=?,xmp_sha=? WHERE id=?', (f'{file_id}/{sidecar.name}', hashlib.sha256(sidecar.read_bytes()).hexdigest(), file_id))
         return file
 
-    def queue(self, items=None, source=None, destination=''):
-        request = transfers.TransferRequest(connection=transfers.config_identity(self.config), items=items or [{'id': 'one'}], source=source or [], destination=destination)
+    def queue(self, items=None, source=None, destination='', allow_duplicates=False):
+        request = transfers.TransferRequest(
+            connection=transfers.config_identity(self.config),
+            items=items or [{'id': 'one'}],
+            source=source or [],
+            destination=destination,
+            allow_duplicates=allow_duplicates,
+        )
         with catalog.database(write=True) as db:
             result = transfers.queue_transfer(db, request, api.device_folder)
             return dict(db.execute('SELECT * FROM jobs WHERE id=?', (result['id'],)).fetchone())
@@ -242,6 +256,102 @@ class TransferTests(unittest.TestCase):
         with catalog.database() as db:
             recorded = db.execute('SELECT count(*) FROM archive_entries WHERE job_id=?', (job['id'],)).fetchone()[0]
         self.assertEqual(recorded, 0)
+
+    def test_cross_path_duplicate_is_blocked_unless_allowed_and_ignores_xmp_templates(self):
+        self.config['storageId'] = 'abcdef0123456789abcdef0123456789'
+        self.assertEqual(self.run_job(self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}]))[0], 'done')
+        # Same target path is allowed (for re-upload / fast-skip).
+        self.assertEqual(self.run_job(self.queue([{'id': 'one'}]))[0], 'done')
+
+        # Different media with identical XMP bytes should not be flagged as duplicate.
+        self.add_file('two', 'two.MP4', b'second video', xmp=True)
+        with self.assertRaises(transfers.RemoteDuplicateError) as caught:
+            self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}, {'id': 'two'}, {'id': 'two', 'kind': 'xmp'}], destination='backup')
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.duplicate_ids, ['one'])
+        self.assertEqual(caught.exception.new_count, 2)
+        self.assertEqual(caught.exception.duplicates[0]['existingPaths'], ['Trip/Day/GoPro HERO8 Black/clip.MP4'])
+
+        # Uploading only the new file + identical XMP succeeds without allow_duplicates.
+        self.assertEqual(self.run_job(self.queue([{'id': 'two'}, {'id': 'two', 'kind': 'xmp'}], destination='backup'))[0], 'done')
+        # Explicitly allowing duplicates uploads to the new target path.
+        self.assertEqual(self.run_job(self.queue([{'id': 'one'}], destination='backup', allow_duplicates=True))[0], 'done')
+        self.assertEqual((self.remote / 'backup/Trip/Day/GoPro HERO8 Black/clip.MP4').read_bytes(), b'first video')
+
+    def test_fast_skip_avoids_remote_hash_when_unchanged_and_rehashes_when_mtime_changes(self):
+        self.config['storageId'] = 'abcdef0123456789abcdef0123456789'
+        job = self.queue()
+        self.assertEqual(self.run_job(job)[0], 'done')
+        self.assertTrue(self.sftp.prefetch_calls)
+        with patch.object(transfers, 'remote_hash', side_effect=AssertionError('fast-skip should avoid remote_hash')):
+            status, result = self.run_job(self.queue())
+        self.assertEqual((status, result['skipped']), ('done', 1))
+
+        # Changing mtime on the remote copy forces re-hashing with prefetch.
+        target = self.remote / 'Trip/Day/GoPro HERO8 Black/clip.MP4'
+        stat_before = target.stat()
+        os.utime(target, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns + 5_000_000_000))
+        self.sftp.prefetch_calls.clear()
+        with patch.object(transfers, 'remote_hash', wraps=transfers.remote_hash) as spy:
+            status, result = self.run_job(self.queue())
+        self.assertEqual((status, result['skipped']), ('done', 1))
+        spy.assert_called_once()
+        self.assertEqual(self.sftp.prefetch_calls, [len(b'first video')])
+
+    def test_ssh_remote_hash_parses_output_handles_cancel_and_falls_back(self):
+        expected_sha = hashlib.sha256(b'first video').hexdigest()
+        target = self.remote / 'clip.MP4'
+        target.write_bytes(b'first video')
+
+        def fake_sftp(chunks, exit_code=0, open_error=None):
+            exec_channel = MagicMock()
+            exec_channel.recv.side_effect = list(chunks)
+            exec_channel.recv_exit_status.return_value = exit_code
+            transport = MagicMock()
+            transport.is_active.return_value = True
+            if open_error is not None:
+                transport.open_session.side_effect = open_error
+            else:
+                transport.open_session.return_value = exec_channel
+            sftp_chan = MagicMock()
+            sftp_chan.get_transport.return_value = transport
+            sftp = MagicMock()
+            sftp.get_channel.return_value = sftp_chan
+            sftp.open.side_effect = self.sftp.open
+            return sftp, exec_channel
+
+        # 1. Parses GNU/macOS output (including escaped backslash prefix) without reading via SFTP.
+        sftp, exec_channel = fake_sftp([f'\\{expected_sha}  clip.MP4\n'.encode(), b''])
+        ssh_state = {'supported': True}
+        digest = transfers.remote_hash(sftp, target, lambda _n: None, file_size=11, ssh_state=ssh_state)
+        self.assertEqual(digest, expected_sha)
+        sftp.open.assert_not_called()
+        command = exec_channel.exec_command.call_args.args[0]
+        self.assertIn('sha256sum -- "$1"', command)
+        self.assertIn('shasum -a 256 -- "$1"', command)
+
+        # 2. Exit 127 / SFTP-only disables SSH exec for session and falls back to SFTP prefetch.
+        sftp, _ = fake_sftp([b''], exit_code=127)
+        ssh_state = {'supported': True}
+        self.sftp.prefetch_calls.clear()
+        progress_bytes = []
+        digest = transfers.remote_hash(sftp, target, progress_bytes.append, file_size=11, ssh_state=ssh_state)
+        self.assertEqual(digest, expected_sha)
+        self.assertFalse(ssh_state['supported'])
+        self.assertEqual(self.sftp.prefetch_calls, [11])
+        self.assertEqual(progress_bytes[-1], 11)
+
+        # 3. ChannelException also disables and falls back.
+        sftp, _ = fake_sftp([], open_error=paramiko.ChannelException(1, 'denied'))
+        ssh_state = {'supported': True}
+        self.assertEqual(transfers.remote_hash(sftp, target, lambda _n: None, file_size=11, ssh_state=ssh_state), expected_sha)
+        self.assertFalse(ssh_state['supported'])
+
+        # 4. UploadCancelled closes exec channel immediately and propagates.
+        sftp, exec_channel = fake_sftp([socket.timeout(), b''])
+        with self.assertRaises(transfers.UploadCancelled):
+            transfers.ssh_remote_hash(sftp, target, lambda: (_ for _ in ()).throw(transfers.UploadCancelled()), file_size=11)
+        exec_channel.close.assert_called_once()
 
 
 if __name__ == '__main__':
