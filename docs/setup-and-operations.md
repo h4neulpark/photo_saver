@@ -20,7 +20,8 @@ docker compose up -d --build
 
 | 변수 | 기본값 | 용도 |
 | --- | --- | --- |
-| `PHOTO_SAVER_PORT` | `8888` | 호스트의 웹 포트. `127.0.0.1`에 바인딩 |
+| `PHOTO_SAVER_PORT` | `8888` | 호스트의 웹 포트. 기본은 `127.0.0.1`에 바인딩 |
+| `PHOTO_SAVER_LAN_IP` | 빈 값 | `127.0.0.1` 외에 추가로 바인딩할 호스트 LAN 인터페이스 IP. 비워 두면 `127.0.0.1`만 바인딩 |
 | `PHOTO_SAVER_TIMEZONE` | `Asia/Seoul` | 기본 표시·해석 시간대. IANA 시간대 이름 사용 |
 | `PHOTO_LIBRARY_ROOT` | `.` | 호스트 라이브러리 루트. 상대 경로는 Compose 프로젝트 기준 |
 | `INCOMING_DIR` | `incoming` | 라이브러리 루트 아래 수집 디렉터리의 상대 경로 |
