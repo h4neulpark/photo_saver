@@ -157,6 +157,7 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 .status { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; padding: 3px 8px; border-radius: 5px; font-size: 12px; font-weight: 740; white-space: nowrap; }
 .status::before { content: ""; display: block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .status.ready, .status.online { color: var(--teal); background: var(--teal-soft); }
+.status.archived { color: var(--blue); background: var(--blue-soft); }
 .status.duplicate, .status.draft { color: #4c5b72; background: #eaf0f7; }
 .status.review, .status.offline { color: var(--amber); background: var(--amber-soft); }
 .view-switch { display: flex; align-items: center; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; }
@@ -211,6 +212,7 @@ button.thumb:hover { outline: 2px solid #3865e5; outline-offset: 0; }
 .event-tools select, .action-bar select { max-width: 210px; }
 .time-edit-link { display: inline-block; padding: 0; margin-top: 5px; border: 0; background: transparent; color: var(--blue); font-size: 12px; font-weight: 700; text-underline-offset: 3px; }
 .time-edit-link:hover { text-decoration: underline; }
+.file-links { display: flex; flex-wrap: wrap; gap: 10px; }
 .xmp-section { margin-top: 16px; }
 .xmp-matches { max-height: 360px; }
 .xmp-matches select { max-width: 340px; }

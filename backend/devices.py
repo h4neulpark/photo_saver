@@ -37,7 +37,7 @@ def listed_devices(db):
                          UNION SELECT source FROM device_names)
         SELECT s.source,coalesce(n.name,s.source) AS name,
                (SELECT count(*) FROM media m WHERE m.device=s.source AND m.user_device IS NULL
-                 AND m.status='available') AS count
+                 AND m.status IN ('available','archived')) AS count
         FROM sources s LEFT JOIN device_names n ON n.source=s.source ORDER BY s.source
     ''')]
 
@@ -59,8 +59,8 @@ def rename_device(request: DeviceName):
     if not name or name in {'.', '..'} or UNSAFE.search(name) or not device_folder(name):
         raise HTTPException(400, '폴더명에 사용할 수 있는 촬영도구 이름을 입력하세요.')
     with database(write=True) as db:
-        if db.execute("SELECT 1 FROM jobs WHERE kind='upload' AND status IN ('queued','running')").fetchone():
-            raise HTTPException(409, '업로드가 끝난 뒤 촬영도구 이름을 변경하세요.')
+        if db.execute("SELECT 1 FROM jobs WHERE kind IN ('upload','offload') AND status IN ('queued','running')").fetchone():
+            raise HTTPException(409, '업로드 또는 로컬 비우기가 끝난 뒤 촬영도구 이름을 변경하세요.')
         devices = listed_devices(db)
         if request.source not in {item['source'] for item in devices}:
             raise HTTPException(404, '촬영도구를 찾을 수 없습니다. 목록을 새로 고침하세요.')
@@ -70,7 +70,7 @@ def rename_device(request: DeviceName):
         if any(folder_key(other) == key for other in others):
             raise HTTPException(409, '다른 촬영도구와 폴더 이름이 같습니다. 다른 이름을 입력하세요.')
         if db.execute('''SELECT 1 FROM media m JOIN events child ON child.parent_id=m.event_id
-                         WHERE m.device=? AND m.user_device IS NULL AND m.status='available'
+                         WHERE m.device=? AND m.user_device IS NULL AND m.status IN ('available','archived')
                          AND child.folder_key=?''', (request.source, key)).fetchone():
             raise HTTPException(409, '이벤트 소분류와 폴더 이름이 같습니다. 다른 이름을 입력하세요.')
         db.execute('INSERT INTO device_names(source,name) VALUES (?,?) '

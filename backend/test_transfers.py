@@ -216,6 +216,33 @@ class TransferTests(unittest.TestCase):
             self.queue([{'id': 'one'}, {'id': 'two'}])
         self.assertEqual(error.exception.status_code, 409)
 
+    def test_upload_and_skip_sync_remote_files(self):
+        self.config['storageId'] = 'abcdef0123456789abcdef0123456789'
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}])
+        status, _ = self.run_job(job)
+        self.assertEqual(status, 'done')
+        with catalog.database() as db:
+            rows = [dict(row) for row in db.execute('SELECT * FROM remote_files ORDER BY path')]
+            storages = [dict(row) for row in db.execute('SELECT * FROM storages')]
+        self.assertEqual(len(storages), 1)
+        self.assertEqual(storages[0]['id'], self.config['storageId'])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['status'] == 'present' and row['archive_root'] == str(self.remote) and row['mtime_ns'] is not None for row in rows))
+        status, result = self.run_job(job)
+        self.assertEqual((status, result['skipped']), ('done', 2))
+
+    def test_sftp_disconnect_aborts_remaining_files_without_repeating_failures(self):
+        self.add_file('two', 'two.MP4', b'second')
+        self.add_file('three', 'three.MP4', b'third')
+        job = self.queue([{'id': 'one'}, {'id': 'two'}, {'id': 'three'}])
+        with patch.object(self.sftp, 'lstat', side_effect=BrokenPipeError('connection dropped')):
+            status, result = self.run_job(job)
+        self.assertEqual(status, 'failed')
+        self.assertEqual((result['completedFiles'], result['failed']), (3, 3))
+        with catalog.database() as db:
+            recorded = db.execute('SELECT count(*) FROM archive_entries WHERE job_id=?', (job['id'],)).fetchone()[0]
+        self.assertEqual(recorded, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

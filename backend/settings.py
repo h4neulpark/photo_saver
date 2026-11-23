@@ -14,6 +14,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
@@ -22,12 +23,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from catalog import DATA, DEFAULT_ZONE, catalog_lock, now, open_db, queue_job, database
+from catalog import DATA, DEFAULT_ZONE, backfill_remote_files, catalog_lock, database, now, open_db, queue_job
 
 router = APIRouter(prefix="/api/settings")
 SETTINGS_DIR = Path("/settings")
 ADDRESS_FILE = SETTINGS_DIR / "address"
 STORAGE_ROOT_FILE = SETTINGS_DIR / "remote-root"
+STORAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 KEY_DIR = SETTINGS_DIR / "ssh"
 KEY_FILE = KEY_DIR / "id_ed25519"
 PUBLIC_KEY = KEY_DIR / "id_ed25519.pub"
@@ -42,10 +44,12 @@ RESTORE_COLUMNS = {
     "jobs": set(),
     "events": set(),
     "device_names": set(),
+    "storages": set(),
     "media": {"user_time_source", "original_path", "xmp_path", "xmp_sha", "xmp_metadata"},
     "scan_files": {"thumbnail", "companions"},
     "scan_xmp": set(),
     "archive_entries": set(),
+    "remote_files": set(),
 }
 JSON_FIELDS = {
     "jobs": {"payload": "object", "result": "object"},
@@ -90,6 +94,21 @@ def read_setting(path):
         return ""
 
 
+def read_storage_id():
+    value = read_setting(SETTINGS_DIR / "storage-id").strip()
+    return value if STORAGE_ID_RE.fullmatch(value) else ""
+
+
+def ensure_storage_id():
+    with settings_lock():
+        existing = read_storage_id()
+        if existing:
+            return existing
+        created = uuid4().hex
+        replace_setting(SETTINGS_DIR / "storage-id", created)
+        return created
+
+
 def settings_state():
     address = read_setting(ADDRESS_FILE).strip()
     storage_root = read_setting(STORAGE_ROOT_FILE)
@@ -100,6 +119,7 @@ def settings_state():
         "storageRootConfigured": bool(storage_root),
         "accountConfigured": bool(os.environ.get("PHOTO_SAVER_STORAGE_USER", "").strip()),
         "keyGenerated": generated, "keyCopied": generated and KEY_COPIED.is_file(),
+        "hostKeyTrusted": bool(address and known_host_file(address).is_file()),
     }
 
 
@@ -135,6 +155,7 @@ def save_storage(request: StorageAddress):
     except ValueError:
         fail(400, "유효한 IPv4 또는 IPv6 주소를 입력하세요.")
     write_setting(ADDRESS_FILE, str(address))
+    ensure_storage_id()
     return JSONResponse(settings_state(), headers=NO_STORE)
 
 
@@ -144,6 +165,7 @@ def save_storage_root(request: StorageRoot):
     if "\0" in value or not PurePosixPath(value).is_absolute():
         fail(400, "원격 스토리지에서 /로 시작하는 절대경로를 입력하세요.")
     write_setting(STORAGE_ROOT_FILE, value)
+    ensure_storage_id()
     return JSONResponse(settings_state(), headers=NO_STORE)
 
 
@@ -319,6 +341,20 @@ def trust_and_test_host(request: HostKeyConfirmation):
     return verify_public_key_access(address, account)
 
 
+@router.delete("/ssh-host-key")
+def reset_host_key():
+    with database() as db:
+        if db.execute("SELECT 1 FROM jobs WHERE kind IN ('upload','offload') AND status IN ('queued','running')").fetchone():
+            fail(409, "업로드 또는 로컬 비우기 작업이 끝난 뒤 호스트 키를 초기화하세요.")
+    with settings_lock():
+        address = read_setting(ADDRESS_FILE).strip()
+        if not address:
+            fail(409, "먼저 스토리지 IP 주소를 등록하세요.")
+        known_host_file(address).unlink(missing_ok=True)
+        PENDING_HOST_KEY.unlink(missing_ok=True)
+    return JSONResponse(settings_state(), headers=NO_STORE)
+
+
 def ensure_catalog_idle(connection):
     if connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
         fail(409, "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요.")
@@ -357,7 +393,7 @@ def restore_columns(source, target):
               if sql and sql.upper().startswith("CREATE TABLE ")}
     columns = {}
     for table, optional in RESTORE_COLUMNS.items():
-        if table in {"scan_xmp", "archive_entries", "device_names"} and table not in tables:
+        if table in {"scan_xmp", "archive_entries", "device_names", "storages", "remote_files"} and table not in tables:
             continue
         available = {row[1] for row in source.execute(f"PRAGMA table_info({table})")}
         expected = [row["name"] for row in target.execute(f"PRAGMA table_info({table})")]
@@ -409,7 +445,9 @@ def restore_catalog_file(path):
                         (json.dumps({"error": "복원 전에 대기 중이던 작업입니다. 라이브러리를 새로 고침하세요."}), now()),
                     )
                     target.execute("UPDATE media SET status='missing' WHERE status='moving'")
+                    target.execute("UPDATE media SET status='available' WHERE status='offloading'")
                     target.execute("UPDATE scan_files SET status='review' WHERE status='deleting'")
+                    backfill_remote_files(target, read_storage_id() or None)
     except sqlite3.DatabaseError:
         fail(400, "데이터베이스 백업을 읽거나 복원할 수 없습니다.")
 

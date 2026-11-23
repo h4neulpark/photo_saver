@@ -3,23 +3,46 @@ import errno
 import hashlib
 import json
 import os
+import socket
 import stat
 import time
 from pathlib import PurePosixPath
 from typing import Literal
 from uuid import uuid4
 
+import paramiko
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from archive import archive_config, archive_connection, archive_revision as config_identity, relative_path
-from catalog import database, now, queue_job
+from archive import archive_config, archive_connection, archive_revision as config_identity, relative_path, storage_id_for
+from catalog import database, now, queue_job, upsert_remote_file
 from media import fingerprint, inspect, regular_file
 from settings import fail
 
 from devices import device_names, effective_device
 
 CHUNK = 1024 * 1024
+CONNECTION_ERRORS = (paramiko.SSHException, EOFError, BrokenPipeError, ConnectionError, TimeoutError, socket.timeout)
+
+
+def sftp_disconnected(sftp, error=None):
+    if isinstance(error, CONNECTION_ERRORS):
+        return True
+    if hasattr(sftp, "get_channel"):
+        channel = sftp.get_channel()
+        if channel is not None and not channel.active:
+            return True
+    return False
+
+
+def stat_mtime_ns(info):
+    if info is None:
+        return None
+    if getattr(info, "st_mtime_ns", None) is not None:
+        return int(info.st_mtime_ns)
+    if getattr(info, "st_mtime", None) is not None:
+        return int(info.st_mtime * 1_000_000_000)
+    return None
 
 
 class TransferItem(BaseModel):
@@ -140,7 +163,7 @@ def send_file(sftp, base, managed, item, temporary_name, progress):
             # Ensure the local source still matches its catalog hash too.
             if hashlib.file_digest(source, "sha256").hexdigest() != item["sha"]:
                 fail(409, "원본이 검사 이후 변경되었습니다. 다시 검사하세요.")
-            return "skipped", local_info.st_size
+            return "skipped", local_info.st_size, stat_mtime_ns(existing)
         temporary = parent / temporary_name
         stale = remote_stat(sftp, temporary)
         if stale is not None:
@@ -167,7 +190,7 @@ def send_file(sftp, base, managed, item, temporary_name, progress):
                 fail(502, "업로드한 파일의 SHA-256 검증에 실패했습니다.")
             # Standard SFTP rename fails if the destination appeared in the meantime.
             sftp.rename(str(temporary), str(target))
-            return "uploaded", sent
+            return "uploaded", sent, stat_mtime_ns(remote_stat(sftp, target))
         finally:
             try:
                 sftp.remove(str(temporary))
@@ -175,8 +198,11 @@ def send_file(sftp, base, managed, item, temporary_name, progress):
                 pass
 
 
-def record_archive(job_id, index, item, config, outcome, size=None, error=None):
+def record_archive(job_id, index, item, config, outcome, size=None, error=None, mtime_ns=None):
     stamp = now()
+    storage_id = storage_id_for(config)
+    final_size = size if size is not None else item["size"]
+    verified_at = stamp if outcome in {"uploaded", "skipped"} else None
     with database(write=True) as db:
         db.execute(
             """INSERT INTO archive_entries
@@ -185,10 +211,14 @@ def record_archive(job_id, index, item, config, outcome, size=None, error=None):
                ON CONFLICT(job_id,item_index) DO UPDATE SET
                size=excluded.size,outcome=excluded.outcome,verified_at=excluded.verified_at,
                recorded_at=excluded.recorded_at,error=excluded.error""",
-            (job_id,index,item["id"],item["kind"],item["local"],item["sha"],size if size is not None else item["size"],
-             config_identity(config),config["root"],item["target"],outcome,
-             stamp if outcome in {"uploaded", "skipped"} else None,stamp,error),
+            (job_id, index, item["id"], item["kind"], item["local"], item["sha"], final_size,
+             storage_id, config["root"], item["target"], outcome, verified_at, stamp, error),
         )
+        if outcome in {"uploaded", "skipped"}:
+            upsert_remote_file(
+                db, storage_id, item["target"], config["root"], item["sha"], final_size,
+                mtime_ns=mtime_ns, status="present", verified_at=verified_at,
+            )
 
 
 def upload_selection(job, _incoming, managed):
@@ -234,13 +264,15 @@ def upload_selection(job, _incoming, managed):
                 result["current"] = item["target"]
                 save(True)
                 try:
-                    outcome, size = send_file(sftp, base, managed, item, f".photo-saver-{payload['token']}-{index}.part", progress)
-                    record_archive(job["id"], index, item, config, outcome, size)
+                    outcome, size, mtime_ns = send_file(sftp, base, managed, item, f".photo-saver-{payload['token']}-{index}.part", progress)
+                    record_archive(job["id"], index, item, config, outcome, size, mtime_ns=mtime_ns)
                     result[outcome] += 1
                     completed_bytes += size
                 except UploadCancelled:
                     raise
                 except (OSError, ValueError, HTTPException) as error:
+                    if sftp_disconnected(sftp, error):
+                        raise
                     result["failed"] += 1
                     message = error.detail if isinstance(error, HTTPException) else "파일을 읽거나 업로드하지 못했습니다. 연결 및 파일 권한을 확인하세요."
                     record_archive(job["id"], index, item, config, "failed", error=message)

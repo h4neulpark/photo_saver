@@ -30,6 +30,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | POST | `/api/jobs/scan` | 없음 | `202 {"id":작업ID}`. `scan` 등록 |
 | POST | `/api/jobs/move` | `{"ids":["파일ID"]}` | `202`. 최근 완료 검사에서 `ready`인 원본만 이동 등록 |
 | POST | `/api/jobs/delete` | `{"ids":["파일ID"]}` | `202`. 최근 검사에서 `ready`·`duplicate`인 사진만 삭제 등록 |
+| POST | `/api/jobs/offload` | `{"ids":["보관파일ID"]}` | `202`. 원격 아카이브에 검증된 사본(연결 XMP 포함)이 있는 `available` 파일의 로컬 원본 비우기 등록 |
 | POST | `/api/jobs/xmp-link` | `{"links":[{"id":"XMP검사ID","media_id":"보관파일ID"}]}` | `202`. 현재 연결 후보에 있는 원본으로 XMP 연결 등록 |
 | GET, HEAD | `/api/incoming/{file_id}/original` | 경로 ID | 원본 응답. 범위 요청은 `FileResponse`가 처리 |
 | GET | `/api/incoming/{file_id}/preview` | 경로 ID | HEIC·HEIF는 최대 2200×2200 JPEG, 나머지는 원본 응답 |
@@ -43,7 +44,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `incoming` | 해당 검사의 파일 목록. `moved`·`deleted`는 제외 |
 | `job` | 종류와 관계없이 가장 최근 작업 또는 `null` |
 | `events` | `id`, `name`, `folder`, `parent`, `start`, `end`, `zone` |
-| `managed` | `available` 원본의 장비·촬영 시각·이벤트·확정 여부·썸네일·XMP |
+| `managed` | `available`·`archived` 원본의 보관 상태(`status`), 장비·촬영 시각·이벤트·확정 여부·아카이브 사본·다운로드/오프로드 가능 여부·썸네일·XMP |
 | `pendingXmp` | 최근 검사에서 아직 `linked`가 아닌 XMP와 연결 후보 |
 
 작업 표현은 `id`, `kind`, `status`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
@@ -99,6 +100,7 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | 메서드 | 경로 | 입력 | 반환·동작 |
 | --- | --- | --- | --- |
 | GET | `/api/archive` | 쿼리 `path` (기본 `""`) | 저장 루트 안의 폴더 목록과 연결 식별자 |
+| GET | `/api/archive/download` | 쿼리 `path` 또는 `media_id`(+`kind`) | 원격 아카이브 정규 파일의 SFTP 스트리밍 다운로드 (`attachment`, `no-store`) |
 | POST | `/api/archive/transfers` | 전송 모델 | `202 {"id":작업ID,"count":파일수}` |
 | POST | `/api/archive/transfers/{job_id}/cancel` | 없음 | `upload` 작업의 취소 요청 후 작업 상태 반환 |
 
@@ -157,6 +159,7 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | POST | `/api/settings/ssh-key/copied` | 없음 | 공개키 복사 완료 표시 저장 |
 | POST | `/api/settings/ssh-test` | 없음 | 공개키 접속 확인 또는 최초 호스트 키 확인 요청 |
 | POST | `/api/settings/ssh-test/trust` | `{"token":"확인토큰"}` | 유효한 확인 요청의 호스트 키 저장 후 공개키 접속 확인 |
+| DELETE | `/api/settings/ssh-host-key` | 없음 | 현재 IP에 저장된 SSH 호스트 키 초기화 (활성 `upload`·`offload` 작업 중에는 409) |
 | GET | `/api/settings/catalog/backup` | 없음 | SQLite 백업 파일 다운로드 |
 | POST | `/api/settings/catalog/reset` | `{"confirmation":"모든 데이터 삭제"}` | `202 {"id":작업ID,"kind":"reset-all","status":"queued"}`. 전체 로컬 데이터 초기화 등록 |
 | POST | `/api/settings/catalog/restore` | SQLite 파일의 원시 요청 본문 | `{"restored":true}`. multipart 업로드가 아님 |
@@ -169,4 +172,4 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 
 incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격 아카이브는 유지한다. 파일 삭제는 되돌릴 수 없고 중간 실패의 파일 롤백은 없다. DB 삭제는 한 트랜잭션으로 처리한다. 실패한 작업은 오류를 기록해 재실행할 수 있게 남는다. 응답은 `no-store`다.
 
-구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [records.py](../backend/records.py).
+구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [offload.py](../backend/offload.py), [records.py](../backend/records.py).

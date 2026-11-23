@@ -6,12 +6,17 @@ from typing import Literal
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
+from archive import active_storage_scope
 from catalog import database
 from settings import NO_STORE
 from devices import device_sql
 
 router = APIRouter(prefix='/api/catalog')
 VERIFIED = "('uploaded','skipped','legacy_verified')"
+FILE_VERIFIED_SQL = f"""(
+    EXISTS (SELECT 1 FROM archive_history a WHERE a.file_id=files.file_id AND a.kind=files.asset_kind AND a.sha=files.sha AND a.outcome IN {VERIFIED})
+    OR EXISTS (SELECT 1 FROM remote_files rf WHERE rf.sha=files.sha AND rf.status='present')
+)"""
 CTE = f"""
 WITH archive_history AS (
     SELECT 'archive:'||a.job_id||':'||a.item_index AS record_key,a.media_id AS file_id,
@@ -83,7 +88,7 @@ def catalog_records(
         elif scope == 'xmp':
             where += " AND kind='xmp'"
         elif scope == 'verified':
-            where += f" AND EXISTS (SELECT 1 FROM archive_history a WHERE a.file_id=files.file_id AND a.kind=files.asset_kind AND a.sha=files.sha AND a.outcome IN {VERIFIED})"
+            where += f" AND {FILE_VERIFIED_SQL}"
         order = 'local_path,record_key'
     else:
         table = 'archive_files'
@@ -116,12 +121,31 @@ def catalog_records(
         total = db.execute(CTE + f'SELECT count(*) FROM {table} WHERE {where}', params).fetchone()[0]
         pages = max(1, math.ceil(total / page_size))
         page = min(page, pages)
-        extra = f", EXISTS(SELECT 1 FROM archive_history a WHERE a.file_id=files.file_id AND a.kind=files.asset_kind AND a.sha=files.sha AND a.outcome IN {VERIFIED}) AS has_archive" if view == 'files' else ''
+        extra = f", {FILE_VERIFIED_SQL} AS has_archive" if view == 'files' else ''
         rows = [dict(row) for row in db.execute(CTE + f'SELECT * {extra} FROM {table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', [*params, page_size, (page - 1) * page_size])]
+        active_storage_id, active_root = active_storage_scope()
+        present_remote = {}
+        if view == 'files' and active_root:
+            for remote in db.execute(
+                """SELECT sha, path FROM remote_files
+                   WHERE status='present' AND archive_root=? AND sha IS NOT NULL
+                   ORDER BY (storage_id=?) DESC, coalesce(verified_at, last_seen_at) DESC, path""",
+                (active_root, active_storage_id or ''),
+            ):
+                present_remote.setdefault(remote['sha'], remote['path'])
         file_summary = db.execute(CTE + 'SELECT count(*) AS files,count(DISTINCT sha) AS hashes FROM files').fetchone()
         archive_summary = db.execute(CTE + f"SELECT count(*) AS attempts,coalesce(sum(outcome IN {VERIFIED}),0) AS verified,coalesce(sum(outcome='failed'),0) AS failed FROM archive_history").fetchone()
     for row in rows:
         row['name'] = row.get('name') or PurePosixPath(row.get('local_path') or row.get('target') or '').name
+        if view == 'files':
+            download_path = present_remote.get(row['sha']) if active_root and row.get('sha') else None
+            row['download_path'] = download_path
+            row['can_download'] = bool(download_path)
+        else:
+            row['can_download'] = bool(
+                active_root and row.get('target') and row.get('archive_root') == active_root
+                and row.get('outcome') in {'uploaded', 'skipped'}
+            )
     return JSONResponse({
         'view': view, 'rows': rows, 'total': total, 'page': page, 'pages': pages, 'pageSize': page_size,
         'summary': {**dict(file_summary), **dict(archive_summary)},

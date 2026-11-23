@@ -4,7 +4,7 @@
 
 카탈로그 파일은 기본 `/data/catalog.sqlite3`이다. API와 워커가 같은 Docker `catalog` 볼륨을 사용한다. [catalog.py](../backend/catalog.py)의 `SCHEMA`와 `initialize()`가 실제 스키마의 기준이다.
 
-현재 테이블은 **`jobs`, `scan_files`, `scan_xmp`, `events`, `media`, `archive_entries`, `device_names`의 7개**다. 초기 설계에 있던 `media_content`, `source_file`, `device`, `placement`, `remote_file`은 별도 테이블로 구현되지 않았다. 콘텐츠·원본·배치 정보 대부분을 `media`에 보관한다.
+현재 테이블은 **`jobs`, `scan_files`, `scan_xmp`, `events`, `device_names`, `storages`, `media`, `archive_entries`, `remote_files`의 9개**다. 초기 설계에 있던 `media_content`, `source_file`, `device`, `placement`는 별도 테이블로 구현되지 않았으며 콘텐츠·원본·배치 정보 대부분을 `media`에 보관한다. 원격 스토리지 식별과 현재 원격 파일 상태는 `storages`와 `remote_files`에 분리 보관한다.
 
 ```mermaid
 erDiagram
@@ -13,6 +13,7 @@ erDiagram
     jobs ||--o{ archive_entries : job_id
     events o|--o{ events : parent_id
     events o|--o{ media : event_id
+    storages ||--o{ remote_files : storage_id
 ```
 
 `archive_entries.media_id`는 논리적 원본 ID이며 외래 키 제약은 없다. 현재 원본이 없어져도 전송 이력을 보존한다. `scan_files.id`와 `media.id`도 DB 외래 키가 아니라 앱이 이동 과정에서 이어 사용하는 ID다.
@@ -24,7 +25,7 @@ erDiagram
 | 필드 | 내용 |
 | --- | --- |
 | `id` | 정수 기본 키 |
-| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `reset-all` |
+| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `reset-all` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
@@ -79,7 +80,9 @@ erDiagram
 | XMP | `xmp_path`, `xmp_sha`, `xmp_metadata` JSON |
 | 분류 | `event_id` 외래 키, `confirmed` 기본 0 |
 
-`media_by_hash(sha, status)` 인덱스는 중복 후보 조회에 사용한다. SHA 자체에는 유일 제약이 없으므로 같은 바이트의 여러 물리 원본을 기록할 수 있다. 상태는 이동 중 `moving`, 이용 가능 `available`, 누락·접근 불가 `missing`을 사용한다.
+`media_by_hash(sha, status)`와 `media_by_event(event_id, status)` 인덱스를 사용한다. SHA 자체에는 유일 제약이 없으므로 같은 바이트의 여러 물리 원본을 기록할 수 있다. 상태는 이동 중 `moving`, 로컬 보관 `available`, 로컬 비우기 중 `offloading`, 원격 아카이브 보관(로컬 원본 비움) `archived`, 누락·접근 불가 `missing`을 사용한다.
+
+`archived` 상태의 행은 로컬 `managed`에서 원본과 연결 XMP를 안전하게 비운 뒤에도 이벤트 배정, 메타데이터, XMP 메타데이터와 썸네일을 유지한다. 이벤트 관리 화면과 파일 기록에서 계속 조회·검색할 수 있으며, 아카이브 전송의 Source 업로드 대상에서는 제외한다.
 
 사용자 보정은 자동 분석 값과 분리해서 저장한다. 같은 경로에서 같은 해시 파일을 재분석할 때 이벤트·확정 상태·사용자 보정을 보존한다. 같은 경로의 내용이 다른 해시로 바뀌면 새 콘텐츠로 취급하고 해당 분류·보정과 원래 위치·XMP 연결을 초기화한다. 장비를 수정하거나 다른 이벤트로 배정하면 다시 확정해야 한다.
 
@@ -94,7 +97,14 @@ erDiagram
 | `outcome` | `uploaded`, `skipped`, `failed` |
 | `verified_at`, `recorded_at`, `error` | 검증 시각, 기록 시각, 오류 |
 
-`archive_by_hash(sha, outcome)` 인덱스가 있다. 부분 실패한 업로드도 성공한 파일의 이력을 별도로 유지한다. `verified_at`은 성공·동일 파일 건너뜀 시 기록하고 실패는 검증 완료로 표시하지 않는다. `archive_root`는 `config['root']`를 그대로 저장하며, SFTP 정규화 결과는 전송 경로 계산에만 사용한다.
+`archive_by_hash(sha, outcome)`와 `archive_by_media(media_id, asset_kind, sha, outcome)` 인덱스가 있다. 부분 실패한 업로드도 성공한 파일의 이력을 별도로 유지한다. `verified_at`은 성공·동일 파일 건너뜀 시 기록하고 실패는 검증 완료로 표시하지 않는다. `archive_root`는 `config['root']`를 그대로 저장하며, SFTP 정규화 결과는 전송 경로 계산에만 사용한다.
+
+### `storages`와 `remote_files`: 안정적 스토리지와 현재 원격 상태
+
+- `storages`는 IP·SSH 키 변경과 무관한 저장소 UUID(`/settings/storage-id`)와 최근 `root_hint`, 생성·확인 시각을 보관한다.
+- `remote_files`는 `(storage_id, path)`를 기본 키로 하여 원격 스토리지의 현재 파일 스냅샷(`archive_root`, `sha`, `size`, `mtime_ns`, `status`, `first_seen_at`, `verified_at`, `last_seen_at`)을 보관하며 `remote_files_by_sha(sha, status)` 인덱스를 둔다.
+- 업로드(`uploaded`·`skipped`) 성공 시 `remote_files`를 `present` 상태로 자동 갱신한다. Safe Offload(`offload`) 실행 중 원격 파일이 사라졌거나 크기가 다른 것으로 확인되면 해당 행을 `missing`으로 갱신하고 로컬 원본을 삭제하지 않는다.
+- 기존 `archive_entries`만 있는 카탈로그를 업그레이드하거나 구버전 백업을 복원하면 검증 완료 이력에서 `storages`와 `remote_files`를 자동 백필한다.
 
 ### `device_names`: 촬영도구 이름 규칙
 
@@ -119,10 +129,10 @@ erDiagram
 
 앱은 시작 시 테이블·인덱스를 생성하고 과거 카탈로그에 `scan_files.thumbnail`, `scan_files.companions`, `media.user_time_source`, 원래 경로·XMP 관련 필드가 없으면 추가한다. 별도 마이그레이션 도구나 스키마 버전 테이블은 없다.
 
-백업·복원은 [settings.py](../backend/settings.py)의 SQLite Backup API와 테이블 복사 로직을 사용한다. 복원 시 스키마·JSON·외래 키 무결성을 확인하고, 오래된 백업의 일부 누락 열과 `scan_xmp`·`archive_entries` 테이블 부재를 허용한다. 현재 활성 작업이 있으면 백업·복원을 거부한다. 복원된 활성 작업은 실패로 종료하고 `moving` 원본은 `missing`, `deleting` 검사 파일은 `review`로 전환한다.
+백업·복원은 [settings.py](../backend/settings.py)의 SQLite Backup API와 테이블 복사 로직을 사용한다. 복원 시 스키마·JSON·외래 키 무결성을 확인하고, 오래된 백업의 일부 누락 열과 `scan_xmp`·`archive_entries`·`device_names`·`storages`·`remote_files` 테이블 부재를 허용한다. 현재 활성 작업이 있으면 백업·복원을 거부한다. 복원된 활성 작업은 실패로 종료하고 `moving` 원본은 `missing`, `offloading` 원본은 `available`, `deleting` 검사 파일은 `review`로 전환하며 구버전 백업에서 `remote_files`를 자동 백필한다.
 
 ## 사용자 데이터 초기화
 
-`POST /api/settings/catalog/reset`은 `모든 데이터 삭제` 확인 문구로 `reset-all` 작업 하나를 등록한다. 다른 활성 작업이 있으면 거부한다. 워커는 managed·썸네일과 카탈로그 볼륨의 임시 파일을 비운 뒤 `clear_catalog()`로 7개 테이블의 모든 행을 한 트랜잭션에서 삭제한다. 이번 작업의 행도 삭제하므로 성공 후 작업 이력은 0개다. 파일 이동 계획이나 별도 완료 기록은 남기지 않는다.
+`POST /api/settings/catalog/reset`은 `모든 데이터 삭제` 확인 문구로 `reset-all` 작업 하나를 등록한다. 다른 활성 작업이 있으면 거부한다. 워커는 managed·썸네일과 카탈로그 볼륨의 임시 파일을 비운 뒤 `clear_catalog()`로 9개 테이블의 모든 행을 한 트랜잭션에서 삭제한다. 이번 작업의 행도 삭제하므로 성공 후 작업 이력은 0개다. 파일 이동 계획이나 별도 완료 기록은 남기지 않는다.
 
 SQLite 본체·WAL·SHM·카탈로그 및 워커 잠금 파일은 실행을 위해 유지한다. 사용자 레코드는 모두 비워진다. incoming 디렉터리와 그 내용, SSH 설정 볼륨·원격 아카이브는 유지한다. 파일 삭제는 트랜잭션 롤백 대상이 아니며 실패 시 이미 삭제한 파일은 복원되지 않는다. 실패 이력은 재실행을 위해 남고, 다음 성공 시 함께 지워진다. 중단된 running 작업은 재시작 때 다시 실행해 남은 파일을 삭제한다.

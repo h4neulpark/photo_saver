@@ -16,11 +16,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from catalog import DEFAULT_ZONE, PHOTOS, database, initialize, load_latest_scan, now, queue_job
+from catalog import DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
 from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
-from settings import router as settings_router
-from archive import router as archive_router
+from settings import ensure_storage_id, router as settings_router
+from archive import active_storage_scope, router as archive_router
 from transfers import TransferRequest, queue_transfer
+from offload import OffloadRequest, queue_offload
 from records import router as records_router
 from devices import router as devices_router, device_names, effective_device, device_sql, device_folder
 
@@ -29,6 +30,9 @@ from devices import router as devices_router, device_names, effective_device, de
 async def lifespan(_app):
     ZoneInfo(DEFAULT_ZONE)
     initialize()
+    storage_id = ensure_storage_id()
+    with database(write=True) as db:
+        backfill_remote_files(db, storage_id)
     yield
 
 
@@ -179,7 +183,18 @@ def capture_for_event(row, metadata, xmp):
     return row["capture_time"], row["time_source"], bool(row["time_verified"]), None
 
 
-def view_media(row, periods, names=None):
+def remote_copies_by_sha(db):
+    copies = {}
+    for row in db.execute(
+        """SELECT storage_id, path, archive_root, sha, size, verified_at, last_seen_at
+           FROM remote_files WHERE status='present' AND sha IS NOT NULL
+           ORDER BY coalesce(verified_at, last_seen_at) DESC, path"""
+    ):
+        copies.setdefault(row["sha"], []).append(dict(row))
+    return copies
+
+
+def view_media(row, periods, names=None, remote_index=None, active_scope=(None, None)):
     device = effective_device(row, names or {})
     metadata = json.loads(row["metadata"])
     xmp = json.loads(row["xmp_metadata"] or "{}")
@@ -189,8 +204,17 @@ def view_media(row, periods, names=None):
             review_reason = review_reason or "촬영 시각 확인 필요"
         elif len(matching_events(stamp, periods)) > 1:
             review_reason = "이벤트 기간 중복"
+    remote_index = remote_index or {}
+    active_storage_id, active_root = active_scope
+    all_copies = remote_index.get(row["sha"], [])
+    active_copies = [item for item in all_copies if active_root and item["archive_root"] == active_root]
+    active_copies.sort(key=lambda item: (item["storage_id"] != active_storage_id,))
+    xmp_copies = remote_index.get(row["xmp_sha"], []) if row["xmp_sha"] else []
+    xmp_active = [item for item in xmp_copies if active_root and item["archive_root"] == active_root]
+    xmp_archived = True if not row["xmp_path"] else bool(xmp_active)
     return {
         "id": row["id"], "name": row["name"], "path": row["path"], "kind": row["kind"],
+        "status": row["status"],
         "size": display_size(row["size"]), "device": device, "deviceFolder": device_folder(device),
         "time": stamp, "timeVerified": verified, "reviewReason": review_reason,
         "timeSource": source,
@@ -200,6 +224,11 @@ def view_media(row, periods, names=None):
             "modified": modified_time_from_fingerprint(row["fingerprint"]),
         },
         "eventId": row["event_id"], "confirmed": bool(row["confirmed"]),
+        "archived": bool(all_copies),
+        "canDownload": bool(active_copies),
+        "canOffload": row["status"] == "available" and bool(active_copies) and xmp_archived,
+        "xmpArchived": xmp_archived,
+        "remotePaths": [item["path"] for item in active_copies],
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
         "analysisError": metadata.get("error"),
         "xmp": {**xmp, "name": PurePosixPath(row["xmp_path"]).name} if row["xmp_path"] else None,
@@ -316,12 +345,14 @@ def state():
             (scan["id"],),
         ).fetchall() if scan else []
         managed = db.execute(
-            "SELECT * FROM media WHERE status='available' ORDER BY coalesce(user_time, capture_time), name"
+            "SELECT * FROM media WHERE status IN ('available', 'archived') ORDER BY coalesce(user_time, capture_time), name"
         ).fetchall()
-        available = {row["id"]: row for row in managed}
+        available = {row["id"]: row for row in managed if row["status"] == "available"}
         pending = db.execute("SELECT * FROM scan_xmp WHERE scan_id=? AND status<>'linked' ORDER BY id", (scan["id"],)).fetchall() if scan else []
         names = device_names(db)
-        media = [view_media(row, periods, names) for row in managed]
+        remote_index = remote_copies_by_sha(db)
+        active_scope = active_storage_scope()
+        media = [view_media(row, periods, names, remote_index, active_scope) for row in managed]
         media.sort(key=lambda item: (item["time"] or "", item["name"]))
         return {
             "timezone": DEFAULT_ZONE,
@@ -374,6 +405,12 @@ def delete_photos(selection: Selection):
     return queue_incoming_selection(selection, "delete")
 
 
+@app.post("/api/jobs/offload", status_code=202)
+def offload_files(request: OffloadRequest):
+    with database(write=True) as db:
+        return queue_offload(db, request)
+
+
 @app.post("/api/jobs/xmp-link", status_code=202)
 def link_xmp(selection: XmpSelection):
     links = selection.links
@@ -422,10 +459,11 @@ def get_event(db, event_id):
     return event
 
 
-def get_selection(db, ids):
+def get_selection(db, ids, *, statuses=("available", "archived")):
+    placeholders = ",".join("?" for _ in statuses)
     selection = []
     for file_id in dict.fromkeys(ids):
-        row = db.execute("SELECT * FROM media WHERE id=? AND status='available'", (file_id,)).fetchone()
+        row = db.execute(f"SELECT * FROM media WHERE id=? AND status IN ({placeholders})", (file_id, *statuses)).fetchone()
         if row is None:
             error(409, "선택한 파일이 목록에 없습니다. 화면을 새로 고침하세요.")
         selection.append(row)
@@ -449,7 +487,7 @@ def matching_events(stamp, periods):
 def collect(db, event):
     periods = root_periods(db.execute("SELECT * FROM events WHERE parent_id IS NULL"))
     collected, uncertain, overlapping = [], 0, 0
-    for row in db.execute("SELECT * FROM media WHERE event_id IS NULL AND status='available'"):
+    for row in db.execute("SELECT * FROM media WHERE event_id IS NULL AND status IN ('available', 'archived')"):
         stamp, _, verified, _ = capture_for_event(row, json.loads(row["metadata"]), json.loads(row["xmp_metadata"] or "{}"))
         if not stamp or not verified:
             uncertain += 1
@@ -490,7 +528,7 @@ def check_event_device_folder(db, parent_id, folder):
         return
     devices = db.execute(
         f"""SELECT DISTINCT {device_sql()} FROM media m
-           WHERE event_id=? AND confirmed=1 AND status='available'""", (parent_id,)
+           WHERE event_id=? AND confirmed=1 AND status IN ('available', 'archived')""", (parent_id,)
     )
     if any(path_key(device_folder(row[0])) == path_key(folder) for row in devices):
         error(409, "이미 사용 중인 장비 폴더와 같은 이름입니다.")
@@ -629,7 +667,7 @@ def edit_media(request: MediaEdit):
 @app.post("/api/placements/confirm")
 def confirm_placements(selection: Selection):
     with database(write=True) as db:
-        rows = get_selection(db, selection.ids)
+        rows = get_selection(db, selection.ids, statuses=("available",))
         names = device_names(db)
         for row in rows:
             if not row["event_id"]:

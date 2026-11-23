@@ -2,7 +2,9 @@ import json
 import sqlite3
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import archive
 import catalog
 import records
 import settings
@@ -142,6 +144,21 @@ class CatalogRecordsTests(unittest.TestCase):
             connection.close()
         settings.restore_catalog_file(backup)
         self.assertEqual(self.query('archives')['rows'][0]['outcome'], 'legacy_verified')
+
+    def test_archived_status_and_download_flags(self):
+        job = self.fixture.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}])
+        self.fixture.run_job(job)
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE media SET status='archived' WHERE id='one'")
+        with patch.object(archive, 'archive_config', return_value=self.fixture.config):
+            files = self.query(view='files')
+            archives = self.query(view='archives')
+        self.assertTrue(all(row['status'] == 'archived' and row['can_download'] and row['download_path'] for row in files['rows']))
+        self.assertTrue(all(row['can_download'] for row in archives['rows']))
+        mismatch = {**self.fixture.config, 'root': '/other/root'}
+        with patch.object(archive, 'archive_config', return_value=mismatch):
+            self.assertFalse(any(row['can_download'] for row in self.query(view='files')['rows']))
+            self.assertFalse(any(row['can_download'] for row in self.query(view='archives')['rows']))
 
 
 if __name__ == '__main__':

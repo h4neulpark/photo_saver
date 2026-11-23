@@ -32,6 +32,7 @@ class CatalogResetTests(unittest.TestCase):
         (self.settings_dir / 'ssh').mkdir(parents=True)
         (self.settings_dir / 'address').write_text('192.0.2.10')
         (self.settings_dir / 'remote-root').write_text('/archive')
+        (self.settings_dir / 'storage-id').write_text('11112222333344445555666677778888')
         (self.settings_dir / 'ssh' / 'id_ed25519').write_bytes(b'test private key')
         (self.settings_dir / 'ssh' / 'id_ed25519.pub').write_bytes(b'test public key')
         (self.settings_dir / 'ssh' / 'public_key_copied').touch()
@@ -116,7 +117,7 @@ class CatalogResetTests(unittest.TestCase):
             self.assertIsNotNone(catalog.queue_job(db, 'scan', {}))
 
     def test_blocks_all_active_jobs_without_changing_data(self):
-        for kind in ('scan', 'move', 'delete', 'xmp-link', 'upload', 'reset-all'):
+        for kind in ('scan', 'move', 'delete', 'xmp-link', 'upload', 'offload', 'reset-all'):
             for status in ('queued', 'running'):
                 with self.subTest(kind=kind, status=status):
                     with catalog.database(write=True) as db:

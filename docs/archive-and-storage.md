@@ -10,12 +10,13 @@
 4. **접속 테스트**에서 처음 접속하는 IP의 호스트 키 지문을 확인한다. 서버에서 확인한 지문과 비교한 뒤 승인하면 호스트 키를 저장하고 공개키 인증을 테스트한다. 승인 요청은 5분 후 만료된다.
 5. **아카이브 전송 → 아카이브 연결**에서 저장 경로의 SFTP 목록을 확인한다. SSH 인증 테스트와 SFTP 접근·쓰기 권한 확인은 별개다.
 
-설정 조회는 계정명과 공개키를 `***`로 반환하고 구성 여부를 별도 필드로 제공한다. SSH 테스트는 OpenSSH 명령을, 탐색과 업로드는 Paramiko를 사용한다. 두 경로 모두 앱 전용 개인키와 저장한 호스트 키를 사용하며 SSH agent와 비밀번호 인증을 사용하지 않는다. 저장한 호스트 키가 바뀌면 연결을 거절한다. 변경된 호스트 키를 화면에서 교체하는 기능은 없다.
+설정 조회는 계정명과 공개키를 `***`로 반환하고 구성 여부와 현재 IP의 호스트 키 신뢰 여부(`hostKeyTrusted`)를 별도 필드로 제공한다. SSH 테스트는 OpenSSH 명령을, 탐색·다운로드·업로드·오프로드는 Paramiko를 사용한다. 두 경로 모두 앱 전용 개인키와 저장한 호스트 키를 사용하며 SSH agent와 비밀번호 인증을 사용하지 않는다. 저장한 호스트 키가 바뀌면 연결을 거절하며, 설정의 **호스트 키 초기화**(`DELETE /api/settings/ssh-host-key`)로 기존 키를 지운 뒤 접속 테스트로 다시 신뢰할 수 있다.
 
 | 컨테이너 경로 | 내용 |
 | --- | --- |
 | `/settings/address` | 원격 IP |
 | `/settings/remote-root` | 원격 저장 절대경로 |
+| `/settings/storage-id` | IP·SSH 키 변경과 무관한 안정적 스토리지 UUID (API 기동 시 1회 생성) |
 | `/settings/ssh/id_ed25519` | 앱 전용 개인키 |
 | `/settings/ssh/id_ed25519.pub` | 공개키 |
 | `/settings/ssh/public_key_copied` | 공개키 복사 완료 표시 |
@@ -57,9 +58,9 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 
 한 요청은 최대 10,000개 항목이다. 예약하면 목적지, 로컬 경로, SHA-256, 원본 fingerprint를 작업 payload에 고정한다. 설정 원문 대신 연결 버전 해시를 저장하며, 실행 전에 설정이 달라졌으면 실패한다. 이후 이벤트 이름이나 배치를 바꿔도 이미 예약한 목적지는 유지된다.
 
-현재 작업 큐는 검사·이동·사진 삭제·XMP 연결·업로드를 통틀어 `queued` 또는 `running` 작업 하나만 허용한다. 업로드가 진행되는 동안 새 파일 작업을 예약할 수 없다.
+현재 작업 큐는 검사·이동·사진 삭제·XMP 연결·업로드·로컬 비우기를 통틀어 `queued` 또는 `running` 작업 하나만 허용한다. 업로드·오프로드가 진행되는 동안 새 파일 작업을 예약할 수 없다.
 
-## 4. SFTP 전송과 검증
+## 4. SFTP 전송·검증·다운로드·로컬 원본 비우기
 
 워커는 예약한 항목을 순서대로 처리한다.
 
@@ -68,7 +69,21 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 3. 목적지에 같은 이름의 일반 파일이 있으면 크기와 SHA-256을 확인한다. 원격 파일과 로컬 원본이 모두 예약된 해시와 같으면 `skipped`로 기록한다. 내용이 다르거나 일반 파일이 아니면 덮어쓰지 않고 실패한다.
 4. 새 파일은 같은 디렉터리의 `.photo-saver-<작업 토큰>-<항목 번호>.part`에 배타적으로 생성한다. 같은 작업의 이전 임시 파일만 제거하고 처음부터 다시 쓴다.
 5. 1 MiB 단위로 전송하면서 로컬 SHA-256과 크기를 검증하고 전송 후 fingerprint를 재확인한다.
-6. 임시 파일 전체를 SFTP로 다시 읽어 SHA-256을 계산한다. 검증이 성공한 뒤 덮어쓰지 않는 SFTP `rename`으로 최종 이름을 게시하고 `uploaded`로 기록한다.
+6. 임시 파일 전체를 SFTP로 다시 읽어 SHA-256을 계산한다. 검증이 성공한 뒤 덮어쓰지 않는 SFTP `rename`으로 최종 이름을 게시하고 `uploaded`로 기록한다. 성공(`uploaded`·`skipped`) 시 `storages`와 `remote_files` 스냅샷도 함께 갱신한다.
+7. 전송 도중 SFTP 채널이 끊기거나 통신 수준 오류가 발생하면 남은 파일마다 실패 행을 반복 기록하지 않고 즉시 작업을 `failed`로 종료한다.
+
+### 단일 파일 SFTP 다운로드
+
+- `GET /api/archive/download`는 `path`(현재 저장 절대경로 기준 상대경로) 또는 `media_id`(+`kind=media|xmp`)로 원격 정규 파일을 스트리밍 다운로드한다.
+- 모든 상위 디렉터리와 대상 파일에 `lstat`을 수행해 심볼릭 링크, 디렉터리, 루트 이탈 경로를 차단한다. `media_id` 조회 시 현재 설정된 `archive_root`와 다른 경로에만 보관된 파일은 409로 거부한다.
+- RFC 5987 UTF-8 `Content-Disposition`, `Content-Length`, `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`를 설정하며, Destination 탐색기·이벤트 관리·파일 기록에서 바로 내려받을 수 있다.
+
+### 로컬 원본 비우기 (Safe Offload)
+
+- `POST /api/jobs/offload`는 현재 활성 저장 루트의 `remote_files(status='present')`에 검증된 사본이 있는 `available` 파일만 받는다. 연결된 XMP가 있는 파일은 XMP도 함께 아카이브에 검증·보관되어 있어야 한다.
+- 워커는 삭제 직전 원격 SFTP에 연결해 상위 경로와 대상 파일의 `lstat`(정규 파일·크기 일치, 심볼릭 링크 거부)을 실시간으로 확인하고, 로컬 파일의 fingerprint와 SHA-256을 재검증한 뒤에만 로컬 원본(및 XMP)과 빈 `managed/<ID>` 디렉터리를 삭제한다.
+- 원격에서 파일이 사라졌거나 크기가 다르면 해당 `remote_files` 행을 `missing`으로 갱신하고 로컬 원본은 삭제하지 않는다.
+- 비우기가 끝나면 `media.status='archived'`로 전환하며 썸네일, 메타데이터, XMP 메타데이터와 이벤트 배정은 유지한다. 중단 후 재시작 시 `offloading` 상태에서 멱등 복구한다.
 
 해시 검증은 원격 셸에서 실행하지 않고 SFTP 읽기로 수행한다. 업로드 후 전체 파일을 다시 내려 읽으므로 검증에도 네트워크 트래픽이 발생한다. 전송 중 목적지 파일이 새로 생기면 최종 이름 변경이 실패하며 기존 파일을 보존한다.
 
@@ -137,7 +152,7 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 
 ## 관련 코드와 테스트
 
-- [원격 탐색·연결](../backend/archive.py), [SFTP 전송·이력 저장](../backend/transfers.py)
+- [원격 탐색·연결·다운로드](../backend/archive.py), [SFTP 전송·이력 저장](../backend/transfers.py), [안전 로컬 비우기](../backend/offload.py)
 - [설정·SSH 테스트·백업·복원](../backend/settings.py), [파일 기록 조회](../backend/records.py)
 - [워커 재시작 처리](../backend/worker.py), [큐 제약과 스키마](../backend/catalog.py)
-- [탐색 테스트](../backend/test_archive.py), [전송 테스트](../backend/test_transfers.py), [파일 기록·백업 호환 테스트](../backend/test_records.py)
+- [탐색·다운로드 테스트](../backend/test_archive.py), [전송 테스트](../backend/test_transfers.py), [로컬 비우기·모델 테스트](../backend/test_offload.py), [파일 기록·백업 호환 테스트](../backend/test_records.py)

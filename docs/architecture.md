@@ -57,7 +57,7 @@ SSH 설정·접속 테스트와 Destination 폴더 조회는 **API 프로세스*
 
 ## 작업과 DB 동시성
 
-지원 작업은 `scan`, `move`, `delete`, `xmp-link`, `upload`, `reset-all`다. `jobs`의 부분 유일 인덱스 `one_active_job`과 등록 함수가 전체 작업 중 `queued` 또는 `running`인 작업을 **하나만** 허용한다. 워커는 하나의 루프에서 작업을 순차 실행하며, 작업이 없으면 0.4초 간격으로 확인한다.
+지원 작업은 `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `reset-all`다. `jobs`의 부분 유일 인덱스 `one_active_job`과 등록 함수가 전체 작업 중 `queued` 또는 `running`인 작업을 **하나만** 허용한다. 워커는 하나의 루프에서 작업을 순차 실행하며, 작업이 없으면 0.4초 간격으로 확인한다.
 
 워커 프로세스는 `/data/worker.lock`에 비차단 배타 잠금을 건다. 재시작 시 `running` 작업을 `queued`로 돌리고 해당 처리기를 다시 실행한다. 파일별 처리 결과와 실제 로컬·원격 파일 상태를 다시 확인하는 방식이며 작업 임대, 자동 네트워크 재시도, 병렬 분석·전송은 구현하지 않았다.
 
@@ -74,8 +74,9 @@ SQLite는 WAL, 외래 키 검사, 10초 연결 대기 시간을 사용한다. �
 | [worker.py](../backend/worker.py) | 라이브러리 검증, 검사·이동·삭제·XMP 처리, 단일 작업 루프 |
 | [media.py](../backend/media.py) | 안전한 파일 접근·해시·이동, 사진·영상 분석, 썸네일 |
 | [companions.py](../backend/companions.py) | XMP 파싱과 원본 후보 매칭 |
-| [archive.py](../backend/archive.py) | 연결 설정 식별자, Paramiko 연결, 루트 제한 폴더 조회 |
-| [transfers.py](../backend/transfers.py) | 전송 입력 확정, SFTP 전송·검증·취소, 파일별 이력 |
+| [archive.py](../backend/archive.py) | 연결 설정 식별자, 안정적 스토리지 ID 해석, Paramiko 연결, 루트 제한 폴더 조회와 단일 파일 SFTP 다운로드 |
+| [transfers.py](../backend/transfers.py) | 전송 입력 확정, SFTP 전송·검증·취소, 파일별 이력과 `remote_files` 갱신 |
+| [offload.py](../backend/offload.py) | 실시간 SFTP 확인 기반 로컬 원본·XMP 안전 비우기(`archived` 전환)와 중단 재개 |
 | [settings.py](../backend/settings.py) | 저장소 주소·루트, SSH 키·호스트 신뢰, DB 백업·복원 |
 | [records.py](../backend/records.py) | 로컬 파일과 업로드 이력의 읽기 전용 검색·집계 |
 

@@ -15,6 +15,7 @@ from media import (
     preview_thumbnail, relative_parts, scan_tree, thumbnail_path,
 )
 from transfers import upload_selection
+from offload import offload_selection
 from resets import reset_local_data
 
 log = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ def index_managed(managed):
     for path, info in scan_tree(managed):
         seen.add(path)
         old = existing.get(path)
-        if old and old["status"] == "moving":
+        if old and old["status"] in {"moving", "offloading"}:
             continue
         try:
             if info is None:
@@ -447,7 +448,7 @@ def refresh_deleted_group(managed, sha):
         ).fetchall()
         references = db.execute(
             """SELECT 1 FROM scan_files WHERE sha=? AND thumbnail IS NOT NULL AND status NOT IN ('moved','deleted')
-               UNION ALL SELECT 1 FROM media WHERE sha=? AND thumbnail IS NOT NULL AND status='available'
+               UNION ALL SELECT 1 FROM media WHERE sha=? AND thumbnail IS NOT NULL AND status IN ('available','archived')
                LIMIT 1""", (sha, sha)
         ).fetchone()
 
@@ -505,7 +506,11 @@ def run():
             db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
 
         log.info("수집 워커 시작 · %s → %s", incoming, managed)
-        handlers = {"scan": scan_incoming, "move": import_selection, "delete": delete_selection, "xmp-link": link_xmp_selection, "upload": upload_selection, "reset-all": reset_local_data}
+        handlers = {
+            "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
+            "xmp-link": link_xmp_selection, "upload": upload_selection,
+            "offload": offload_selection, "reset-all": reset_local_data,
+        }
         while True:
             with database(write=True) as db:
                 job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()

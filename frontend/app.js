@@ -68,7 +68,7 @@ const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: nul
 const view = {
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), preview: null,
-  incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventDevice: '', eventDate: '',
+  incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   sshTestBusy: false, sshTestResult: null,
@@ -118,6 +118,7 @@ function jobMessage(job) {
   if (job.status === 'cancelled') return job.result.error || '작업을 중지했습니다.';
   if (job.status === 'failed') return job.result.error;
   if (job.kind === 'upload') return `업로드 ${job.result.uploaded}개 완료 · 동일 파일 ${job.result.skipped}개 건너뜀`;
+  if (job.kind === 'offload') return `로컬 원본 ${job.result.offloaded || 0}개를 비웠습니다.${job.result.failed ? ` 실패 ${job.result.failed}개.` : ''}`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
   if (job.kind === 'xmp-link') return `XMP ${job.result.linked}개를 연결했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
@@ -346,8 +347,12 @@ function incomingPage() {
   const active = jobActive();
   const failed = state.job?.status === 'failed';
   const scanning = active && state.job.kind === 'scan';
-  const jobLabels = { scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중', 'xmp-link': 'XMP 연결 중', 'reset-all': '서버 데이터 초기화 중' };
-  const status = active ? jobLabels[state.job.kind] :
+  const jobLabels = {
+    scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중',
+    'xmp-link': 'XMP 연결 중', upload: '아카이브 업로드 중', offload: '로컬 원본 비우기 중',
+    'reset-all': '서버 데이터 초기화 중',
+  };
+  const status = active ? (jobLabels[state.job.kind] || '작업 진행 중') :
     failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
   const detail = failed ? state.job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
     state.scan ? `${dateTimeFormatter(state.timezone).format(new Date(state.scan.finishedAt))} · ${state.scan.result.checked}개 검사` : '새로 고침을 눌러 검사를 시작하세요.';
@@ -427,27 +432,57 @@ function eventDateForFile(file) {
 
 function filteredEventFiles(files) {
   const query = view.eventQuery.trim().toLocaleLowerCase();
-  return files.filter(file => (!view.eventDevice || (view.eventDevice === 'missing' ? !file.device : `device:${file.device}` === view.eventDevice)) &&
+  return files.filter(file =>
+    (!view.eventStorage || file.status === view.eventStorage) &&
+    (!view.eventDevice || (view.eventDevice === 'missing' ? !file.device : `device:${file.device}` === view.eventDevice)) &&
     (!view.eventDate || eventDateForFile(file) === view.eventDate) &&
-    (!query || file.name.toLocaleLowerCase().includes(query) || file.device?.toLocaleLowerCase().includes(query) || matchesXmp(file, query)));
+    (!query || file.name.toLocaleLowerCase().includes(query) || file.device?.toLocaleLowerCase().includes(query) || matchesXmp(file, query))
+  );
+}
+
+function offloadStatus() {
+  const job = state.job;
+  if (job?.kind !== 'offload') return '';
+  const result = job.result || {};
+  const active = jobActive(job);
+  const percent = Math.min(100, Math.round((result.completedFiles || 0) / (result.totalFiles || 1) * 100));
+  return `<section class="surface upload-status" aria-label="로컬 원본 비우기 상태">
+    <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '로컬 원본 비우기 대기 중' : result.phase || '로컬 원본 비우기 중' : job.status === 'done' ? '로컬 원본 비우기 완료' : '로컬 원본 비우기 실패'}</strong>
+      <span class="small muted">${result.completedFiles || 0} / ${result.totalFiles || 0}개 처리 · 완료 ${result.offloaded || 0}개 · 실패 ${result.failed || 0}개${result.freedBytes ? ` · 확보 ${sizeLabel(result.freedBytes / 1_000_000)}` : ''}</span></div>
+    ${active ? `<progress max="100" value="${percent}" aria-label="로컬 원본 비우기 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '원격 아카이브를 확인하고 있습니다.')}</p>` : ''}
+    ${result.error ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
+    ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
+  </section>`;
+}
+
+function eventFileStatus(file) {
+  if (file.status === 'archived') {
+    return `${badge('archived', '아카이브 보관')}${file.reviewReason ? `<div class="file-reason small muted">${escapeHtml(file.reviewReason)}</div>` : ''}`;
+  }
+  const primary = file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
+    badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정');
+  return `${primary}${file.archived ? '<div class="file-reason small muted">아카이브 사본 있음</div>' : ''}`;
 }
 
 function eventPage() {
   const event = eventById(view.eventId);
   const files = footageForEvent(view.eventId);
   const filtered = filteredEventFiles(files);
-  const filtersActive = view.eventDevice || view.eventDate || view.eventQuery.trim();
+  const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
   const dates = [...new Set(files.map(eventDateForFile).filter(Boolean))].sort();
   const parent = event?.parent ? eventById(event.parent) : event;
   const footageDate = dateTimeFormatter(parent?.zone || state.timezone);
   const destinations = eventDestinations(event);
   const devices = [...new Set(files.map(file => file.device).filter(Boolean))];
   const selected = view.eventSelection.size;
+  const offloadable = filtered.filter(file => view.eventSelection.has(file.id) && file.canOffload);
+  const offloadLabel = offloadable.length && offloadable.length !== selected ? `아카이브 검증 ${offloadable.length}개 로컬 비우기` : '로컬 원본 비우기';
   const confirmButton = event ? button('confirm-event', '선택 배치 확정', {
-    glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && !file.confirmed),
+    glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed),
   }) : '';
   return `${header('이벤트 관리', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
     button('new-event', '이벤트 생성', { glyph: 'plus', primary: true }))}
+    ${offloadStatus()}
     <div class="event-split">
       <section class="surface" aria-label="이벤트 목록">
         <div class="surface-head"><h2>이벤트</h2></div>
@@ -474,6 +509,11 @@ function eventPage() {
         </div>
         <div class="event-tools">
           <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색" value="${escapeHtml(view.eventQuery)}"></label>
+          <select id="event-storage" aria-label="보관 위치 필터">
+            <option value="">모든 위치</option>
+            <option value="available" ${view.eventStorage === 'available' ? 'selected' : ''}>로컬 보유</option>
+            <option value="archived" ${view.eventStorage === 'archived' ? 'selected' : ''}>아카이브 보관</option>
+          </select>
           <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>
             <option value="missing" ${view.eventDevice === 'missing' ? 'selected' : ''}>장비 확인 필요</option>${devices.map(device =>
             `<option value="device:${escapeHtml(device)}" ${view.eventDevice === `device:${device}` ? 'selected' : ''}>${escapeHtml(device)}</option>`).join('')}</select>
@@ -487,20 +527,20 @@ function eventPage() {
             <th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">배치 상태</th></tr></thead>
           <tbody>${filtered.map(file => `<tr class="${view.eventSelection.has(file.id) ? 'selected' : ''}">
             <td>${checkbox('event', file.id, `${file.name} 선택`, view.eventSelection)}</td>
-            <td>${fileCell(file, file.device || '장비 확인 필요')}${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}</td>
+            <td>${fileCell(file, file.device || '장비 확인 필요')}${(file.xmp || file.canDownload) ? `<div class="file-links">${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}${file.canDownload ? `<a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a>` : ''}</div>` : ''}</td>
             <td class="numbers muted">${file.time ? footageDate.format(new Date(file.time)) : '—'}
               ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
               ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
               ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정">촬영 시각 지정</button>` : ''}</td>
-            <td>${file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
-              badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정')}</td>
+            <td>${eventFileStatus(file)}</td>
           </tr>`).join('')}</tbody>
-        </table>` : emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
+        </table>` : emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
         <div class="action-bar">
           <div>
             ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트"><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>
             ${button('move-event', '이동', { disabled: true })}` : ''}
             ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
+            ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || jobActive() })}
           </div>
           ${confirmButton}
         </div>
@@ -517,7 +557,7 @@ function sourceFolders(file) {
 }
 
 function sourceFiles() {
-  return state.managed.filter(file => file.confirmed && eventById(file.eventId));
+  return state.managed.filter(file => file.status === 'available' && file.confirmed && eventById(file.eventId));
 }
 
 function sourceAssetKeys(file) {
@@ -594,10 +634,13 @@ function archiveDestination() {
     <div aria-busy="${view.archiveBusy}">
       ${view.archiveBusy ? emptyState('disk', '아카이브를 조회하고 있습니다.') : archive ?
         `<p class="archive-count small muted" role="status">조회 완료 · ${archive.entries.length}개 항목</p>` +
-        (archive.entries.length ? `<ul class="tree">${archive.entries.map((entry, index) => `<li class="tree-row">
-          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}" ${!jobActive() && !view.uploadStarting ? `data-archive-drop="${escapeHtml([view.archivePath, entry.name].filter(Boolean).join('/'))}"` : ''}>${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
-            `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>`}
-        </li>`).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
+        (archive.entries.length ? `<ul class="tree">${archive.entries.map((entry, index) => {
+          const entryPath = [view.archivePath, entry.name].filter(Boolean).join('/');
+          return `<li class="tree-row">
+          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}" ${!jobActive() && !view.uploadStarting ? `data-archive-drop="${escapeHtml(entryPath)}"` : ''}>${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
+            `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>${entry.kind === 'file' ? `<a class="button icon" href="/api/archive/download?path=${encodeURIComponent(entryPath)}" target="_blank" rel="noopener" aria-label="${escapeHtml(entry.name)} 다운로드" title="다운로드">${icon('download')}</a>` : ''}`}
+        </li>`;
+        }).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
         emptyState('disk', view.archiveError ? '파일 목록을 불러오지 못했습니다.' : '원격 아카이브에 연결하세요.',
           view.archiveError ? '다시 연결하거나 설정에서 SSH 연결 정보를 확인하세요.' : '설정에 저장된 SSH 연결 정보와 저장 절대경로를 사용합니다.')}
     </div>`;
@@ -707,7 +750,7 @@ function catalogPage() {
   const options = archives ? [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']] :
     [['all', '모든 파일'], ['managed', '보관 파일'], ['incoming', 'Incoming 기록'], ['xmp', 'XMP'], ['verified', '아카이브 검증 기록 있음']];
   const outcomes = { uploaded: '업로드 검증', skipped: '동일 파일 확인', legacy_verified: '과거 전송 완료', failed: '실패', pending: '진행 대기', unknown: '파일별 결과 미기록' };
-  const statuses = { available: '보관 중', missing: '파일 없음', moving: '이동 중', ready: '이동 대기', duplicate: '중복', review: '검토 필요', moved: '이동됨', deleted: '삭제됨', deleting: '삭제 중' };
+  const statuses = { available: '보관 중', archived: '아카이브 보관', offloading: '로컬 비우기 중', missing: '파일 없음', moving: '이동 중', ready: '이동 대기', duplicate: '중복', review: '검토 필요', moved: '이동됨', deleted: '삭제됨', deleting: '삭제 중' };
   return `${header('파일 기록', '카탈로그에 저장된 파일 해시와 아카이빙 검증 결과를 조회하세요.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
     <section class="surface" aria-label="파일 카탈로그">
       <div class="catalog-tabs" role="group" aria-label="기록 종류">
@@ -734,8 +777,8 @@ function catalogPage() {
           <td>${catalogHash(row)}</td>
           <td>${archives ? `<div class="catalog-path mono">${escapeHtml(row.archive_root ? [row.archive_root.replace(/\/$/, ''), row.target].join('/') : row.target || '목적지 미기록')}</div>${!row.archive_root ? '<div class="small muted">아카이브 루트 미기록</div>' : ''}` :
             `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted">${escapeHtml(row.kind === 'xmp' ? 'XMP' : row.device || '장비 미확인')} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>`}</td>
-          <td>${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
-            `<span class="status ${row.status === 'available' ? 'ready' : 'draft'}">${escapeHtml(statuses[row.status] || row.status)}</span>${row.location === 'managed' ? `<div class="small muted">${row.confirmed ? '배치 확정' : '배치 미확정'}</div>` : ''}${row.has_archive ? '<div class="small muted">아카이브 검증 기록 있음</div>' : ''}`}</td>
+          <td>${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.target)}" target="_blank" rel="noopener">다운로드</a>` : ''}${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
+            `<span class="status ${row.status === 'available' ? 'ready' : row.status === 'archived' ? 'archived' : 'draft'}">${escapeHtml(statuses[row.status] || row.status)}</span>${row.location === 'managed' && row.status !== 'archived' ? `<div class="small muted">${row.confirmed ? '배치 확정' : '배치 미확정'}</div>` : ''}${row.has_archive ? '<div class="small muted">아카이브 검증 기록 있음</div>' : ''}${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.download_path)}" target="_blank" rel="noopener">아카이브 다운로드</a>` : ''}`}</td>
         </tr>`).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : view.catalogEvent !== 'all' || view.catalogQuery || view.catalogScope !== 'all' ? '조건에 맞는 기록이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : 'Incoming Library에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
       </div>
       ${data && !view.catalogBusy && !view.catalogError ? `<div class="catalog-pagination"><span class="small muted" role="status">${data.total}개 기록 · ${data.page} / ${data.pages}페이지</span><div>
@@ -800,6 +843,12 @@ function settingsPage() {
         (settings?.keyGenerated ? button('copy-public-key', '공개키 복사', { glyph: 'copy', disabled: keyCopied || !view.publicKeyToCopy || view.sshTestBusy }) +
           button('regenerate-storage-key', '공개키 재생성', { glyph: 'key', disabled: view.sshTestBusy }) :
           button('generate-storage-key', '공개키 생성', { glyph: 'key', primary: true, disabled: !settings || view.sshTestBusy })))}
+      ${settingRow('서버 호스트 키', '저장된 SSH 호스트 키와 서버가 다를 때 초기화한 뒤 접속 테스트로 다시 신뢰할 수 있습니다.',
+        `<span class="small muted">${settings ? settings.hostKeyTrusted ? '신뢰됨' : '미등록' : '확인 중'}</span>` +
+        button('reset-host-key', '호스트 키 초기화', {
+          danger: true,
+          disabled: !settings?.hostKeyTrusted || view.sshTestBusy || (jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind)),
+        }))}
       ${settingRow('SSH 접속 테스트', view.sshTestResult ? `<span role="status" class="${view.sshTestResult.ok ? 'ssh-test-success' : 'form-error'}">${escapeHtml(view.sshTestResult.message)}</span>` :
         '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
         button('test-storage-ssh', view.sshTestBusy ? '테스트 중…' : '접속 테스트', { glyph: 'refresh', disabled: !settings || view.sshTestBusy }))}
@@ -813,8 +862,8 @@ function settingsPage() {
         view.devices.map((device, index) => `<form class="setting-row device-name-form" data-source="${escapeHtml(device.source)}">
           <div class="device-name-origin"><label for="device-name-${index}">${escapeHtml(device.source)}</label>
             <p class="small muted">기존 파일 ${device.count}개와 이후 파일에 적용</p></div>
-          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && ['upload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>
-            <button type="submit" class="button" ${jobActive() && ['upload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>이름 저장</button></div>
+          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>
+            <button type="submit" class="button" ${jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>이름 저장</button></div>
           <p class="form-error device-name-error" role="alert" hidden></p>
         </form>`).join('')}
     </section>
@@ -958,6 +1007,8 @@ async function testStorageSsh() {
           reportSshResult(true, 'SSH 공개키 인증에 성공했습니다.');
         } catch (error) {
           reportSshResult(false, error.message);
+        } finally {
+          view.settings = await api('settings').catch(() => view.settings);
         }
       });
     } else {
@@ -969,6 +1020,18 @@ async function testStorageSsh() {
     view.sshTestBusy = false;
     render();
   }
+}
+
+function confirmResetHostKey() {
+  showDialog('서버 호스트 키 초기화', `<p>현재 스토리지 IP에 저장된 SSH 호스트 키를 삭제합니다.</p>
+    <p>다음 접속 테스트에서 서버의 지문을 다시 확인해 신뢰해야 원격 아카이브에 연결할 수 있습니다.</p>`,
+  '호스트 키 초기화', async () => {
+    view.settings = await api('settings/ssh-host-key', 'DELETE');
+    view.sshTestResult = null;
+    view.archive = null;
+    view.archiveError = '';
+    announce('저장된 SSH 호스트 키를 초기화했습니다. 접속 테스트로 다시 확인하세요.');
+  }, { danger: true });
 }
 
 async function downloadCatalog() {
@@ -1273,6 +1336,7 @@ function showXmp(id) {
 function chooseEvent(id) {
   view.eventId = id;
   view.eventSelection.clear();
+  view.eventStorage = '';
   view.eventDevice = '';
   view.eventDate = '';
   view.eventQuery = '';
@@ -1522,7 +1586,7 @@ const previewActions = {
 };
 
 function confirmEvent() {
-  const files = footageForEvent(view.eventId).filter(file => view.eventSelection.has(file.id) && !file.confirmed);
+  const files = footageForEvent(view.eventId).filter(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed);
   if (!files.length) return;
   showDialog('배치 확정', `<p>확정한 파일 ${files.length}개가 아카이브 전송의 Source에 표시됩니다.</p>
     <ul class="preview-paths mono">${files.map(file => `<li>${escapeHtml([...sourceFolders(file), file.name].join('/'))}</li>`).join('')}</ul>`,
@@ -1532,6 +1596,21 @@ function confirmEvent() {
     await syncState();
     announce('선택한 배치를 확정했습니다.');
   });
+}
+
+function confirmOffload() {
+  const files = filteredEventFiles(footageForEvent(view.eventId)).filter(file => view.eventSelection.has(file.id) && file.canOffload);
+  if (!files.length) return;
+  showDialog('로컬 원본 비우기', `<p>원격 아카이브에 파일 존재·크기를 실시간 확인한 뒤 아래 ${files.length}개 파일의 로컬 <code>managed</code> 원본(및 연결된 XMP)을 삭제합니다.</p>
+    <p>썸네일, 메타데이터, XMP 정보, 이벤트 배정은 DB에 그대로 유지되며 언제든 다시 다운로드할 수 있습니다. 원격에 없거나 크기가 다르면 삭제하지 않고 유지합니다.</p>
+    <ul class="preview-paths mono">${files.map(file => `<li>${escapeHtml(file.name)}${file.xmp ? ` (+ ${escapeHtml(file.xmp.name)})` : ''} → ${escapeHtml(file.remotePaths[0] || '')}</li>`).join('')}</ul>`,
+  `로컬 원본 ${files.length}개 비우기`, async () => {
+    const result = await api('jobs/offload', 'POST', { ids: files.map(file => file.id) });
+    state.job = { id: result.id, kind: 'offload', status: 'queued', result: {} };
+    view.eventSelection.clear();
+    await syncState();
+    announce(`${result.count}개 파일의 원격 확인 및 로컬 원본 비우기를 시작합니다.`);
+  }, { danger: true });
 }
 
 const actions = {
@@ -1557,6 +1636,7 @@ const actions = {
   'generate-storage-key': generateStorageKey,
   'regenerate-storage-key': regenerateStorageKey,
   'copy-public-key': copyStorageKey,
+  'reset-host-key': confirmResetHostKey,
   'test-storage-ssh': testStorageSsh,
   'download-catalog': downloadCatalog,
   'pick-catalog-file'() { page.querySelector('#restore-catalog-file').click(); },
@@ -1574,6 +1654,7 @@ const actions = {
   },
   'move-event': moveEvent,
   'edit-media'() { editMedia(); },
+  'offload-media': confirmOffload,
   'resolve-time'(id) { editMedia([id], true); },
   'confirm-event': confirmEvent,
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); view.sourceSelection.clear(); },
@@ -1693,6 +1774,10 @@ page.addEventListener('change', event => {
     render();
   } else if (control.id === 'incoming-kind') {
     view.incomingKind = control.value;
+    render();
+  } else if (control.id === 'event-storage') {
+    view.eventStorage = control.value;
+    view.eventSelection.clear();
     render();
   } else if (control.id === 'event-device') {
     view.eventDevice = control.value;
