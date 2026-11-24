@@ -26,12 +26,15 @@ erDiagram
 | --- | --- |
 | `id` | 정수 기본 키 |
 | `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
+| `lane` | `local` (`scan`, `move`, `delete`, `xmp-link`), `remote` (`upload`, `offload`, `remote-index`), `exclusive` (`reset-all`). 기본 `exclusive` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
 | `created_at`, `finished_at` | 생성·종료 시각 |
 
-부분 유일 인덱스 `one_active_job`은 `queued`·`running` 전체에 상수 키 하나를 적용한다. 따라서 대기열을 여러 개 쌓는 구조가 아니며, 활성 작업이 있으면 추가 작업 등록을 거부한다. 재시작 시 `running`을 `queued`로 바꾼다.
+부분 유일 인덱스 `one_active_job_per_lane`은 `queued`·`running`을 레인마다 하나만 허용한다. 로컬과 원격은 1+1로 병렬 실행하며 같은 레인의 추가 등록은 409로 거부한다. `jobs_by_lane_status(lane, status, id)`는 조회를 지원한다. `jobs_enforce_exclusive_insert`·`jobs_enforce_exclusive_update` 트리거는 직접 SQL의 INSERT 및 status/lane 변경에도 `exclusive`와 다른 활성 작업의 공존을 차단한다.
+
+`initialize()`는 배타 카탈로그 파일 잠금 안에서 구버전 `jobs.lane`을 추가하고 `backfill_job_lanes()`로 종류별 레인을 채운 뒤 `one_active_job`을 제거한다. 미지의 과거 종류는 `exclusive`로 처리하며 신규 미지 종류 등록은 거부한다. 구버전 DB를 열 수 있도록 공통 `SCHEMA`에는 lane 참조 인덱스·트리거를 두지 않고 마이그레이션 뒤 생성한다. SQLite는 WAL, 연결 timeout 30초 및 `busy_timeout=30000`을 사용한다. 재시작 시 두 레인의 `running`을 함께 `queued`로 복구한다.
 
 ### `scan_files`: Incoming 검사 결과
 
@@ -129,7 +132,7 @@ erDiagram
 
 앱은 시작 시 테이블·인덱스를 생성하고 과거 카탈로그에 `scan_files.thumbnail`, `scan_files.companions`, `media.user_time_source`, 원래 경로·XMP 관련 필드가 없으면 추가한다. 별도 마이그레이션 도구나 스키마 버전 테이블은 없다.
 
-백업·복원은 [settings.py](../backend/settings.py)의 SQLite Backup API와 테이블 복사 로직을 사용한다. 복원 시 스키마·JSON·외래 키 무결성을 확인하고, 오래된 백업의 일부 누락 열과 `scan_xmp`·`archive_entries`·`device_names`·`storages`·`remote_files` 테이블 부재를 허용한다. 현재 활성 작업이 있으면 백업·복원을 거부한다. 복원된 활성 작업은 실패로 종료하고 `moving` 원본은 `missing`, `offloading` 원본은 `available`, `deleting` 검사 파일은 `review`로 전환하며 구버전 백업에서 `remote_files`를 자동 백필한다.
+백업·복원은 [settings.py](../backend/settings.py)의 SQLite Backup API와 테이블 복사 로직을 사용한다. 복원 시 스키마·JSON·외래 키 무결성을 확인하고, 오래된 백업의 일부 누락 열과 `scan_xmp`·`archive_entries`·`device_names`·`storages`·`remote_files` 테이블 부재를 허용한다. 현재 어느 레인이든 활성 작업이 있으면 백업·복원을 거부한다. 동기 백업·복원은 배타 카탈로그 파일 잠금으로 작업 등록과 상호 배제하며 백업 임시 파일은 잠금과 유휴 검사 이후 생성한다. 구버전 백업의 `jobs.lane` 생략을 허용하고 복원 후 레인을 백필한다. 복원된 활성 작업은 실패로 종료하고 `moving` 원본은 `missing`, `offloading` 원본은 `available`, `deleting` 검사 파일은 `review`로 전환하며 구버전 백업에서 `remote_files`를 자동 백필한다.
 
 ## 사용자 데이터 초기화
 

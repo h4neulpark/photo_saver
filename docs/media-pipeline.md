@@ -78,7 +78,9 @@
 | 캐시 | `<SHA-256>-v1.jpg`; Incoming에서 만든 캐시를 이동 후에도 재사용 |
 | 분석 실패 | 오류를 메타데이터에 기록하고 파일 수정 시각을 참고값으로 사용. 썸네일은 없을 수 있음 |
 
-Incoming 원본·미리보기 API는 최신 검사에 포함된 `ready`·`duplicate` 파일의 지문을 확인한다. HEIC·HEIF 미리보기는 최대 `2200×2200` JPEG로 변환하고, 다른 형식은 원본을 제공한다. 영상 재생은 브라우저 코덱 지원에 따른다. 원본 응답은 HTTP 범위 요청을 지원하며, 변동된 파일은 새로 고침을 요구한다.
+Incoming 원본·미리보기 API는 최신 검사에 포함된 `ready`·`duplicate` 파일의 지문을 확인한다. 보관(`managed`) 파일도 `media.status=available`이고 지문이 유효하면 API의 `/managed-preview` 읽기 전용 마운트를 통해 `/api/managed/{file_id}/original`·`/preview`로 큰 사진 미리보기와 브라우저 영상 재생을 제공한다. 이때 파일 조회는 논리적 이벤트 폴더가 아니라 DB에 기록된 실제 물리 상대 경로(`managed/<파일 ID>/<원래 파일명>` 등)를 기준으로 하므로, 이벤트 배정·소분류 이동·확정 변경만으로 미리보기 경로나 파일 위치가 바뀌지 않는다.
+
+공통 파이프라인에서 HEIC·HEIF 미리보기는 EXIF 회전을 반영한 최대 `2200×2200` JPEG로 변환해 전체 `200` 응답으로 제공하고, 다른 형식은 지문을 검증한 파일 디스크립터(`/proc/self/fd/<fd>`) 기반 `FileResponse`로 원본을 스트리밍한다. 영상 재생은 브라우저 코덱 지원에 따르며, `managed` 원본 응답은 단일 바이트 `Range`와 지문 기반 `ETag`/`If-Range`를 지원한다. 외부에서 변동된 파일은 지문 불일치(`409`)로 차단하고 새로 고침 재검사를 요구한다. 로컬 원본 비우기(`offload`)로 `archived` 상태가 된 파일은 로컬 원본이 없으므로 미리보기·원본 URL이 `null`이 되며 썸네일과 메타데이터만 유지된다.
 
 ### 촬영 시각
 
@@ -110,7 +112,11 @@ XMP에서는 제목, 설명, 키워드, 도시·지역·국가·장소, GPS 문�
 
 ## 실행 제약
 
-워커는 `worker.lock`으로 단일 실행을 보장하고 0.4초 간격으로 큐를 확인한다. `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `reset-all`를 한 프로세스에서 순차 실행한다. [catalog.py](../backend/catalog.py)의 제약으로 전체 작업 중 `queued` 또는 `running`은 한 개만 허용된다. 업로드·로컬 비우기 중에는 새 파일 작업을 등록할 수 없다.
+워커는 `worker.lock`으로 단일 프로세스를 보장한다. `WorkerCoordinator`는 기본 0.4초 폴링 및 스레드 완료 이벤트로 큐를 확인하고 한 DB 쓰기 트랜잭션에서 claim한다. `local` 스레드는 `scan`·`move`·`delete`·`xmp-link`를, `remote` 스레드는 `upload`·`offload`·`remote-index`를 실행해 최대 1+1 병렬로 처리한다. 같은 레인에는 활성 작업 하나만 허용한다. `exclusive` 작업(`reset-all`)이 대기·실행 중이면 다른 레인의 claim을 막고, 기존 스레드와 DB running 작업이 모두 끝난 뒤 코디네이터가 직접 실행한다. 기동 시 두 레인의 stale running을 queued로 복구하며 SIGTERM·SIGINT는 새 claim을 중단하고 실행 중인 스레드가 끝나기를 기다린다.
+
+병렬 스캔은 missing/XMP 해제 갱신을 available에만 적용하고 분석 upsert는 offloading·archived를 덮어쓰지 않는다. 로컬 비우기는 삭제 직전 status·sha·path·xmp_path·xmp_sha를 한 SQL로 확인해 offloading으로 전환한다. 정보가 달라졌으면 삭제 없이 409로 거부한다. 활성 offload 대상의 XMP 연결은 API와 워커에서 거부하며, XMP 이동 후 원본 상태가 바뀌어 연결에 실패하면 옮긴 XMP를 Incoming으로 돌려놓는다. 삭제 후 썸네일 정리는 available·archived·offloading·moving 참조를 모두 보존한다.
+
+UI는 로컬/원격 버튼을 각 레인의 활성 상태로 제한하고 exclusive 또는 백업·복원 요청 중에는 모두 잠근다. 전역 진행 배너에 두 레인을 함께 표시하고 원격 중지는 해당 작업 ID로 요청한다. 한 레인이 끝나도 다른 활성 레인이 있으면 폴링과 미리보기 삭제 추적을 계속한다.
 
 `renameat2`와 `/proc/self/fd`를 사용하므로 파일 처리 구현은 Linux 컨테이너 실행을 기준으로 한다. 원본을 앱 외부에서 변경하면 다음 스캔에서 다시 검증하며, 처리 도중의 변경은 지문 검사로 감지한다.
 

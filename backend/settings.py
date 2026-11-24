@@ -23,7 +23,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from catalog import DATA, DEFAULT_ZONE, backfill_remote_files, catalog_lock, database, now, open_db, queue_job
+from catalog import (DATA, DEFAULT_ZONE, JobConflictError, LANE_EXCLUSIVE, LANE_REMOTE,
+                     backfill_job_lanes, backfill_remote_files, catalog_lock, database,
+                     has_active_jobs, now, open_db, queue_job)
 
 router = APIRouter(prefix="/api/settings")
 SETTINGS_DIR = Path("/settings")
@@ -41,7 +43,7 @@ NO_STORE = {"Cache-Control": "no-store"}
 
 # Copy data into the application's existing schema, including older Photo Saver backups.
 RESTORE_COLUMNS = {
-    "jobs": set(),
+    "jobs": {"lane"},
     "events": set(),
     "device_names": set(),
     "storages": {"last_indexed_at"},
@@ -344,7 +346,7 @@ def trust_and_test_host(request: HostKeyConfirmation):
 @router.delete("/ssh-host-key")
 def reset_host_key():
     with database() as db:
-        if db.execute("SELECT 1 FROM jobs WHERE kind IN ('upload','offload','remote-index') AND status IN ('queued','running')").fetchone():
+        if has_active_jobs(db, (LANE_REMOTE, LANE_EXCLUSIVE)):
             fail(409, "업로드·로컬 비우기·원격 인덱싱 작업이 끝난 뒤 호스트 키를 초기화하세요.")
     with settings_lock():
         address = read_setting(ADDRESS_FILE).strip()
@@ -363,23 +365,27 @@ def ensure_catalog_idle(connection):
 @router.post("/catalog/reset", status_code=202)
 def reset_catalog(request: CatalogReset):
     with database(write=True) as connection:
-        ensure_catalog_idle(connection)
-        job_id = queue_job(connection, "reset-all", {})
-    return JSONResponse({"id": job_id, "kind": "reset-all", "status": "queued"},
+        try:
+            job_id = queue_job(connection, "reset-all", {})
+        except JobConflictError as exc:
+            fail(409, str(exc))
+    return JSONResponse({"id": job_id, "kind": "reset-all", "lane": LANE_EXCLUSIVE, "status": "queued"},
                         status_code=202, headers=NO_STORE)
 
 
 @router.get("/catalog/backup")
 def backup_catalog():
-    with tempfile.NamedTemporaryFile(dir=DATA, suffix=".sqlite3", delete=False) as temporary:
-        path = Path(temporary.name)
+    path = None
     try:
         with catalog_lock(exclusive=True), closing(open_db()) as current:
             ensure_catalog_idle(current)
+            with tempfile.NamedTemporaryFile(dir=DATA, suffix=".sqlite3", delete=False) as temporary:
+                path = Path(temporary.name)
             with closing(sqlite3.connect(path)) as destination:
                 current.backup(destination)
     except BaseException:
-        path.unlink(missing_ok=True)
+        if path:
+            path.unlink(missing_ok=True)
         raise
     date = datetime.now(ZoneInfo(DEFAULT_ZONE)).strftime("%Y%m%d-%H%M%S")
     return FileResponse(
@@ -444,6 +450,7 @@ def restore_catalog_file(path):
                            WHERE status IN ('queued','running')""",
                         (json.dumps({"error": "복원 전에 대기 중이던 작업입니다. 라이브러리를 새로 고침하세요."}), now()),
                     )
+                    backfill_job_lanes(target)
                     target.execute("UPDATE media SET status='missing' WHERE status='moving'")
                     target.execute("UPDATE media SET status='available' WHERE status='offloading'")
                     target.execute("UPDATE scan_files SET status='review' WHERE status='deleting'")

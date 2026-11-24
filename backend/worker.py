@@ -2,13 +2,16 @@ import fcntl
 import json
 import logging
 import os
+import signal
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from catalog import DATA, DEFAULT_ZONE, PHOTOS, THUMBNAILS, database, initialize, now
+from catalog import (DATA, DEFAULT_ZONE, PHOTOS, THUMBNAILS, LANE_LOCAL, LANE_REMOTE,
+                     LANE_EXCLUSIVE, active_offload_media_ids, database, initialize, now)
 from companions import CAMERA_AUX, COMPANION_EXTENSIONS, XMP, read_xmp, source_candidates, source_index, xmp_owner
 from media import (
     SUPPORTED, VIDEO_METADATA_VERSION, analyze, delete_photo, delete_verified_file, fingerprint, hash_file, inspect, iso_time, move_file,
@@ -72,6 +75,7 @@ def store_analysis(file_id, path, sha, info, analysis):
                 xmp_path=CASE WHEN media.sha=excluded.sha THEN media.xmp_path END,
                 xmp_sha=CASE WHEN media.sha=excluded.sha THEN media.xmp_sha END,
                 xmp_metadata=CASE WHEN media.sha=excluded.sha THEN media.xmp_metadata END
+            WHERE media.status NOT IN ('offloading', 'archived')
             """,
             (file_id, path, Path(path).name, kind, sha, info.st_size, snapshot,
              json.dumps(details, ensure_ascii=False), thumbnail, captured, source, int(verified), device),
@@ -112,7 +116,7 @@ def index_managed(managed):
     )
     if missing:
         with database(write=True) as db:
-            db.executemany("UPDATE media SET status='missing' WHERE path=?", [(path,) for path in missing])
+            db.executemany("UPDATE media SET status='missing' WHERE path=? AND status='available'", [(path,) for path in missing])
     return known
 
 
@@ -192,13 +196,16 @@ def index_managed_xmp(managed):
             log.warning("보관 중인 XMP를 읽을 수 없습니다: %s", path)
             continue
         if owner["xmp_sha"] != sidecar["sha"]:
-            with database(write=True) as db:
-                associate_xmp(db, owner["id"], path, sidecar)
+            try:
+                with database(write=True) as db:
+                    associate_xmp(db, owner["id"], path, sidecar)
+            except OSError as exc:
+                log.warning("보관 중인 XMP 연결을 건너뜁니다: %s: %s", path, exc)
         free.discard(owner["path"])
     missing = assigned.keys() - seen
     if missing:
         with database(write=True) as db:
-            db.executemany("UPDATE media SET xmp_path=NULL,xmp_sha=NULL,xmp_metadata=NULL WHERE xmp_path=?", [(path,) for path in missing])
+            db.executemany("UPDATE media SET xmp_path=NULL,xmp_sha=NULL,xmp_metadata=NULL WHERE xmp_path=? AND status='available'", [(path,) for path in missing])
 
 
 def archived_hashes():
@@ -280,13 +287,19 @@ def set_outcome(file_id, status, reason=""):
 
 
 def associate_xmp(db, owner, target, sidecar):
-    db.execute("UPDATE media SET xmp_path=?,xmp_sha=?,xmp_metadata=? WHERE id=?", (
+    if owner in active_offload_media_ids(db):
+        raise OSError("로컬 원본 비우기가 진행 중인 파일에는 XMP를 연결할 수 없습니다.")
+    cursor = db.execute("UPDATE media SET xmp_path=?,xmp_sha=?,xmp_metadata=? WHERE id=? AND status='available'", (
         target, sidecar["sha"], json.dumps(sidecar["metadata"], ensure_ascii=False), owner,
     ))
+    if cursor.rowcount != 1:
+        raise OSError("managed 원본의 상태가 변경되어 XMP를 연결하지 않았습니다.")
 
 
 def retain_xmp(incoming, managed, owner, sidecar):
     with database() as db:
+        if owner in active_offload_media_ids(db):
+            raise OSError("로컬 원본 비우기가 진행 중인 파일에는 XMP를 연결할 수 없습니다.")
         record = db.execute("SELECT * FROM media WHERE id=? AND status='available'", (owner,)).fetchone()
     if not record or fingerprint(inspect(managed, record["path"])) != record["fingerprint"]:
         raise OSError("managed 원본을 다시 확인해야 합니다.")
@@ -296,6 +309,7 @@ def retain_xmp(incoming, managed, owner, sidecar):
     with database() as db:
         if db.execute("SELECT 1 FROM media WHERE xmp_path=? AND id<>? AND status='available'", (target, owner)).fetchone():
             raise OSError("다른 원본이 이미 이 경로의 XMP를 사용합니다.")
+    moved = False
     try:
         existing_sha, _ = hash_file(managed, target)
     except FileNotFoundError:
@@ -303,11 +317,17 @@ def retain_xmp(incoming, managed, owner, sidecar):
         if actual_sha != sidecar["sha"]:
             raise OSError("검사 이후 XMP 내용이 변경되었습니다.")
         move_file(incoming, sidecar["path"], managed, target, sidecar["fingerprint"], create_parent=False)
+        moved = True
     else:
         if existing_sha != sidecar["sha"]:
             raise OSError("같은 경로에 다른 XMP가 있습니다.")
-    with database(write=True) as db:
-        associate_xmp(db, owner, target, sidecar)
+    try:
+        with database(write=True) as db:
+            associate_xmp(db, owner, target, sidecar)
+    except OSError:
+        if moved:
+            move_file(managed, target, incoming, sidecar["path"], fingerprint(inspect(managed, target)), create_parent=False)
+        raise
 
 
 def finish_import_companions(row, incoming, managed, counts):
@@ -468,7 +488,7 @@ def refresh_deleted_group(managed, sha):
         ).fetchall()
         references = db.execute(
             """SELECT 1 FROM scan_files WHERE sha=? AND thumbnail IS NOT NULL AND status NOT IN ('moved','deleted')
-               UNION ALL SELECT 1 FROM media WHERE sha=? AND thumbnail IS NOT NULL AND status IN ('available','archived')
+               UNION ALL SELECT 1 FROM media WHERE sha=? AND thumbnail IS NOT NULL AND status IN ('available','archived','offloading','moving')
                LIMIT 1""", (sha, sha)
         ).fetchone()
 
@@ -514,9 +534,89 @@ def delete_selection(job, incoming, managed):
 
 def finish(db, job_id, result, status="done"):
     db.execute(
-        "UPDATE jobs SET status=?, result=?, finished_at=? WHERE id=?",
+        "UPDATE jobs SET status=?, result=?, finished_at=? WHERE id=? AND status IN ('queued', 'running')",
         (status, json.dumps(result, ensure_ascii=False), now(), job_id),
     )
+
+
+class WorkerCoordinator:
+    def __init__(self, incoming=None, managed=None, *, handlers=None, poll_interval=0.4):
+        self.incoming, self.managed = incoming, managed
+        self.handlers = handlers if handlers is not None else {
+            "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
+            "xmp-link": link_xmp_selection, "upload": upload_selection,
+            "offload": offload_selection, "remote-index": index_remote_archive,
+            "reset-all": reset_local_data,
+        }
+        self.poll_interval = poll_interval
+        self.running = {}
+        self.wake_event = threading.Event()
+        self.stop_event = threading.Event()
+
+    def recover_stale_jobs(self):
+        with database(write=True) as db:
+            db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
+
+    def reap_finished(self):
+        for lane, thread in list(self.running.items()):
+            if not thread.is_alive():
+                thread.join(timeout=0)
+                del self.running[lane]
+
+    def stop(self):
+        self.stop_event.set()
+        self.wake_event.set()
+
+    def dispatch_once(self):
+        self.reap_finished()
+        if self.stop_event.is_set():
+            return
+        claimed = []
+        with database(write=True) as db:
+            exclusive = db.execute("SELECT * FROM jobs WHERE status='queued' AND lane='exclusive' ORDER BY id LIMIT 1").fetchone()
+            exclusive_running = db.execute("SELECT 1 FROM jobs WHERE status='running' AND lane='exclusive' LIMIT 1").fetchone()
+            if exclusive or exclusive_running:
+                if exclusive and not self.running and not db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
+                    claimed.append(dict(exclusive))
+            else:
+                for lane in (LANE_LOCAL, LANE_REMOTE):
+                    if lane not in self.running:
+                        job = db.execute("SELECT * FROM jobs WHERE status='queued' AND lane=? ORDER BY id LIMIT 1", (lane,)).fetchone()
+                        if job:
+                            claimed.append(dict(job))
+            for job in claimed:
+                db.execute("UPDATE jobs SET status='running' WHERE id=?", (job['id'],))
+                job['status'] = 'running'
+        for job in claimed:
+            lane = job['lane']
+            if lane == LANE_EXCLUSIVE:
+                self._run_job(lane, job)
+            else:
+                thread = threading.Thread(target=self._run_job, args=(lane, job), name=f"worker-{lane}-{job['id']}")
+                self.running[lane] = thread
+                thread.start()
+
+    def _run_job(self, lane, job):
+        try:
+            self.handlers[job['kind']](job, self.incoming, self.managed)
+        except Exception:
+            log.exception("작업이 실패했습니다: %s", job['id'])
+            with database(write=True) as db:
+                finish(db, job['id'], {"error": "작업을 마치지 못했습니다. 경로와 워커 로그를 확인하세요."}, "failed")
+        finally:
+            self.wake_event.set()
+
+    def run(self):
+        self.recover_stale_jobs()
+        try:
+            while not self.stop_event.is_set():
+                self.dispatch_once()
+                self.wake_event.wait(timeout=self.poll_interval)
+                self.wake_event.clear()
+        finally:
+            for thread in self.running.values():
+                thread.join()
+            self.reap_finished()
 
 
 def run():
@@ -525,30 +625,17 @@ def run():
     THUMBNAILS.mkdir(parents=True, exist_ok=True)
     with (DATA / "worker.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with database(write=True) as db:
-            db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
-
+        coordinator = WorkerCoordinator(incoming, managed)
+        previous = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                previous[sig] = signal.signal(sig, lambda _signum, _frame: coordinator.stop())
         log.info("수집 워커 시작 · %s → %s", incoming, managed)
-        handlers = {
-            "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
-            "xmp-link": link_xmp_selection, "upload": upload_selection,
-            "offload": offload_selection, "remote-index": index_remote_archive,
-            "reset-all": reset_local_data,
-        }
-        while True:
-            with database(write=True) as db:
-                job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
-                if job:
-                    db.execute("UPDATE jobs SET status='running' WHERE id=?", (job["id"],))
-            if not job:
-                time.sleep(0.4)
-                continue
-            try:
-                handlers[job["kind"]](job, incoming, managed)
-            except Exception:
-                log.exception("작업이 실패했습니다: %s", job["id"])
-                with database(write=True) as db:
-                    finish(db, job["id"], {"error": "작업을 마치지 못했습니다. 경로와 워커 로그를 확인하세요."}, "failed")
+        try:
+            coordinator.run()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

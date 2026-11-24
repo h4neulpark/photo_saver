@@ -1,4 +1,7 @@
+import errno
+import hashlib
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
@@ -15,9 +18,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers, MutableHeaders
 
-from catalog import DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
-from media import capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
+from catalog import LANE_LOCAL, active_jobs_by_lane, latest_jobs_by_lane, active_offload_media_ids, DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
+from media import VIDEOS, capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
 from settings import ensure_storage_id, router as settings_router
 from archive import active_storage_scope, router as archive_router
 from transfers import RemoteDuplicateError, TransferRequest, queue_transfer
@@ -57,7 +61,7 @@ async def handle_remote_duplicate(_request, exc):
 
 def reset_in_progress():
     with database() as db:
-        return db.execute("SELECT 1 FROM jobs WHERE kind='reset-all' AND status IN ('queued','running')").fetchone() is not None
+        return db.execute("SELECT 1 FROM jobs WHERE lane='exclusive' AND status IN ('queued','running')").fetchone() is not None
 
 
 @app.middleware("http")
@@ -67,14 +71,29 @@ async def guard_reset(request, call_next):
     return await call_next(request)
 
 
+logger = logging.getLogger(__name__)
 unsafe_component = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 INCOMING_PREVIEW = Path("/incoming-preview")
+MANAGED_PREVIEW = Path("/managed-preview")
 MEDIA_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
     ".heic": "image/heic", ".heif": "image/heif", ".mp4": "video/mp4", ".mov": "video/quicktime",
 }
 MEDIA_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+SINGLE_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(?:(?P<start>\d+)-(?P<end>\d*)|-(?P<suffix>\d+))\s*$", re.IGNORECASE)
+MAX_RANGE_DIGITS = 32
+MAX_RANGE_TOKEN_LEN = 64
 STALE_PREVIEW = "파일이 변경되었거나 이동했습니다. Incoming Library를 새로 고침하세요."
+INCOMING_HEIF_ERROR = "사진을 미리 볼 수 없습니다. 새로 고침하거나 원본 파일을 확인하세요."
+MANAGED_UNAVAILABLE = "로컬 원본을 미리 볼 수 없습니다."
+MANAGED_NOT_FOUND = "로컬 원본을 찾을 수 없습니다."
+MANAGED_PERMISSION_DENIED = "로컬 원본의 읽기 권한을 확인하세요."
+MANAGED_STALE_PREVIEW = "로컬 원본이 변경되었습니다. 원본을 확인한 뒤 Incoming Library에서 새로 고침하여 다시 검사하세요."
+MANAGED_ACCESS_ERROR = "로컬 원본을 읽을 수 없습니다. 원본을 확인한 뒤 Incoming Library에서 새로 고침하여 다시 검사하세요."
+MANAGED_UNSUPPORTED = "미리보기를 지원하지 않는 파일 형식입니다."
+MANAGED_HEIF_ERROR = "사진을 미리 볼 수 없습니다. 원본을 확인한 뒤 다시 검사하거나 원본 파일을 열어 확인하세요."
+MANAGED_RANGE_ERROR = "단일 바이트 범위 요청만 지원합니다."
+MANAGED_RANGE_UNSATISFIABLE = "요청한 바이트 범위가 파일 크기를 벗어났습니다."
 
 
 class Selection(BaseModel):
@@ -206,6 +225,18 @@ def remote_copies_by_sha(db):
     return copies
 
 
+def managed_media_type(path, kind):
+    suffix = PurePosixPath(path).suffix.lower()
+    media_type = MEDIA_TYPES.get(suffix)
+    if not media_type:
+        return None
+    if kind == "photo" and suffix in PHOTOS:
+        return media_type
+    if kind == "video" and suffix in VIDEOS:
+        return media_type
+    return None
+
+
 def view_media(row, periods, names=None, remote_index=None, active_scope=(None, None)):
     device = effective_device(row, names or {})
     metadata = json.loads(row["metadata"])
@@ -224,6 +255,11 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
     xmp_copies = remote_index.get(row["xmp_sha"], []) if row["xmp_sha"] else []
     xmp_active = [item for item in xmp_copies if active_root and item["archive_root"] == active_root]
     xmp_archived = True if not row["xmp_path"] else bool(xmp_active)
+    can_preview = (
+        row["status"] == "available"
+        and bool(row["fingerprint"])
+        and managed_media_type(row["path"], row["kind"]) is not None
+    )
     return {
         "id": row["id"], "name": row["name"], "path": row["path"], "kind": row["kind"],
         "status": row["status"],
@@ -233,7 +269,7 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
         "timeCandidates": {
             "metadata": metadata_time(row, metadata),
             "xmp": xmp_time(xmp),
-            "modified": modified_time_from_fingerprint(row["fingerprint"]),
+            "modified": modified_time_from_fingerprint(row["fingerprint"]) if row["fingerprint"] else None,
         },
         "eventId": row["event_id"], "confirmed": bool(row["confirmed"]),
         "archived": bool(all_copies),
@@ -242,6 +278,8 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
         "xmpArchived": xmp_archived,
         "remotePaths": [item["path"] for item in active_copies],
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
+        "preview": f"/api/managed/{row['id']}/preview" if can_preview else None,
+        "original": f"/api/managed/{row['id']}/original" if can_preview else None,
         "analysisError": metadata.get("error"),
         "xmp": {**xmp, "name": PurePosixPath(row["xmp_path"]).name} if row["xmp_path"] else None,
     }
@@ -279,7 +317,7 @@ def view_job(row):
     if not row:
         return None
     return {
-        "id": row["id"], "kind": row["kind"], "status": row["status"],
+        "id": row["id"], "kind": row["kind"], "lane": row["lane"], "status": row["status"],
         "finishedAt": row["finished_at"], "result": json.loads(row["result"]) if row["result"] else {},
     }
 
@@ -287,6 +325,41 @@ def view_job(row):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+class MediaJSONResponse(JSONResponse):
+    def __init__(self, content, status_code=200, headers=None):
+        super().__init__(content, status_code=status_code, headers={**MEDIA_HEADERS, **(headers or {})})
+
+    async def __call__(self, scope, receive, send):
+        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+        body = b"" if scope.get("method") == "HEAD" else self.body
+        await send({"type": "http.response.body", "body": body})
+
+
+def fingerprint_etag(snapshot):
+    return f'"{hashlib.sha256(snapshot.encode("utf-8")).hexdigest()}"'
+
+
+def classify_incoming_access_error(_exc):
+    return 409, STALE_PREVIEW
+
+
+def classify_incoming_heif_error(_exc):
+    return 409, INCOMING_HEIF_ERROR
+
+
+def classify_managed_access_error(exc):
+    if isinstance(exc, (ValueError, FileNotFoundError)) or getattr(exc, "errno", None) in {
+        errno.ENOENT, errno.ELOOP, errno.ENOTDIR,
+    }:
+        return 404, MANAGED_NOT_FOUND
+    if isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM}:
+        return 403, MANAGED_PERMISSION_DENIED
+    if isinstance(exc, OSError) and exc.errno is None and str(exc) == "파일 상태가 변경되었습니다.":
+        return 409, MANAGED_STALE_PREVIEW
+    logger.warning("Managed media access failed: %s", exc)
+    return 409, MANAGED_ACCESS_ERROR
 
 
 def incoming_for_preview(file_id):
@@ -301,26 +374,173 @@ def incoming_for_preview(file_id):
     return row
 
 
-class IncomingOriginal(Response):
-    def __init__(self, row, media_type):
+def managed_for_preview(file_id):
+    with database() as db:
+        row = db.execute(
+            "SELECT id, path, name, kind, status, fingerprint FROM media WHERE id=?",
+            (file_id,),
+        ).fetchone()
+    if not row or row["status"] != "available" or not row["fingerprint"]:
+        return None, None, (404, MANAGED_UNAVAILABLE)
+    media_type = managed_media_type(row["path"], row["kind"])
+    if not media_type:
+        return None, None, (415, MANAGED_UNSUPPORTED)
+    return row, media_type, None
+
+
+def parse_range_uint(token: str) -> int | None:
+    if len(token) > MAX_RANGE_TOKEN_LEN:
+        return None
+    stripped = token.lstrip("0")
+    if not stripped:
+        return 0
+    if len(stripped) > MAX_RANGE_DIGITS:
+        return None
+    try:
+        return int(stripped)
+    except ValueError:
+        return None
+
+
+def parse_single_byte_range(range_headers: list[str], file_size: int):
+    if len(range_headers) != 1 or "," in range_headers[0]:
+        return "bad", None
+    match = SINGLE_RANGE_RE.match(range_headers[0])
+    if not match:
+        return "bad", None
+    suffix_str = match.group("suffix")
+    if suffix_str is not None:
+        suffix = parse_range_uint(suffix_str)
+        if suffix is None:
+            return "bad", None
+        if file_size <= 0 or suffix <= 0:
+            return "unsatisfiable", None
+        return "ok", (max(0, file_size - suffix), file_size - 1)
+    start = parse_range_uint(match.group("start"))
+    if start is None:
+        return "bad", None
+    end_str = match.group("end")
+    if end_str:
+        end = parse_range_uint(end_str)
+        if end is None or end < start:
+            return "bad", None
+        if file_size <= 0 or start >= file_size:
+            return "unsatisfiable", None
+        return "ok", (start, min(end, file_size - 1))
+    if file_size <= 0 or start >= file_size:
+        return "unsatisfiable", None
+    return "ok", (start, file_size - 1)
+
+
+class VerifiedOriginal(Response):
+    def __init__(self, root, row, media_type, *, error_classifier, range_policy="default", etag=None):
         super().__init__(media_type=media_type)
+        self.root = root
         self.row = row
+        self.error_classifier = error_classifier
+        self.range_policy = range_policy
+        self.etag = etag
 
     async def __call__(self, scope, receive, send):
+        is_head = scope.get("method") == "HEAD"
+        file_size = None
+        head_body_sent = False
+
+        async def wrapped_send(message):
+            nonlocal head_body_sent
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(raw=list(message.get("headers", [])))
+                for key, value in MEDIA_HEADERS.items():
+                    headers[key] = value
+                if message.get("status") == 416:
+                    content_range = headers.get("content-range")
+                    if content_range and not content_range.lower().startswith("bytes "):
+                        headers["content-range"] = f"bytes {content_range}"
+                    elif not content_range and file_size is not None:
+                        headers["content-range"] = f"bytes */{file_size}"
+                await send({**message, "headers": headers.raw})
+                return
+            if message["type"] == "http.response.body" and is_head:
+                if head_body_sent:
+                    return
+                head_body_sent = True
+                await send({**message, "body": b"", "more_body": False})
+                return
+            await send(message)
+
         with ExitStack() as stack:
             try:
                 stream, info = stack.enter_context(regular_file(
-                    INCOMING_PREVIEW, self.row["path"], expected=self.row["fingerprint"], recheck=False,
+                    self.root, self.row["path"], expected=self.row["fingerprint"], recheck=False,
                 ))
-            except OSError:
-                await JSONResponse({"detail": STALE_PREVIEW}, status_code=409, headers=MEDIA_HEADERS)(scope, receive, send)
+            except (OSError, ValueError) as exc:
+                status, detail = self.error_classifier(exc)
+                await JSONResponse({"detail": detail}, status_code=status)(scope, receive, wrapped_send)
                 return
+            file_size = info.st_size
             # Keep the verified descriptor open while FileResponse handles HTTP range requests.
+            response_headers = dict(MEDIA_HEADERS)
+            if self.etag is not None:
+                response_headers["ETag"] = self.etag
             response = FileResponse(
                 f"/proc/self/fd/{stream.fileno()}", stat_result=info, media_type=self.media_type,
-                filename=PurePosixPath(self.row["path"]).name, content_disposition_type="inline", headers=MEDIA_HEADERS,
+                filename=PurePosixPath(self.row["path"]).name, content_disposition_type="inline",
+                headers=response_headers,
             )
-            await response(scope, receive, send)
+            call_scope = scope
+            if self.range_policy == "single":
+                req_headers = Headers(scope=scope)
+                range_headers = req_headers.getlist("range")
+                if range_headers:
+                    if_range = req_headers.get("if-range")
+                    if if_range is not None and if_range not in {
+                        response.headers.get("etag"), response.headers.get("last-modified"),
+                    }:
+                        call_scope = {
+                            **scope,
+                            "headers": [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"range"],
+                        }
+                    else:
+                        kind, bounds = parse_single_byte_range(range_headers, file_size)
+                        if kind == "bad":
+                            await JSONResponse({"detail": MANAGED_RANGE_ERROR}, status_code=400)(scope, receive, wrapped_send)
+                            return
+                        if kind == "unsatisfiable":
+                            await JSONResponse(
+                                {"detail": MANAGED_RANGE_UNSATISFIABLE}, status_code=416,
+                                headers={"Content-Range": f"bytes */{file_size}"},
+                            )(scope, receive, wrapped_send)
+                            return
+                        start, end = bounds
+                        filtered = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"range"]
+                        filtered.append((b"range", f"bytes={start}-{end}".encode("ascii")))
+                        call_scope = {**scope, "headers": filtered}
+            await response(call_scope, receive, wrapped_send)
+
+
+class IncomingOriginal(VerifiedOriginal):
+    def __init__(self, row, media_type):
+        super().__init__(
+            INCOMING_PREVIEW, row, media_type,
+            error_classifier=classify_incoming_access_error,
+            range_policy="default",
+        )
+
+
+def render_heif_preview(root, row, *, error_classifier, decode_error_detail):
+    preview = BytesIO()
+    try:
+        with regular_file(root, row["path"], expected=row["fingerprint"]) as (stream, _):
+            try:
+                with Image.open(stream) as image:
+                    save_image_preview(image, preview, (2200, 2200))
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                logger.warning("HEIF preview conversion failed: %s", exc)
+                return MediaJSONResponse({"detail": decode_error_detail}, status_code=409)
+    except (OSError, ValueError) as exc:
+        status, detail = error_classifier(exc)
+        return MediaJSONResponse({"detail": detail}, status_code=status)
+    return Response(preview.getvalue(), media_type="image/jpeg", headers=MEDIA_HEADERS)
 
 
 @app.api_route("/api/incoming/{file_id}/original", methods=["GET", "HEAD"])
@@ -336,14 +556,46 @@ def incoming_preview(file_id: str):
     suffix = PurePosixPath(row["path"]).suffix.lower()
     if suffix not in {".heic", ".heif"}:
         return IncomingOriginal(row, MEDIA_TYPES[suffix])
-    preview = BytesIO()
-    try:
-        with regular_file(INCOMING_PREVIEW, row["path"], expected=row["fingerprint"]) as (stream, _):
-            with Image.open(stream) as image:
-                save_image_preview(image, preview, (2200, 2200))
-    except (OSError, ValueError, Image.DecompressionBombError):
-        error(409, "사진을 미리 볼 수 없습니다. 새로 고침하거나 원본 파일을 확인하세요.")
-    return Response(preview.getvalue(), media_type="image/jpeg", headers=MEDIA_HEADERS)
+    return render_heif_preview(
+        INCOMING_PREVIEW, row,
+        error_classifier=classify_incoming_heif_error,
+        decode_error_detail=INCOMING_HEIF_ERROR,
+    )
+
+
+@app.api_route("/api/managed/{file_id}/original", methods=["GET", "HEAD"])
+def managed_original(file_id: str):
+    row, media_type, failure = managed_for_preview(file_id)
+    if failure:
+        status, detail = failure
+        return MediaJSONResponse({"detail": detail}, status_code=status)
+    return VerifiedOriginal(
+        MANAGED_PREVIEW, row, media_type,
+        error_classifier=classify_managed_access_error,
+        range_policy="single",
+        etag=fingerprint_etag(row["fingerprint"]),
+    )
+
+
+@app.get("/api/managed/{file_id}/preview")
+def managed_preview(file_id: str):
+    row, media_type, failure = managed_for_preview(file_id)
+    if failure:
+        status, detail = failure
+        return MediaJSONResponse({"detail": detail}, status_code=status)
+    suffix = PurePosixPath(row["path"]).suffix.lower()
+    if suffix not in {".heic", ".heif"}:
+        return VerifiedOriginal(
+            MANAGED_PREVIEW, row, media_type,
+            error_classifier=classify_managed_access_error,
+            range_policy="single",
+            etag=fingerprint_etag(row["fingerprint"]),
+        )
+    return render_heif_preview(
+        MANAGED_PREVIEW, row,
+        error_classifier=classify_managed_access_error,
+        decode_error_detail=MANAGED_HEIF_ERROR,
+    )
 
 
 @app.get("/api/state")
@@ -366,10 +618,19 @@ def state():
         active_scope = active_storage_scope()
         media = [view_media(row, periods, names, remote_index, active_scope) for row in managed]
         media.sort(key=lambda item: (item["time"] or "", item["name"]))
+        active = active_jobs_by_lane(db)
+        jobs = latest_jobs_by_lane(db)
+        compat_job = active['exclusive'] or max(
+            (row for row in active.values() if row), key=lambda row: row['id'], default=None,
+        )
+        if compat_job is None:
+            compat_job = db.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
         return {
             "timezone": DEFAULT_ZONE,
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
-            "job": view_job(db.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()),
+            "job": view_job(compat_job),
+            "jobs": {lane: view_job(row) for lane, row in jobs.items()},
+            "activeJobs": {lane: view_job(row) for lane, row in active.items()},
             "events": [view_event(row) for row in events],
             "managed": media,
             "pendingXmp": sorted((view_pending_xmp(row, available) for row in pending), key=lambda item: item["path"]),
@@ -380,7 +641,7 @@ def state():
 def scan_library():
     with database(write=True) as db:
         try:
-            return {"id": queue_job(db, "scan", {})}
+            return {"id": queue_job(db, "scan", {}), "lane": LANE_LOCAL}
         except ValueError as exc:
             error(409, str(exc))
 
@@ -455,10 +716,13 @@ def link_xmp(selection: XmpSelection):
         pending = {row["id"]: json.loads(row["candidates"]) for row in db.execute(
             "SELECT id,candidates FROM scan_xmp WHERE scan_id=? AND status='pending'", (scan["id"],),
         )} if scan else {}
+        offloading = active_offload_media_ids(db)
+        if any(link.media_id in offloading for link in links):
+            error(409, "로컬 원본 비우기가 진행 중인 파일에는 XMP를 연결할 수 없습니다.")
         if any(link.media_id not in pending.get(link.id, ()) for link in links):
             error(409, "XMP 연결 후보가 변경되었습니다. 새로 고침하세요.")
         try:
-            return {"id": queue_job(db, "xmp-link", selection.model_dump())}
+            return {"id": queue_job(db, "xmp-link", selection.model_dump()), "lane": LANE_LOCAL}
         except ValueError as exc:
             error(409, str(exc))
 
@@ -481,7 +745,7 @@ def queue_incoming_selection(selection, kind):
         ):
             error(409, "검사가 끝난 incoming 사진을 다시 선택하세요.")
         try:
-            return {"id": queue_job(db, kind, {"ids": ids})}
+            return {"id": queue_job(db, kind, {"ids": ids}), "lane": LANE_LOCAL}
         except ValueError as exc:
             error(409, str(exc))
 

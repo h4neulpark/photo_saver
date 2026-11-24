@@ -37,6 +37,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${PHOTO_LIBRARY_ROOT:-.}/${MANAGED_DIR:-managed}
+        target: /managed-preview
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=2).close()"]
       interval: 3s

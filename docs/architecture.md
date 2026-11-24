@@ -19,11 +19,12 @@ flowchart LR
     API <--> DB[(SQLite 카탈로그)]
     API <--> Settings[(SSH 및 스토리지 설정)]
     API -->|읽기 전용 미리보기| Incoming[incoming]
+    API -->|읽기 전용 미리보기| Managed[managed]
     API <-->|SFTP 폴더 조회| OMV[원격 스토리지]
     Worker[단일 워커] <--> DB
     Settings -->|읽기 전용| Worker
     Incoming -->|검사 및 승인된 이동| Worker
-    Worker <--> Managed[managed]
+    Worker <--> Managed
     Worker --> Cache[썸네일 캐시]
     Cache --> Nginx
     Worker -->|SFTP 업로드 및 재읽기 검증| OMV
@@ -37,6 +38,7 @@ SSH 설정·접속 테스트와 Destination 폴더 조회는 **API 프로세스*
 | --- | --- | --- | --- |
 | 호스트 라이브러리 루트 → `/library` | 마운트 없음 | 읽기·쓰기 | 없음 |
 | 호스트 Incoming → `/incoming-preview` | 읽기 전용 | `/library` 아래에서 접근 | 없음 |
+| 호스트 Managed → `/managed-preview` | 읽기 전용 | `/library` 아래에서 접근 | 없음 |
 | `catalog` 볼륨 → `/data` | 읽기·쓰기 | 읽기·쓰기 | 없음 |
 | `settings` 볼륨 → `/settings` | 읽기·쓰기 | 읽기 전용 | 없음 |
 | `thumbnails` 볼륨 → `/thumbnails` | 마운트 없음 | 읽기·쓰기 | 읽기 전용 |
@@ -67,7 +69,7 @@ SQLite는 WAL, 외래 키 검사, 10초 연결 대기 시간을 사용한다. �
 
 | 파일 | 책임 |
 | --- | --- |
-| [api.py](../backend/api.py) | 앱 수명주기, 화면 상태, Incoming 미리보기, 이벤트·배치·사용자 보정, 작업 등록·취소 |
+| [api.py](../backend/api.py) | 앱 수명주기, 화면 상태, Incoming·managed 원본/미리보기, 이벤트·배치·사용자 보정, 작업 등록·취소 |
 | [devices.py](../backend/devices.py) | 원래 장비명별 이름 규칙, 공통 이름 결정, 조회·변경·충돌 검사 |
 | [resets.py](../backend/resets.py) | incoming·SSH를 보존한 managed·캐시·임시 데이터·카탈로그 삭제, 중단 후 삭제 재개 |
 | [catalog.py](../backend/catalog.py) | DB 스키마·초기화·부분 마이그레이션·트랜잭션·작업 등록 |

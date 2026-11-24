@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from archive import (
     archive_config, archive_connection, archive_revision as config_identity, resolve_remote_file, storage_id_for,
 )
-from catalog import database, now, queue_job
+from catalog import LANE_REMOTE, database, now, queue_job
 from media import delete_verified_file, directory, fingerprint, regular_file, relative_parts
 from settings import fail
 from transfers import sftp_disconnected
@@ -66,14 +66,14 @@ def queue_offload(db, request):
     }
     try:
         job_id = queue_job(db, "offload", payload)
-    except ValueError:
-        fail(409, "진행 중인 파일 작업이 끝난 뒤 로컬 원본 비우기를 실행하세요.")
+    except ValueError as exc:
+        fail(409, str(exc))
     result = {
         "totalFiles": len(files), "completedFiles": 0, "offloaded": 0, "failed": 0,
         "freedBytes": 0, "errors": [], "current": "", "phase": "대기 중",
     }
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), job_id))
-    return {"id": job_id, "count": len(files)}
+    return {"id": job_id, "lane": LANE_REMOTE, "count": len(files)}
 
 
 def mark_remote_missing(storage_id, remote_path):
@@ -167,7 +167,15 @@ def offload_file(sftp, config, managed, item):
 
     if not recovering:
         with database(write=True) as db:
-            db.execute("UPDATE media SET status='offloading' WHERE id=? AND status='available'", (item["id"],))
+            cursor = db.execute(
+                """UPDATE media SET status='offloading' WHERE id=? AND status='available'
+                   AND sha=? AND path=? AND xmp_path IS ? AND xmp_sha IS ?""",
+                (item["id"], item["sha"], item["local"],
+                 expected_xmp["local"] if expected_xmp else None,
+                 expected_xmp["sha"] if expected_xmp else None),
+            )
+            if cursor.rowcount != 1:
+                fail(409, "카탈로그의 원본 또는 XMP 정보가 변경되어 비우지 않았습니다.")
 
     if primary_exists:
         delete_verified_file(managed, item["local"], item["fingerprint"])

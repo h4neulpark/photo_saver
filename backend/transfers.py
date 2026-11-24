@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from archive import archive_config, archive_connection, archive_revision as config_identity, relative_path, storage_id_for
-from catalog import database, now, queue_job, upsert_remote_file
+from catalog import LANE_REMOTE, database, now, queue_job, upsert_remote_file
 from media import fingerprint, inspect, regular_file
 from settings import fail
 
@@ -143,12 +143,12 @@ def queue_transfer(db, request, device_folder):
     payload = {"config": config_identity(config), "files": files, "token": uuid4().hex}
     try:
         job_id = queue_job(db, "upload", payload)
-    except ValueError:
-        fail(409, "진행 중인 파일 작업이 끝난 뒤 업로드하세요.")
+    except ValueError as exc:
+        fail(409, str(exc))
     result = {"totalFiles": len(files), "completedFiles": 0, "uploaded": 0, "skipped": 0, "failed": 0,
               "totalBytes": sum(item["size"] or 0 for item in files), "transferredBytes": 0, "errors": []}
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id))
-    return {"id": job_id, "count": len(files)}
+    return {"id": job_id, "lane": LANE_REMOTE, "count": len(files)}
 
 
 class UploadCancelled(Exception):

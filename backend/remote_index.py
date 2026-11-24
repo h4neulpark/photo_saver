@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from archive import (
     archive_config, archive_connection, archive_revision as config_identity, relative_path, storage_id_for,
 )
-from catalog import database, ensure_storage, now, queue_job, upsert_remote_file
+from catalog import LANE_REMOTE, database, ensure_storage, now, queue_job, upsert_remote_file
 from companions import XMP
 from media import SUPPORTED
 from settings import fail
@@ -55,15 +55,15 @@ def queue_remote_index(db, request):
     }
     try:
         job_id = queue_job(db, "remote-index", payload)
-    except ValueError:
-        fail(409, "진행 중인 파일 작업이 끝난 뒤 원격 인덱싱을 실행하세요.")
+    except ValueError as exc:
+        fail(409, str(exc))
     result = {
         "scope": scope, "fullRehash": bool(request.full_rehash),
         "totalFiles": 0, "processedFiles": 0, "hashed": 0, "unchanged": 0,
         "missing": 0, "failed": 0, "errors": [], "current": "", "phase": "대기 중",
     }
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), job_id))
-    return {"id": job_id, "scope": scope}
+    return {"id": job_id, "lane": LANE_REMOTE, "scope": scope}
 
 
 def resolve_remote_scope(sftp, root, scope):

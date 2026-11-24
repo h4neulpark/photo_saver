@@ -64,14 +64,14 @@ function savedIncomingLayout() {
   }
 }
 
-const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, job: null, timezone: 'Asia/Seoul' };
+const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), preview: null,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
-  sshTestBusy: false, sshTestResult: null,
+  catalogOpBusy: false, sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '',
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
   catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
@@ -82,6 +82,8 @@ let refreshTimer;
 let stateRequest = 0;
 let catalogRequest = 0;
 let devicesRequest = 0;
+let previewMediaGeneration = 0;
+let pendingPreviewFocus = null;
 
 const page = document.getElementById('page');
 const nav = document.getElementById('navigation');
@@ -114,8 +116,50 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-function jobActive(job = state.job) {
-  return job && ['queued', 'running'].includes(job.status);
+const jobLanes = { scan: 'local', move: 'local', delete: 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const lanes = ['local', 'remote', 'exclusive'];
+function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
+function jobActive(job = state.job) { return isJobActive(job); }
+function normalizeJobs(snapshot) {
+  const jobs = { local: null, remote: null, exclusive: null, ...snapshot.jobs };
+  const activeJobs = { local: null, remote: null, exclusive: null, ...snapshot.activeJobs };
+  if (!snapshot.jobs && snapshot.job) jobs[snapshot.job.lane || jobLanes[snapshot.job.kind] || 'exclusive'] = snapshot.job;
+  for (const lane of lanes) {
+    if (jobs[lane]) jobs[lane] = { ...jobs[lane], lane, result: jobs[lane].result || {} };
+    if (!snapshot.activeJobs) activeJobs[lane] = isJobActive(jobs[lane]) ? jobs[lane] : null;
+    else if (activeJobs[lane]) activeJobs[lane] = { ...activeJobs[lane], lane, result: activeJobs[lane].result || {} };
+  }
+  return { jobs, activeJobs };
+}
+function laneJob(lane) {
+  return state.jobs?.[lane] || ((state.job?.lane || jobLanes[state.job?.kind]) === lane ? state.job : null);
+}
+function activeLaneJob(lane) {
+  const job = state.activeJobs?.[lane] || laneJob(lane);
+  return isJobActive(job) ? job : null;
+}
+function exclusiveActive() { return Boolean(activeLaneJob('exclusive')) || view.catalogOpBusy; }
+function localBusy() { return exclusiveActive() || Boolean(activeLaneJob('local')); }
+function remoteBusy() { return exclusiveActive() || Boolean(activeLaneJob('remote')); }
+function anyJobActive() { return lanes.some(lane => activeLaneJob(lane)); }
+function setOptimisticJob(job) {
+  const lane = job.lane || jobLanes[job.kind] || 'exclusive';
+  job = { ...job, lane, result: job.result || {} };
+  state.job = job;
+  state.jobs[lane] = job;
+  state.activeJobs[lane] = isJobActive(job) ? job : null;
+}
+function activeJobsBar() {
+  if (!anyJobActive()) return '';
+  const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
+  const kinds = { scan: '검사', move: '이동', delete: '삭제', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
+    const job = activeLaneJob(lane);
+    if (!job) return '';
+    const result = job.result || {};
+    const cancel = job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
+    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
+  }).join('')}</div>`;
 }
 
 function jobMessage(job) {
@@ -134,32 +178,41 @@ async function syncState() {
   const request = ++stateRequest;
   window.clearTimeout(refreshTimer);
   try {
-    const previousJob = state.job;
+    const previousJobs = Object.fromEntries(lanes.map(lane => [lane, laneJob(lane)]));
     const snapshot = await api('state');
     if (request !== stateRequest) return;
-    Object.assign(state, snapshot);
+    Object.assign(state, snapshot, normalizeJobs(snapshot));
     view.loadError = '';
-    if (previousJob?.kind === 'reset-all' && jobActive(previousJob) && !state.job) {
-      clearCatalogViews();
-      announce('incoming과 SSH 연결 설정을 보존하고 managed·캐시·카탈로그를 초기화했습니다.');
-    } else if (jobActive(previousJob) && state.job?.id === previousJob.id && !jobActive()) {
-      announce(jobMessage(state.job));
-      if (state.job.kind === 'upload' && view.archive && view.page === 'archive') await browseArchive(view.archivePath);
-      if (view.page === 'catalog') await loadCatalog();
+    const messages = [];
+    let completed = false;
+    for (const lane of lanes) {
+      const previous = previousJobs[lane], current = laneJob(lane);
+      if (previous?.kind === 'reset-all' && isJobActive(previous) && !current) {
+        clearCatalogViews();
+        messages.push('incoming과 SSH 연결 설정을 보존하고 managed·캐시·카탈로그를 초기화했습니다.');
+        completed = true;
+      } else if (isJobActive(previous) && current?.id === previous.id && !isJobActive(current)) {
+        messages.push(jobMessage(current));
+        completed = true;
+        if (lane === 'remote' && current.kind === 'upload' && view.archive && view.page === 'archive') await browseArchive(view.archivePath);
+      }
     }
+    if (messages.length) announce(messages.filter(Boolean).join(' · '));
+    if (completed && view.page === 'catalog') await loadCatalog();
     const sourceKeys = new Set(sourceFiles().flatMap(sourceAssetKeys));
     for (const key of view.sourceSelection) if (!sourceKeys.has(key)) view.sourceSelection.delete(key);
     const selectable = new Set(state.incoming.filter(canSelectIncoming).map(file => file.id));
     for (const id of view.incomingSelection) {
       if (!selectable.has(id)) view.incomingSelection.delete(id);
     }
-    updatePreviewAfterDelete();
+    const preservePreviewMessage = updatePreviewAfterDelete();
+    reconcilePreview({ preserveMessage: preservePreviewMessage });
   } catch (error) {
     if (request === stateRequest) view.loadError = error.message;
   } finally {
     if (request === stateRequest) {
       view.connecting = false;
-      if (jobActive() || view.loadError) refreshTimer = window.setTimeout(async () => {
+      if (anyJobActive() || view.loadError) refreshTimer = window.setTimeout(async () => {
         await syncState();
         render();
       }, view.loadError ? 2500 : 650);
@@ -169,7 +222,7 @@ async function syncState() {
 
 async function submitJob(kind, payload, preview = null) {
   const result = await api(`jobs/${kind}`, 'POST', payload);
-  state.job = { id: result.id, kind, status: 'queued' };
+  setOptimisticJob({ id: result.id, kind, status: 'queued' });
   if (preview) preview.jobId = result.id;
   else view.incomingSelection.clear();
   await syncState();
@@ -187,6 +240,7 @@ function announce(message) {
 }
 
 function button(action, label, { glyph, primary, danger, disabled, extra = '' } = {}) {
+  if (['new-event', 'new-child', 'edit-event', 'delete-event', 'collect', 'move-event', 'edit-media', 'confirm-event', 'resolve-time'].includes(action)) disabled ||= exclusiveActive();
   return `<button type="button" class="button${primary ? ' primary' : ''}${danger ? ' danger' : ''}" data-action="${action}" ${disabled ? 'disabled' : ''} ${extra}>${glyph ? icon(glyph) : ''}${label}</button>`;
 }
 
@@ -218,20 +272,23 @@ function sizeLabel(size) {
   return size >= 1000 ? `${(size / 1000).toFixed(2)} GB` : `${Number(size.toFixed(1))} MB`;
 }
 
-function fileThumbnail(file, interactive = false, card = false) {
+function fileThumbnail(file, interactive = false, card = false, source = 'incoming') {
   const picture = file.kind === 'photo';
   const image = file.thumbnail ? `<img src="${escapeHtml(file.thumbnail)}" alt="" loading="lazy">` : '';
   const contents = `${icon(picture ? 'photo' : 'video')}${image}`;
-  if (interactive && file.preview) {
-    return `<button type="button" class="thumb" data-action="preview-incoming" data-value="${escapeHtml(file.id)}"
-      aria-label="${escapeHtml(file.name)} 미리보기" ${card ? 'data-card-preview' : ''}>${contents}</button>`;
+  const canPreview = source === 'managed' ? file.status === 'available' && Boolean(file.preview) : Boolean(file.preview);
+  if (interactive && canPreview) {
+    const action = source === 'managed' ? 'preview-managed' : 'preview-incoming';
+    const cardAttr = source === 'incoming' && card ? ' data-card-preview' : '';
+    return `<button type="button" class="thumb" data-action="${action}" data-value="${escapeHtml(file.id)}"
+      aria-label="${escapeHtml(file.name)} 미리보기"${cardAttr}>${contents}</button>`;
   }
   return `<span class="thumb">${contents}</span>`;
 }
 
-function fileCell(file, detail, interactive = false) {
+function fileCell(file, detail, interactive = false, source = 'incoming') {
   return `<div class="file-cell">
-    ${fileThumbnail(file, interactive)}
+    ${fileThumbnail(file, interactive, false, source)}
     <div><strong>${escapeHtml(file.name)}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}</div>
   </div>`;
 }
@@ -318,8 +375,8 @@ function incomingActions() {
   const movable = selectedIncoming(file => file.status === 'ready').length;
   const moveLabel = movable && movable !== count ? `신규 ${movable}개를 managed로 이동` : '선택 항목을 managed로 이동';
   return `<span class="small muted">${count}개 선택됨${photos && photos !== count ? ` · 사진 ${photos}개` : ''}</span>
-    <div>${button('delete-incoming', '사진 삭제', { glyph: 'trash', danger: true, disabled: !photos || jobActive() })}
-    ${button('move-incoming', moveLabel, { glyph: 'arrow', primary: true, disabled: !movable || jobActive() })}</div>`;
+    <div>${button('delete-incoming', '사진 삭제', { glyph: 'trash', danger: true, disabled: !photos || localBusy() })}
+    ${button('move-incoming', moveLabel, { glyph: 'arrow', primary: true, disabled: !movable || localBusy() })}</div>`;
 }
 
 function pendingXmpLinks() {
@@ -343,26 +400,27 @@ function pendingXmpSection() {
           </select>` : `<span class="muted">${escapeHtml(file.reason || '연결 가능한 원본을 찾지 못했습니다.')}</span>`}</td></tr>`;
       }).join('')}</tbody></table></div>
     <div class="action-bar"><span class="small muted">${duplicated ? '같은 원본에 여러 XMP가 선택되었습니다.' : '원본을 확인한 뒤 XMP를 함께 보관합니다.'}</span>
-      ${button('link-xmp', '선택한 XMP 연결', { primary: true, disabled: !selected.length || duplicated || jobActive() })}</div>
+      ${button('link-xmp', '선택한 XMP 연결', { primary: true, disabled: !selected.length || duplicated || localBusy() })}</div>
   </section>`;
 }
 
 function incomingPage() {
   const results = state.incoming.filter(file => !view.incomingKind || file.kind === view.incomingKind);
-  const active = jobActive();
-  const failed = state.job?.status === 'failed';
-  const scanning = active && state.job.kind === 'scan';
+  const job = activeLaneJob('exclusive') || laneJob('local');
+  const active = isJobActive(job);
+  const failed = job?.status === 'failed';
+  const scanning = active && job.kind === 'scan';
   const jobLabels = {
     scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중',
     'xmp-link': 'XMP 연결 중', upload: '아카이브 업로드 중', offload: '로컬 원본 비우기 중',
     'remote-index': '원격 아카이브 인덱싱 중', 'reset-all': '서버 데이터 초기화 중',
   };
-  const status = active ? (jobLabels[state.job.kind] || '작업 진행 중') :
+  const status = active ? (jobLabels[job.kind] || '작업 진행 중') :
     failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
-  const detail = failed ? state.job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
+  const detail = failed ? job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
     state.scan ? `${dateTimeFormatter(state.timezone).format(new Date(state.scan.finishedAt))} · ${state.scan.result.checked}개 검사` : '새로 고침을 눌러 검사를 시작하세요.';
   return `${header('Incoming Library', '사진과 영상을 검사하고 managed로 옮길 파일을 선택하세요.',
-    button('scan', scanning ? '검사 중…' : '새로 고침', { glyph: 'refresh', disabled: active || view.connecting }))}
+    button('scan', scanning ? '검사 중…' : '새로 고침', { glyph: 'refresh', disabled: localBusy() || view.connecting }))}
     <div class="scan-strip" role="status">
       <span>${icon(active ? 'refresh' : 'check')} ${status}</span>
       <span class="small">${escapeHtml(detail)}</span>
@@ -446,7 +504,7 @@ function filteredEventFiles(files) {
 }
 
 function offloadStatus() {
-  const job = state.job;
+  const job = laneJob('remote');
   if (job?.kind !== 'offload') return '';
   const result = job.result || {};
   const active = jobActive(job);
@@ -462,7 +520,7 @@ function offloadStatus() {
 
 function eventFileStatus(file) {
   if (file.status === 'archived') {
-    return `${badge('archived', '아카이브 보관')}${file.reviewReason ? `<div class="file-reason small muted">${escapeHtml(file.reviewReason)}</div>` : ''}`;
+    return `${badge('archived', '아카이브 보관')}<div class="file-reason small muted">로컬 원본 없음</div>${file.reviewReason ? `<div class="file-reason small muted">${escapeHtml(file.reviewReason)}</div>` : ''}`;
   }
   const primary = file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
     badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정');
@@ -527,25 +585,25 @@ function eventPage() {
           ${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}
           ${confirmButton}
         </div>
-        <div class="table-wrap">${filtered.length ? `<table aria-label="이벤트별 파일">
+        <div class="table-wrap" id="event-rows">${filtered.length ? `<table aria-label="이벤트별 파일">
           <thead><tr><th scope="col">${checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set(filtered.every(file => view.eventSelection.has(file.id)) ? ['all'] : []))}</th>
             <th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">배치 상태</th></tr></thead>
           <tbody>${filtered.map(file => `<tr class="${view.eventSelection.has(file.id) ? 'selected' : ''}">
             <td>${checkbox('event', file.id, `${file.name} 선택`, view.eventSelection)}</td>
-            <td>${fileCell(file, file.device || '장비 확인 필요')}${(file.xmp || file.canDownload) ? `<div class="file-links">${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}${file.canDownload ? `<a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a>` : ''}</div>` : ''}</td>
+            <td>${fileCell(file, file.device || '장비 확인 필요', true, 'managed')}${(file.xmp || file.canDownload) ? `<div class="file-links">${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}${file.canDownload ? `<a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a>` : ''}</div>` : ''}</td>
             <td class="numbers muted">${file.time ? footageDate.format(new Date(file.time)) : '—'}
               ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
               ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
-              ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정">촬영 시각 지정</button>` : ''}</td>
+              ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정" ${exclusiveActive() ? 'disabled' : ''}>촬영 시각 지정</button>` : ''}</td>
             <td>${eventFileStatus(file)}</td>
           </tr>`).join('')}</tbody>
         </table>` : emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
         <div class="action-bar">
           <div>
-            ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트"><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>
+            ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트" ${exclusiveActive() ? 'disabled' : ''}><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>
             ${button('move-event', '이동', { disabled: true })}` : ''}
             ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
-            ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || jobActive() })}
+            ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || remoteBusy() })}
           </div>
           ${confirmButton}
         </div>
@@ -592,7 +650,7 @@ function sourceEntries() {
 function archivePage() {
   const entries = sourceEntries();
   const allAssets = entries.flatMap(entry => entry.assets);
-  const busy = jobActive() || view.uploadStarting;
+  const busy = remoteBusy() || view.uploadStarting;
   return `${header('아카이브 전송', '파일·폴더를 선택해 업로드하거나 Destination으로 드래그하세요.', '')}
     ${uploadStatus()}${remoteIndexStatus()}
     <div class="split">
@@ -645,7 +703,7 @@ function archiveDestination() {
         (archive.entries.length ? `<ul class="tree">${archive.entries.map((entry, index) => {
           const entryPath = [view.archivePath, entry.name].filter(Boolean).join('/');
           return `<li class="tree-row">
-          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}" ${!jobActive() && !view.uploadStarting ? `data-archive-drop="${escapeHtml(entryPath)}"` : ''}>${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
+          ${entry.kind === 'folder' ? `<button type="button" class="tree-button" data-action="open-archive" data-value="${index}" ${!remoteBusy() && !view.uploadStarting ? `data-archive-drop="${escapeHtml(entryPath)}"` : ''}>${icon('folder')}<span>${escapeHtml(entry.name)}</span>${icon('right')}</button>` :
             `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>${entry.kind === 'file' ? `<a class="button icon" href="/api/archive/download?path=${encodeURIComponent(entryPath)}" target="_blank" rel="noopener" aria-label="${escapeHtml(entry.name)} 다운로드" title="다운로드">${icon('download')}</a>` : ''}`}
         </li>`;
         }).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
@@ -655,7 +713,7 @@ function archiveDestination() {
 }
 
 function uploadStatus() {
-  const job = state.job;
+  const job = laneJob('remote');
   if (job?.kind !== 'upload') return '';
   const result = job.result || {};
   const active = jobActive(job);
@@ -663,7 +721,7 @@ function uploadStatus() {
   return `<section class="surface upload-status" aria-label="아카이브 업로드 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '업로드 대기 중' : result.phase || '업로드 중' : job.status === 'done' ? '업로드 완료' : job.status === 'cancelled' ? '업로드 중지됨' : '업로드 실패'}</strong>
       <span class="small muted">${result.completedFiles || 0} / ${result.totalFiles || 0}개 처리 · 업로드 ${result.uploaded || 0}개 · 건너뜀 ${result.skipped || 0}개 · 실패 ${result.failed || 0}개</span>
-      ${active ? button('cancel-archive-upload', result.cancelRequested ? '중지 중…' : '업로드 중지', { disabled: result.cancelRequested }) : ''}</div>
+      ${active ? button('cancel-archive-upload', result.cancelRequested ? '중지 중…' : '업로드 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>
     ${active ? `<progress max="100" value="${percent}" aria-label="업로드 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '서버에 연결하고 있습니다.')} · ${sizeLabel((result.transferredBytes || 0) / 1_000_000)} / ${sizeLabel((result.totalBytes || 0) / 1_000_000)}</p>` : ''}
     ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
     ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
@@ -671,7 +729,7 @@ function uploadStatus() {
 }
 
 function remoteIndexStatus() {
-  const job = state.job;
+  const job = laneJob('remote');
   if (job?.kind !== 'remote-index') return '';
   const result = job.result || {};
   const active = jobActive(job);
@@ -681,7 +739,7 @@ function remoteIndexStatus() {
   return `<section class="surface upload-status" aria-label="원격 아카이브 인덱싱 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '원격 인덱싱 대기 중' : result.phase || '원격 인덱싱 중' : job.status === 'done' ? '원격 인덱싱 완료' : job.status === 'cancelled' ? '원격 인덱싱 중지됨' : '원격 인덱싱 실패'}</strong>
       <span class="small muted">${escapeHtml(scopeLabel)} · ${result.processedFiles || 0} / ${total}개 처리 · 해시 ${result.hashed || 0}개 · 변경 없음 ${result.unchanged || 0}개${result.missing ? ` · 누락 ${result.missing}개` : ''}${result.failed ? ` · 실패 ${result.failed}개` : ''}</span>
-      ${active ? button('cancel-remote-index', result.cancelRequested ? '중지 중…' : '인덱싱 중지', { disabled: result.cancelRequested }) : ''}</div>
+      ${active ? button('cancel-remote-index', result.cancelRequested ? '중지 중…' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>
     ${active ? `<progress max="100" value="${percent}" aria-label="원격 인덱싱 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '원격 아카이브에 연결하고 있습니다.')}</p>` : ''}
     ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
     ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
@@ -689,7 +747,7 @@ function remoteIndexStatus() {
 }
 
 function openRemoteIndexDialog() {
-  if (!view.archive || jobActive()) return;
+  if (!view.archive || remoteBusy()) return;
   const currentScope = view.archivePath || '';
   showDialog('원격 아카이브 인덱싱', `<p>원격 스토리지의 사진·영상·XMP 파일을 증분 스캔해 아카이브 DB(<code>remote_files</code>)에 등록합니다. 이미 기록된 파일 중 크기와 수정 시각이 같은 파일은 재해시를 건너뜁니다.</p>
     <p class="small muted">인덱싱된 원격 파일은 Incoming 수집 및 업로드 시 전역 중복 차단에 반영되며, 파일 기록의 <strong>원격 인덱스</strong> 탭에서 검색·다운로드할 수 있습니다.</p>
@@ -704,7 +762,7 @@ function openRemoteIndexDialog() {
     const result = await api('archive/index', 'POST', {
       connection: view.archive.connectionVersion, path: scope, full_rehash: fullRehash,
     });
-    state.job = { id: result.id, kind: 'remote-index', status: 'queued', result: { scope } };
+    setOptimisticJob({ id: result.id, kind: 'remote-index', status: 'queued', result: { scope } });
     await syncState();
     announce('원격 아카이브 인덱싱을 시작합니다.');
   });
@@ -758,7 +816,7 @@ function confirmDuplicateUpload(keys, source, destination, data) {
 }
 
 async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath, allowDuplicates = false) {
-  if (jobActive() || view.uploadStarting || view.archiveBusy || !view.archive || !keys.length) return;
+  if (remoteBusy() || view.uploadStarting || view.archiveBusy || !view.archive || !keys.length) return;
   if (keys.length > 10000) throw new Error('한 번에 최대 10,000개 파일을 업로드할 수 있습니다. 나누어 선택하세요.');
   view.uploadStarting = true;
   render();
@@ -768,7 +826,7 @@ async function startArchiveUpload(keys = [...view.sourceSelection], source = [..
     const result = await api('archive/transfers', 'POST', {
       items, source, destination, connection: view.archive.connectionVersion, allow_duplicates: allowDuplicates,
     });
-    state.job = { id: result.id, kind: 'upload', status: 'queued', result: { totalFiles: result.count } };
+    setOptimisticJob({ id: result.id, kind: 'upload', status: 'queued', result: { totalFiles: result.count } });
     await syncState();
     announce(`${result.count}개 파일의 업로드를 시작합니다.`);
   } catch (error) {
@@ -1006,7 +1064,7 @@ function settingsPage() {
         `<span class="small muted">${settings ? settings.hostKeyTrusted ? '신뢰됨' : '미등록' : '확인 중'}</span>` +
         button('reset-host-key', '호스트 키 초기화', {
           danger: true,
-          disabled: !settings?.hostKeyTrusted || view.sshTestBusy || (jobActive() && ['upload', 'offload', 'remote-index', 'reset-all'].includes(state.job?.kind)),
+          disabled: !settings?.hostKeyTrusted || view.sshTestBusy || remoteBusy(),
         }))}
       ${settingRow('SSH 접속 테스트', view.sshTestResult ? `<span role="status" class="${view.sshTestResult.ok ? 'ssh-test-success' : 'form-error'}">${escapeHtml(view.sshTestResult.message)}</span>` :
         '저장된 IP, 계정명, 키로 공개키 인증을 확인합니다.',
@@ -1021,24 +1079,24 @@ function settingsPage() {
         view.devices.map((device, index) => `<form class="setting-row device-name-form" data-source="${escapeHtml(device.source)}">
           <div class="device-name-origin"><label for="device-name-${index}">${escapeHtml(device.source)}</label>
             <p class="small muted">기존 파일 ${device.count}개와 이후 파일에 적용</p></div>
-          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>
-            <button type="submit" class="button" ${jobActive() && ['upload', 'offload', 'reset-all'].includes(state.job?.kind) ? 'disabled' : ''}>이름 저장</button></div>
+          <div class="setting-controls"><input id="device-name-${index}" name="name" value="${escapeHtml(device.name)}" required maxlength="80" autocomplete="off" ${exclusiveActive() || ['upload', 'offload'].includes(activeLaneJob('remote')?.kind) ? 'disabled' : ''}>
+            <button type="submit" class="button" ${exclusiveActive() || ['upload', 'offload'].includes(activeLaneJob('remote')?.kind) ? 'disabled' : ''}>이름 저장</button></div>
           <p class="form-error device-name-error" role="alert" hidden></p>
         </form>`).join('')}
     </section>
     <section class="surface settings-section" aria-label="DB 백업 및 복원">
       <div class="surface-head"><h2>${icon('file')} DB 백업 및 복원</h2></div>
       ${settingRow('카탈로그 백업', '이벤트와 파일 배치가 포함된 SQLite 백업을 다운로드합니다.',
-        button('download-catalog', 'DB 백업 다운로드', { glyph: 'download', disabled: jobActive() }))}
+        button('download-catalog', 'DB 백업 다운로드', { glyph: 'download', disabled: anyJobActive() || view.catalogOpBusy }))}
       ${settingRow('카탈로그 복원', '선택한 백업의 내용으로 현재 카탈로그를 교체합니다.',
         `<input id="restore-catalog-file" type="file" accept=".sqlite3,.sqlite,.db,application/octet-stream" hidden>` +
-        (view.restoreFile ? maskedSetting('파일 선택됨') : '') + button('pick-catalog-file', '백업 파일 선택') +
-        button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || jobActive() }))}
+        (view.restoreFile ? maskedSetting('파일 선택됨') : '') + button('pick-catalog-file', '백업 파일 선택', { disabled: anyJobActive() || view.catalogOpBusy }) +
+        button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || anyJobActive() || view.catalogOpBusy }))}
     </section>
     <section class="surface settings-section" aria-label="데이터 초기화">
       <div class="surface-head"><h2>${icon('trash')} 데이터 초기화</h2></div>
       ${settingRow('managed 및 기록 초기화', 'managed 원본과 부가 파일, 썸네일, 카탈로그·작업 기록을 영구 삭제합니다. incoming과 SSH 연결 설정은 유지합니다.',
-        button('reset-catalog', '데이터 초기화', { danger: true, disabled: jobActive() }))}
+        button('reset-catalog', '데이터 초기화', { danger: true, disabled: anyJobActive() || view.catalogOpBusy }))}
       ${resetStatus()}
     </section>`;
 }
@@ -1194,19 +1252,23 @@ function confirmResetHostKey() {
 }
 
 async function downloadCatalog() {
-  const response = await fetch('/api/settings/catalog/backup', { cache: 'no-store' });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error.detail || 'DB 백업을 다운로드할 수 없습니다.');
-  }
-  const url = URL.createObjectURL(await response.blob());
-  const download = document.createElement('a');
-  download.href = url;
-  download.download = response.headers.get('content-disposition')?.match(/filename="?([^";]+)/)?.[1] || 'photo-saver.sqlite3';
-  document.body.append(download);
-  download.click();
-  download.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+  view.catalogOpBusy = true;
+  render();
+  try {
+    const response = await fetch('/api/settings/catalog/backup', { cache: 'no-store' });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || 'DB 백업을 다운로드할 수 없습니다.');
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const download = document.createElement('a');
+    download.href = url;
+    download.download = response.headers.get('content-disposition')?.match(/filename="?([^";]+)/)?.[1] || 'photo-saver.sqlite3';
+    document.body.append(download);
+    download.click();
+    download.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } finally { view.catalogOpBusy = false; render(); }
 }
 
 function confirmCatalogRestore() {
@@ -1214,19 +1276,23 @@ function confirmCatalogRestore() {
   if (!file) return;
   showDialog('카탈로그 복원', `<p>선택한 백업으로 현재 이벤트와 파일 배치를 교체합니다.</p>
     <p>원본 사진과 영상은 디스크에 보관됩니다.</p>`, 'DB 복원', async () => {
-    await api('settings/catalog/restore', 'POST', file);
-    view.restoreFile = null;
-    view.incomingSelection.clear();
-    view.xmpChoices.clear();
-    chooseEvent('unassigned');
-    view.sourcePath = [];
-    await syncState();
-    announce('카탈로그를 복원했습니다.');
+    view.catalogOpBusy = true;
+    render();
+    try {
+      await api('settings/catalog/restore', 'POST', file);
+      view.restoreFile = null;
+      view.incomingSelection.clear();
+      view.xmpChoices.clear();
+      chooseEvent('unassigned');
+      view.sourcePath = [];
+      await syncState();
+      announce('카탈로그를 복원했습니다.');
+    } finally { view.catalogOpBusy = false; render(); }
   }, { danger: true });
 }
 
 function resetStatus() {
-  const job = state.job;
+  const job = laneJob('exclusive');
   if (job?.kind !== 'reset-all') return '';
   const result = job.result || {};
   const detail = job.status === 'failed' ? result.error :
@@ -1252,8 +1318,7 @@ function clearCatalogViews() {
   view.catalogRemoteFolder = ''; view.catalogRemoteExpanded.clear();
   view.restoreFile = null;
   view.devices = []; view.devicesError = '';
-  view.preview = null;
-  if (mediaPreview.open) mediaPreview.close();
+  closeMediaPreview({ restoreFocus: false });
 }
 
 function confirmCatalogReset() {
@@ -1267,7 +1332,8 @@ function confirmCatalogReset() {
       <input name="confirmation" required autocomplete="off" spellcheck="false"></label>`,
   '모든 데이터 삭제', async form => {
     const result = await api('settings/catalog/reset', 'POST', { confirmation: form.get('confirmation') });
-    state.job = { id: result.id, kind: 'reset-all', status: 'queued', result: {} };
+    closeMediaPreview({ restoreFocus: false });
+    setOptimisticJob({ id: result.id, kind: 'reset-all', status: 'queued', result: {} });
     await syncState();
     if (jobActive()) announce('서버 데이터 초기화를 시작했습니다. 설정에서 진행 상황을 확인할 수 있습니다.');
   }, { danger: true });
@@ -1507,7 +1573,7 @@ function updateEventActions() {
   const target = page.querySelector('#move-event-target');
   if (target) {
     target.value = view.eventTarget || '';
-    page.querySelector('[data-action="move-event"]').disabled = !target.value || !view.eventSelection.size;
+    page.querySelector('[data-action="move-event"]').disabled = exclusiveActive() || !target.value || !view.eventSelection.size;
   }
 }
 
@@ -1519,6 +1585,8 @@ function render() {
   const folderScroll = page.querySelector('.catalog-folder-list')?.scrollTop || 0;
   const incomingTable = page.querySelector('#incoming-rows');
   const tableScroll = incomingTable ? { top: incomingTable.scrollTop, left: incomingTable.scrollLeft } : null;
+  const eventTable = page.querySelector('#event-rows');
+  const eventScroll = eventTable ? { top: eventTable.scrollTop, left: eventTable.scrollLeft } : null;
   const xmpScroll = page.querySelector('.xmp-matches')?.scrollTop;
   const active = document.activeElement;
   const keepFocus = active && page.contains(active);
@@ -1529,7 +1597,7 @@ function render() {
   view.page = current.id;
   nav.innerHTML = navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join('');
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
-  page.innerHTML = `<main aria-labelledby="page-title">${status}${views[view.page]()}</main>`;
+  page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
   document.title = `${current.title} · Photo Saver`;
   if (view.page === 'events') updateEventActions();
   if (view.page === 'archive') {
@@ -1537,23 +1605,33 @@ function render() {
     page.querySelectorAll('[data-select="source"]').forEach(input => {
       const keys = entries[Number(input.value)]?.assets || [];
       input.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
-      input.disabled = jobActive() || view.uploadStarting;
+      input.disabled = remoteBusy() || view.uploadStarting;
     });
     const all = page.querySelector('[data-select="source-all"]');
     const keys = entries.flatMap(entry => entry.assets);
     if (all) {
       all.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
-      all.disabled = !keys.length || jobActive() || view.uploadStarting;
+      all.disabled = !keys.length || remoteBusy() || view.uploadStarting;
     }
   }
   if (pageChanged) {
+    pendingPreviewFocus = null;
     window.scrollTo(0, 0);
     return;
   }
   if (catalogScrollPosition) page.querySelector('.catalog-table-wrap')?.scrollTo(catalogScrollPosition);
   page.querySelector('.catalog-folder-list')?.scrollTo(0, folderScroll);
-  if (tableScroll) page.querySelector('#incoming-rows').scrollTo(tableScroll);
+  if (tableScroll) page.querySelector('#incoming-rows')?.scrollTo(tableScroll);
+  if (eventScroll) page.querySelector('#event-rows')?.scrollTo(eventScroll);
   if (xmpScroll) page.querySelector('.xmp-matches')?.scrollTo(0, xmpScroll);
+  if (pendingPreviewFocus) {
+    const focusIntent = pendingPreviewFocus;
+    pendingPreviewFocus = null;
+    if (!view.preview) {
+      restorePreviewFocus(focusIntent);
+      return;
+    }
+  }
   if (keepFocus) {
     const replacement = [...page.querySelectorAll('button, input, select')].find(element => {
       if (active.id) return element.id === active.id;
@@ -1561,7 +1639,13 @@ function render() {
       if (active.dataset.xmpId) return element.dataset.xmpId === active.dataset.xmpId;
       return active.dataset.select && element.dataset.select === active.dataset.select && element.value === active.value;
     });
-    replacement?.focus({ preventScroll: true });
+    if (replacement) {
+      replacement.focus({ preventScroll: true });
+    } else if (active.dataset?.action === 'preview-managed' && view.page === 'events') {
+      restorePreviewFocus({ source: 'managed', returnFocus: { source: 'managed', id: active.dataset.value, eventId: view.eventId } });
+    } else if (active.dataset?.action === 'preview-incoming' && view.page === 'incoming') {
+      restorePreviewFocus({ source: 'incoming', returnFocus: { source: 'incoming', id: active.dataset.value, eventId: null } });
+    }
   }
 }
 
@@ -1607,69 +1691,252 @@ function confirmDeleteIncoming() {
   `사진 ${photos.length}개 삭제`, () => submitJob('delete', { ids: photos.map(file => file.id) }), { danger: true });
 }
 
-function currentPreviewFile() {
-  const preview = view.preview;
-  return preview && state.incoming.find(file => file.id === preview.ids[preview.index]);
+function previewCollection(source) {
+  return source === 'managed' ? state.managed : state.incoming;
+}
+
+function isPreviewableFile(source, file) {
+  if (!file || !file.preview) return false;
+  return source === 'managed' ? file.status === 'available' : true;
+}
+
+function currentPreviewFile(preview = view.preview) {
+  if (!preview) return null;
+  const id = preview.ids[preview.index];
+  if (!id) return null;
+  return previewCollection(preview.source).find(file => file.id === id) || null;
+}
+
+function previewEventLabel(file) {
+  if (!file.eventId) return '미배정';
+  const event = eventById(file.eventId);
+  if (!event) return '';
+  if (event.parent) {
+    const parent = eventById(event.parent);
+    return parent ? `${eventLabel(parent)} / ${eventLabel(event)}` : eventLabel(event);
+  }
+  return eventLabel(event);
+}
+
+function previewMetaHtml(source, file) {
+  if (source === 'managed') {
+    const eventName = previewEventLabel(file);
+    return `<span class="mono">${escapeHtml(`managed/${file.path}`)}</span> · ${sizeLabel(file.size)}${eventName ? ` · 이벤트: ${escapeHtml(eventName)}` : ''}`;
+  }
+  return `${escapeHtml(file.folder ? `incoming/${file.folder}` : 'incoming')} · ${sizeLabel(file.size)}`;
+}
+
+function defaultPreviewErrorMessage(source) {
+  if (source === 'managed') {
+    return '미리보기를 열 수 없습니다. 브라우저에서 지원하지 않는 형식이거나 원본을 읽을 수 없습니다. 원본 열기로 확인하거나 다시 시도하세요.';
+  }
+  return '미리보기를 열 수 없습니다. 원본 파일을 열거나 Incoming Library를 새로 고침하세요.';
+}
+
+function diagnosticMessageForStatus(source, file, status) {
+  if (status === 404) {
+    return source === 'managed'
+      ? '로컬 원본을 찾을 수 없습니다. 원본이 이동·비우기 되었는지 확인하거나 Incoming Library의 새로 고침으로 다시 검사하세요.'
+      : '원본 파일을 찾을 수 없습니다. Incoming Library를 새로 고침하세요.';
+  }
+  if (status === 403) return '로컬 원본의 읽기 권한이 없습니다. 파일·폴더 권한을 확인하세요.';
+  if (status === 409) return '원본 파일이 변경되었습니다. 원본을 확인한 뒤 Incoming Library의 새로 고침으로 다시 검사하세요.';
+  if (status === 415) return '미리보기를 지원하지 않는 파일 형식입니다. 원본 열기로 확인하세요.';
+  if (status === 200 || status === 206) {
+    return file.kind === 'video'
+      ? '브라우저에서 이 영상 코덱을 재생할 수 없거나 파일이 손상되었습니다. 원본 열기로 확인하세요.'
+      : '사진을 표시하거나 변환할 수 없습니다. 원본을 확인한 뒤 다시 검사하거나 원본 열기로 확인하세요.';
+  }
+  return defaultPreviewErrorMessage(source);
+}
+
+function disposePreviewMedia() {
+  previewMediaGeneration += 1;
+  for (const video of mediaPreview.querySelectorAll('video')) {
+    try {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    } catch {
+      // Ignore cleanup errors on detached or stubbed video elements.
+    }
+  }
+  mediaPreview.replaceChildren();
+}
+
+function restorePreviewFocus(closing) {
+  if (!closing) return;
+  const source = closing.returnFocus?.source || closing.source;
+  const currentId = closing.ids?.[closing.index];
+  const originalId = closing.returnFocus?.id;
+  if (source === 'incoming' && view.page === 'incoming') {
+    const buttons = [...page.querySelectorAll('[data-action="preview-incoming"]')];
+    const target = buttons.find(element => element.dataset.value === currentId)
+      || buttons.find(element => element.dataset.value === originalId)
+      || page.querySelector('[data-action="incoming-layout"][aria-pressed="true"]')
+      || page.querySelector('#file-search');
+    target?.focus({ preventScroll: true });
+    return;
+  }
+  if (source === 'managed' && view.page === 'events') {
+    const buttons = [...page.querySelectorAll('[data-action="preview-managed"]')];
+    const eventId = closing.returnFocus?.eventId;
+    const target = buttons.find(element => element.dataset.value === originalId)
+      || buttons.find(element => element.dataset.value === currentId)
+      || page.querySelector('#event-search')
+      || (eventId ? [...page.querySelectorAll('[data-action="choose-event"]')].find(element => element.dataset.value === eventId) : null)
+      || page.querySelector('[data-action="choose-event"][aria-current="true"]');
+    target?.focus({ preventScroll: true });
+  }
+}
+
+function closeMediaPreview({ restoreFocus = true, deferFocus = false } = {}) {
+  const closing = view.preview;
+  if (!restoreFocus) pendingPreviewFocus = null;
+  if (!closing && !mediaPreview.open) return;
+  disposePreviewMedia();
+  view.preview = null;
+  if (mediaPreview.open) mediaPreview.close();
+  if (restoreFocus && closing) {
+    if (deferFocus) {
+      pendingPreviewFocus = closing;
+    } else {
+      pendingPreviewFocus = null;
+      restorePreviewFocus(closing);
+    }
+  }
+}
+
+function openMediaPreview(source, id, ids, returnFocus = null) {
+  const index = ids.indexOf(id);
+  if (index < 0) return;
+  pendingPreviewFocus = null;
+  disposePreviewMedia();
+  view.preview = {
+    source,
+    ids: [...ids],
+    index,
+    confirming: false,
+    busy: false,
+    jobId: null,
+    deletingId: null,
+    message: '',
+    renderedSrc: null,
+    renderedKind: null,
+    returnFocus: returnFocus || { source, id, eventId: source === 'managed' ? view.eventId : null },
+  };
+  renderMediaPreview();
 }
 
 function openIncomingPreview(id) {
   const ids = filteredIncoming().filter(file => file.preview).map(file => file.id);
-  const index = ids.indexOf(id);
-  if (index < 0) return;
-  view.preview = { ids, index, confirming: false, busy: false, jobId: null, message: '' };
-  renderMediaPreview();
+  openMediaPreview('incoming', id, ids, { source: 'incoming', id, eventId: null });
 }
 
-function renderMediaPreview() {
-  const file = currentPreviewFile();
-  if (!file) return;
+function openManagedPreview(id) {
+  const ids = filteredEventFiles(footageForEvent(view.eventId))
+    .filter(file => isPreviewableFile('managed', file))
+    .map(file => file.id);
+  openMediaPreview('managed', id, ids, { source: 'managed', id, eventId: view.eventId });
+}
+
+function renderMediaPreview({ focusTitle = true } = {}) {
+  const preview = view.preview;
+  const file = currentPreviewFile(preview);
+  if (!preview || !file) return;
+  disposePreviewMedia();
+  const gen = previewMediaGeneration;
   const name = escapeHtml(file.name);
   const src = file.preview ? escapeHtml(file.preview) : '';
-  const media = !src ? '' : file.kind === 'photo' ? `<img src="${src}" alt="${name}" decoding="async">` :
-    `<video src="${src}" ${file.thumbnail ? `poster="${escapeHtml(file.thumbnail)}"` : ''} controls preload="metadata" playsinline></video>`;
+  const dataAttrs = `data-preview-gen="${gen}" data-preview-source="${preview.source}" data-preview-id="${escapeHtml(file.id)}"`;
+  const media = !src ? '' : file.kind === 'photo'
+    ? `<img src="${src}" alt="${name}" decoding="async" ${dataAttrs}>`
+    : `<video src="${src}" ${file.thumbnail ? `poster="${escapeHtml(file.thumbnail)}"` : ''} controls preload="metadata" playsinline ${dataAttrs}></video>`;
+  const metaHtml = previewMetaHtml(preview.source, file);
+  const errorOriginal = file.original ? `<a class="button" href="${escapeHtml(file.original)}" target="_blank" rel="noopener">원본 열기</a>` : '';
   mediaPreview.innerHTML = `<div class="preview-frame">
     <header class="preview-header"><div class="preview-title"><h2 id="media-preview-title" tabindex="-1">${name}</h2>
-      <p class="small muted">${escapeHtml(file.folder ? `incoming/${file.folder}` : 'incoming')} · ${sizeLabel(file.size)}</p></div>
+      <p class="small muted preview-meta">${metaHtml}</p></div>
       ${smallButton('close-preview', '미리보기 닫기', 'close')}</header>
-    <div class="preview-stage">
+    <div class="preview-stage${src ? '' : ' is-error'}">
       ${media}
       ${src ? '<p class="preview-media-loading" role="status">원본 불러오는 중…</p>' : ''}
-      <p class="preview-media-error" role="status" ${src ? 'hidden' : ''}>미리보기를 열 수 없습니다. 원본 파일을 열거나 Incoming Library를 새로 고침하세요.</p>
+      <div class="preview-media-error" role="status" ${src ? 'hidden' : ''}>
+        <p class="preview-error-message">${escapeHtml(defaultPreviewErrorMessage(preview.source))}</p>
+        <div class="preview-error-actions">
+          ${button('retry-preview', '다시 시도', { glyph: 'refresh' })}
+          ${errorOriginal}
+        </div>
+      </div>
     </div>
     <footer class="preview-footer"></footer>
   </div>`;
+  const metaEl = mediaPreview.querySelector('.preview-meta');
+  if (metaEl) metaEl.dataset.renderedHtml = metaHtml;
+  preview.renderedSrc = file.preview || null;
+  preview.renderedKind = file.kind || null;
   renderPreviewFooter();
   if (!mediaPreview.open) mediaPreview.showModal();
-  mediaPreview.querySelector('#media-preview-title').focus();
+  if (focusTitle) mediaPreview.querySelector('#media-preview-title')?.focus();
+}
+
+function updatePreviewMetadata() {
+  const preview = view.preview;
+  const file = currentPreviewFile(preview);
+  if (!preview || !file) return;
+  const titleEl = mediaPreview.querySelector('#media-preview-title');
+  if (titleEl && titleEl.textContent !== file.name) titleEl.textContent = file.name;
+  const metaEl = mediaPreview.querySelector('.preview-meta');
+  if (metaEl) {
+    const nextMetaHtml = previewMetaHtml(preview.source, file);
+    if (metaEl.dataset.renderedHtml !== nextMetaHtml) {
+      metaEl.dataset.renderedHtml = nextMetaHtml;
+      metaEl.innerHTML = nextMetaHtml;
+    }
+  }
+  renderPreviewFooter();
 }
 
 function renderPreviewFooter() {
-  const file = currentPreviewFile();
   const preview = view.preview;
+  const file = currentPreviewFile(preview);
   const footer = mediaPreview.querySelector('.preview-footer');
-  if (!file || !footer) return;
-  const canDelete = canDeleteIncoming(file) && !jobActive();
+  if (!preview || !file || !footer) return;
+  const isIncoming = preview.source === 'incoming';
+  const canDelete = isIncoming && canDeleteIncoming(file) && !localBusy();
   const counter = `<span class="numbers preview-count">${preview.index + 1} / ${preview.ids.length}</span>`;
-  if (preview.confirming || preview.busy) {
-    footer.innerHTML = `<p role="status">${preview.busy ? '사진을 삭제하고 있습니다.' :
+  if (isIncoming && (preview.confirming || preview.busy)) {
+    const html = `<p role="status">${preview.busy ? '사진을 삭제하고 있습니다.' :
       `<strong>${escapeHtml(file.name)}</strong> 파일을 incoming에서 영구 삭제합니다.`}</p>
       <div class="preview-controls">
         ${button('cancel-preview-delete', '취소', { disabled: preview.busy })}
         ${button('perform-preview-delete', '사진 삭제', { primary: true, danger: true, disabled: preview.busy })}
       </div>`;
-    if (!preview.busy) footer.querySelector('[data-action="perform-preview-delete"]').focus();
+    if (footer.dataset.renderedHtml !== html) {
+      footer.dataset.renderedHtml = html;
+      footer.innerHTML = html;
+      if (!preview.busy) footer.querySelector('[data-action="perform-preview-delete"]')?.focus();
+    }
     return;
   }
   const original = file.original ? `<a class="button" href="${escapeHtml(file.original)}" target="_blank" rel="noopener">원본 열기</a>` : '';
-  footer.innerHTML = `<div class="preview-controls" role="group" aria-label="파일 이동">
+  const hint = preview.message
+    ? escapeHtml(preview.message)
+    : isIncoming
+      ? `<kbd>←</kbd> <kbd>→</kbd> 이동${canDelete ? ' · <kbd>Delete</kbd> 삭제' : ''}`
+      : '닫은 뒤 선택 항목을 분류할 수 있습니다 · <kbd>←</kbd> <kbd>→</kbd> 이동';
+  const html = `<div class="preview-controls" role="group" aria-label="파일 이동">
       ${button('previous-preview', '이전', { glyph: 'left', disabled: preview.index === 0 })}${counter}
       ${button('next-preview', '다음', { glyph: 'right', disabled: preview.index === preview.ids.length - 1 })}
     </div>
     <div class="preview-controls">
       ${original}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
     </div>
-    <p class="preview-hint small muted" ${preview.message ? 'role="status"' : ''}>${preview.message ? escapeHtml(preview.message) :
-      `<kbd>←</kbd> <kbd>→</kbd> 이동${canDelete ? ' · <kbd>Delete</kbd> 삭제' : ''}`}</p>`;
+    <p class="preview-hint small muted" ${preview.message ? 'role="status"' : ''}>${hint}</p>`;
+  if (footer.dataset.renderedHtml !== html) {
+    footer.dataset.renderedHtml = html;
+    footer.innerHTML = html;
+  }
 }
 
 function stepPreview(direction) {
@@ -1682,32 +1949,108 @@ function stepPreview(direction) {
   renderMediaPreview();
 }
 
+function isPendingPreviewDelete(preview) {
+  if (!preview || preview.source !== 'incoming' || !preview.busy) return false;
+  if (!preview.jobId) return true;
+  return Boolean(laneJob('local')?.id === preview.jobId && isJobActive(laneJob('local')));
+}
+
+function reconcilePreview({ preserveMessage = false } = {}) {
+  const preview = view.preview;
+  if (!preview || isPendingPreviewDelete(preview)) return;
+  const collection = previewCollection(preview.source);
+  const byId = new Map(collection.map(file => [file.id, file]));
+  const currentId = preview.ids[preview.index];
+  const nextIds = preview.ids.filter(id => isPreviewableFile(preview.source, byId.get(id)));
+  if (!nextIds.length) {
+    closeMediaPreview({ deferFocus: true });
+    announce('로컬 미리보기 가능한 파일이 없습니다.');
+    return;
+  }
+  const survivingIndex = nextIds.indexOf(currentId);
+  if (survivingIndex >= 0) {
+    const currentFile = byId.get(currentId);
+    const mediaChanged = preview.renderedSrc !== (currentFile.preview || null) || preview.renderedKind !== (currentFile.kind || null);
+    preview.ids = nextIds;
+    preview.index = survivingIndex;
+    if (mediaChanged) renderMediaPreview({ focusTitle: false });
+    else updatePreviewMetadata();
+    return;
+  }
+  let removedBefore = 0;
+  for (let i = 0; i < preview.index; i += 1) {
+    if (!isPreviewableFile(preview.source, byId.get(preview.ids[i]))) removedBefore += 1;
+  }
+  preview.ids = nextIds;
+  preview.index = Math.max(0, Math.min(preview.index - removedBefore, nextIds.length - 1));
+  preview.confirming = false;
+  preview.busy = false;
+  if (!preserveMessage) preview.message = '';
+  renderMediaPreview();
+}
+
+async function diagnosePreviewError(source, file, gen) {
+  try {
+    const response = await fetch(file.original, { method: 'HEAD', cache: 'no-store' });
+    if (gen !== previewMediaGeneration) return;
+    const preview = view.preview;
+    if (!preview || preview.source !== source || preview.ids[preview.index] !== file.id) return;
+    const messageEl = mediaPreview.querySelector('.preview-error-message');
+    if (!messageEl) return;
+    const detail = diagnosticMessageForStatus(source, file, response.status);
+    if (detail && messageEl.textContent !== detail) messageEl.textContent = detail;
+  } catch {
+    // Keep the default error message when diagnostic HEAD fails.
+  }
+}
+
+async function retryPreview() {
+  const preview = view.preview;
+  if (!preview || preview.busy) return;
+  const { source } = preview;
+  const id = preview.ids[preview.index];
+  const gen = previewMediaGeneration;
+  await syncState();
+  render();
+  if (!view.preview || view.preview !== preview) return;
+  if (view.preview.source !== source || view.preview.ids[view.preview.index] !== id) return;
+  if (gen !== previewMediaGeneration) return;
+  renderMediaPreview({ focusTitle: false });
+}
+
 function requestPreviewDelete() {
-  const file = currentPreviewFile();
-  if (!file || jobActive() || !canDeleteIncoming(file) || view.preview.busy) return;
-  view.preview.confirming = true;
+  const preview = view.preview;
+  if (!preview || preview.source !== 'incoming' || preview.busy || localBusy()) return;
+  const file = currentPreviewFile(preview);
+  if (!file || !canDeleteIncoming(file)) return;
+  preview.confirming = true;
   renderPreviewFooter();
 }
 
 function cancelPreviewDelete() {
-  if (view.preview.busy) return;
-  view.preview.confirming = false;
+  const preview = view.preview;
+  if (!preview || preview.source !== 'incoming' || preview.busy) return;
+  preview.confirming = false;
   renderPreviewFooter();
   mediaPreview.querySelector('[data-action="request-preview-delete"]')?.focus();
 }
 
 async function performPreviewDelete() {
   const preview = view.preview;
-  const file = currentPreviewFile();
-  if (!file || !preview.confirming || preview.busy || jobActive()) return;
+  if (!preview || preview.source !== 'incoming' || !preview.confirming || preview.busy || localBusy()) return;
+  const file = currentPreviewFile(preview);
+  if (!file || !canDeleteIncoming(file)) return;
   preview.busy = true;
+  preview.deletingId = file.id;
   renderPreviewFooter();
-  mediaPreview.querySelector('#media-preview-title').focus();
+  mediaPreview.querySelector('#media-preview-title')?.focus();
   try {
     await submitJob('delete', { ids: [file.id] }, preview);
   } catch (error) {
     preview.busy = false;
     preview.confirming = false;
+    preview.jobId = null;
+    preview.deletingId = null;
     preview.message = error.message;
     if (view.preview === preview) renderPreviewFooter();
   }
@@ -1716,30 +2059,46 @@ async function performPreviewDelete() {
 
 function updatePreviewAfterDelete() {
   const preview = view.preview;
-  const job = state.job;
-  if (!preview?.jobId || preview.jobId !== job?.id || jobActive(job)) return;
+  const job = laneJob('local');
+  if (!preview || preview.source !== 'incoming' || !preview.jobId) return false;
+  const trackedJobId = preview.jobId;
+  if (job?.id === trackedJobId && jobActive(job)) return false;
+  const deletingId = preview.deletingId;
   preview.busy = false;
   preview.confirming = false;
   preview.jobId = null;
-  if (job.status === 'done' && job.result.deleted) {
-    preview.ids.splice(preview.index, 1);
-    if (!preview.ids.length) {
-      mediaPreview.close();
-      return;
+  preview.deletingId = null;
+  if (job?.id !== trackedJobId) return false;
+  if (job.status === 'done' && job.result?.deleted) {
+    const removedIndex = deletingId ? preview.ids.indexOf(deletingId) : -1;
+    if (removedIndex >= 0) {
+      preview.ids.splice(removedIndex, 1);
+      if (!preview.ids.length) {
+        closeMediaPreview({ deferFocus: true });
+        return false;
+      }
+      if (removedIndex < preview.index) preview.index -= 1;
+      else if (preview.index >= preview.ids.length) preview.index = preview.ids.length - 1;
+    } else if (!preview.ids.length) {
+      closeMediaPreview({ deferFocus: true });
+      return false;
     }
-    preview.index = Math.min(preview.index, preview.ids.length - 1);
     preview.message = '선택한 사진을 삭제했습니다.';
-    renderMediaPreview();
-  } else {
-    preview.message = job.status === 'failed' ? job.result.error : '사진이 변경되었거나 삭제할 수 없습니다. 새로 고침 후 다시 확인하세요.';
-    renderPreviewFooter();
+    if (currentPreviewFile(preview)) renderMediaPreview();
+    return true;
   }
+  preview.message = job.status === 'failed'
+    ? (job.result?.error || '사진을 삭제하지 못했습니다.')
+    : '사진이 변경되었거나 삭제할 수 없습니다. 새로 고침 후 다시 확인하세요.';
+  renderPreviewFooter();
+  return true;
 }
 
 const previewActions = {
   'previous-preview': () => stepPreview(-1),
   'next-preview': () => stepPreview(1),
-  'close-preview': () => mediaPreview.close(),
+  'close-preview': () => closeMediaPreview(),
+  'retry-preview': retryPreview,
   'request-preview-delete': requestPreviewDelete,
   'cancel-preview-delete': cancelPreviewDelete,
   'perform-preview-delete': performPreviewDelete,
@@ -1766,7 +2125,7 @@ function confirmOffload() {
     <ul class="preview-paths mono">${files.map(file => `<li>${escapeHtml(file.name)}${file.xmp ? ` (+ ${escapeHtml(file.xmp.name)})` : ''} → ${escapeHtml(file.remotePaths[0] || '')}</li>`).join('')}</ul>`,
   `로컬 원본 ${files.length}개 비우기`, async () => {
     const result = await api('jobs/offload', 'POST', { ids: files.map(file => file.id) });
-    state.job = { id: result.id, kind: 'offload', status: 'queued', result: {} };
+    setOptimisticJob({ id: result.id, kind: 'offload', status: 'queued', result: {} });
     view.eventSelection.clear();
     await syncState();
     announce(`${result.count}개 파일의 원격 확인 및 로컬 원본 비우기를 시작합니다.`);
@@ -1786,6 +2145,7 @@ const actions = {
     }
   },
   'preview-incoming': openIncomingPreview,
+  'preview-managed': openManagedPreview,
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
   'link-xmp'() { return submitJob('xmp-link', { links: pendingXmpLinks() }); },
@@ -1820,13 +2180,17 @@ const actions = {
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); view.sourceSelection.clear(); },
   'source-up'() { view.sourcePath.pop(); view.sourceSelection.clear(); },
   'upload-archive'() { return startArchiveUpload(); },
-  async 'cancel-archive-upload'() {
-    state.job = await api(`archive/transfers/${state.job.id}/cancel`, 'POST');
+  async 'cancel-archive-upload'(value) {
+    const jobId = Number(value) || activeLaneJob('remote')?.id;
+    if (!jobId) return;
+    setOptimisticJob(await api(`archive/transfers/${jobId}/cancel`, 'POST'));
     await syncState();
   },
   'open-remote-index': openRemoteIndexDialog,
-  async 'cancel-remote-index'() {
-    state.job = await api(`archive/index/${state.job.id}/cancel`, 'POST');
+  async 'cancel-remote-index'(value) {
+    const jobId = Number(value) || activeLaneJob('remote')?.id;
+    if (!jobId) return;
+    setOptimisticJob(await api(`archive/index/${jobId}/cancel`, 'POST'));
     await syncState();
   },
   'catalog-folder'(value) {
@@ -1878,7 +2242,7 @@ function clearArchiveDrag() {
 
 page.addEventListener('dragstart', event => {
   const row = event.target.closest('[data-source-index]');
-  if (!row || jobActive() || view.uploadStarting) return;
+  if (!row || remoteBusy() || view.uploadStarting) return;
   const entry = sourceEntries()[Number(row.dataset.sourceIndex)];
   if (!entry) return;
   const keys = entry.assets.every(key => view.sourceSelection.has(key)) ? [...view.sourceSelection] : entry.assets;
@@ -1890,7 +2254,7 @@ page.addEventListener('dragstart', event => {
 
 page.addEventListener('dragover', event => {
   const target = event.target.closest('[data-archive-drop]');
-  if (!target || !view.dragSource || jobActive() || view.uploadStarting) return;
+  if (!target || !view.dragSource || remoteBusy() || view.uploadStarting) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = 'copy';
   page.querySelectorAll('.archive-drop-hover').forEach(element => {
@@ -2008,52 +2372,69 @@ page.addEventListener('keydown', event => {
   }
 });
 
+function isEditableOrMediaTarget(target) {
+  if (!target) return false;
+  const tag = target.tagName;
+  return tag === 'VIDEO' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(target.isContentEditable);
+}
+
 mediaPreview.addEventListener('click', event => {
   const action = event.target.closest('button[data-action]')?.dataset.action;
-  if (action) previewActions[action]();
+  if (action && previewActions[action]) previewActions[action]();
 });
 
 mediaPreview.addEventListener('keydown', event => {
   const preview = view.preview;
-  if (!preview) return;
+  if (!preview || event.altKey || event.ctrlKey || event.metaKey) return;
   if (event.key === 'Delete' || event.key === 'Backspace') {
+    if (preview.source !== 'incoming' || isEditableOrMediaTarget(event.target)) return;
     event.preventDefault();
     if (!event.repeat && !preview.confirming) requestPreviewDelete();
-  } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && event.target.tagName !== 'VIDEO') {
+  } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !isEditableOrMediaTarget(event.target)) {
     event.preventDefault();
     stepPreview(event.key === 'ArrowLeft' ? -1 : 1);
   }
 });
 
 mediaPreview.addEventListener('cancel', event => {
-  if (view.preview?.confirming && !view.preview.busy) {
+  if (view.preview?.source === 'incoming' && view.preview.confirming && !view.preview.busy) {
     event.preventDefault();
     cancelPreviewDelete();
   }
 });
 
 mediaPreview.addEventListener('close', () => {
-  const id = view.preview?.ids[view.preview.index];
+  if (mediaPreview.open) return;
+  const closing = view.preview;
+  disposePreviewMedia();
+  if (!closing) return;
   view.preview = null;
-  mediaPreview.replaceChildren();
-  if (view.page === 'incoming') {
-    const button = [...page.querySelectorAll('[data-action="preview-incoming"]')].find(element => element.dataset.value === id);
-    (button || page.querySelector('[data-action="incoming-layout"][aria-pressed="true"]'))?.focus();
-  }
+  restorePreviewFocus(closing);
 });
 
 mediaPreview.addEventListener('error', event => {
-  if (!event.target.matches('.preview-stage img, .preview-stage video')) return;
-  event.target.hidden = true;
-  event.target.parentElement.querySelector('.preview-media-loading')?.remove();
-  mediaPreview.querySelector('.preview-media-error').hidden = false;
+  const target = event.target;
+  if (!target?.matches?.('.preview-stage img, .preview-stage video')) return;
+  const preview = view.preview;
+  const gen = Number(target.dataset?.previewGen);
+  if (!target.isConnected || !preview || gen !== previewMediaGeneration) return;
+  const currentId = preview.ids[preview.index];
+  if (target.dataset?.previewSource !== preview.source || target.dataset?.previewId !== currentId) return;
+  target.hidden = true;
+  target.parentElement?.classList?.add('is-error');
+  target.parentElement?.querySelector('.preview-media-loading')?.remove();
+  const errorBox = mediaPreview.querySelector('.preview-media-error');
+  if (errorBox) errorBox.hidden = false;
+  const file = currentPreviewFile(preview);
+  if (file?.original) diagnosePreviewError(preview.source, file, gen);
 }, true);
 
 for (const type of ['load', 'loadedmetadata']) {
   mediaPreview.addEventListener(type, event => {
-    if (event.target.matches('.preview-stage img, .preview-stage video')) {
-      event.target.parentElement.querySelector('.preview-media-loading')?.remove();
-    }
+    const target = event.target;
+    if (!target?.matches?.('.preview-stage img, .preview-stage video')) return;
+    if (!target.isConnected || Number(target.dataset?.previewGen) !== previewMediaGeneration) return;
+    target.parentElement?.querySelector('.preview-media-loading')?.remove();
   }, true);
 }
 
@@ -2063,7 +2444,7 @@ dialog.addEventListener('click', event => {
 
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon); });
 function loadRoute() {
-  if (mediaPreview.open) mediaPreview.close();
+  closeMediaPreview({ restoreFocus: false });
   render();
   if (view.page === 'catalog') loadCatalog();
   if (view.page === 'settings') loadSettings().then(() => {

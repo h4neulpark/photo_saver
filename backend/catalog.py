@@ -10,6 +10,35 @@ DATA = Path(os.environ.get("PHOTO_SAVER_DATA", "/data"))
 THUMBNAILS = Path(os.environ.get("PHOTO_SAVER_THUMBNAILS", "/thumbnails"))
 DEFAULT_ZONE = os.environ.get("PHOTO_SAVER_TIMEZONE", "Asia/Seoul")
 PHOTOS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+LANE_LOCAL = "local"
+LANE_REMOTE = "remote"
+LANE_EXCLUSIVE = "exclusive"
+LANES = (LANE_LOCAL, LANE_REMOTE, LANE_EXCLUSIVE)
+JOB_LANES = {
+    "scan": LANE_LOCAL, "move": LANE_LOCAL, "delete": LANE_LOCAL, "xmp-link": LANE_LOCAL,
+    "upload": LANE_REMOTE, "offload": LANE_REMOTE, "remote-index": LANE_REMOTE,
+    "reset-all": LANE_EXCLUSIVE,
+}
+
+
+class JobConflictError(ValueError):
+    def __init__(self, message, *, conflict_lane=None):
+        super().__init__(message)
+        self.conflict_lane = conflict_lane
+
+
+def lane_for_kind(kind):
+    if kind not in JOB_LANES:
+        raise ValueError(f"알 수 없는 작업 종류입니다: {kind}")
+    return JOB_LANES[kind]
+
+
+def backfill_job_lanes(connection):
+    cases = " ".join("WHEN ? THEN ?" for _ in JOB_LANES)
+    parameters = [value for pair in JOB_LANES.items() for value in pair]
+    connection.execute(f"UPDATE jobs SET lane=CASE kind {cases} ELSE 'exclusive' END", parameters)
+
+
 CATALOG_TABLES = (
     "jobs", "events", "device_names", "storages",
     "media", "scan_files", "scan_xmp", "archive_entries", "remote_files",
@@ -19,14 +48,13 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
+    lane TEXT NOT NULL DEFAULT 'exclusive' CHECK (lane IN ('local', 'remote', 'exclusive')),
     status TEXT NOT NULL DEFAULT 'queued',
     payload TEXT NOT NULL DEFAULT '{}',
     result TEXT,
     created_at TEXT NOT NULL,
     finished_at TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_job
-    ON jobs ((1)) WHERE status IN ('queued', 'running');
 CREATE TABLE IF NOT EXISTS scan_files (
     scan_id INTEGER NOT NULL REFERENCES jobs(id),
     id TEXT PRIMARY KEY,
@@ -202,8 +230,9 @@ def clear_catalog(connection):
 
 
 def open_db():
-    connection = sqlite3.connect(DATA / "catalog.sqlite3", timeout=10, isolation_level=None)
+    connection = sqlite3.connect(DATA / "catalog.sqlite3", timeout=30, isolation_level=None)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
     connection.execute("PRAGMA foreign_keys=ON")
     return connection
 
@@ -232,6 +261,11 @@ def database(write=False):
 
 def initialize():
     DATA.mkdir(parents=True, exist_ok=True)
+    with catalog_lock(exclusive=True):
+        _initialize_locked()
+
+
+def _initialize_locked():
     connection = open_db()
     try:
         connection.execute("PRAGMA journal_mode=WAL")
@@ -251,7 +285,31 @@ def initialize():
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(storages)")}
         if "last_indexed_at" not in columns:
             connection.execute("ALTER TABLE storages ADD COLUMN last_indexed_at TEXT")
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+        if "lane" not in columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN lane TEXT NOT NULL DEFAULT 'exclusive'")
+        backfill_job_lanes(connection)
+        connection.execute("DROP INDEX IF EXISTS one_active_job")
+        connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_lane
+                              ON jobs (lane) WHERE status IN ('queued', 'running')""")
+        connection.execute("CREATE INDEX IF NOT EXISTS jobs_by_lane_status ON jobs (lane, status, id)")
+        for operation in ("INSERT", "UPDATE OF status, lane"):
+            name = "insert" if operation == "INSERT" else "update"
+            others = "" if name == "insert" else "id <> NEW.id AND "
+            connection.execute(f"""CREATE TRIGGER IF NOT EXISTS jobs_enforce_exclusive_{name}
+                BEFORE {operation} ON jobs WHEN NEW.status IN ('queued', 'running')
+                BEGIN
+                    SELECT RAISE(ABORT, 'exclusive job conflict')
+                    WHERE (NEW.lane = 'exclusive' AND EXISTS (
+                        SELECT 1 FROM jobs WHERE {others}status IN ('queued', 'running')
+                    )) OR (NEW.lane <> 'exclusive' AND EXISTS (
+                        SELECT 1 FROM jobs WHERE {others}lane = 'exclusive' AND status IN ('queued', 'running')
+                    ));
+                END""")
         connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -263,9 +321,57 @@ def load_latest_scan(connection):
 
 
 def queue_job(connection, kind, payload):
-    if connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running')").fetchone():
-        raise ValueError("검사 또는 이동 작업이 진행 중입니다.")
+    lane = lane_for_kind(kind)
+    conflict = connection.execute(
+        "SELECT lane FROM jobs WHERE status IN ('queued','running')" +
+        (" LIMIT 1" if lane == LANE_EXCLUSIVE else " AND lane IN (?, 'exclusive') LIMIT 1"),
+        () if lane == LANE_EXCLUSIVE else (lane,),
+    ).fetchone()
+    if conflict:
+        raise _job_conflict(lane, conflict["lane"])
+    try:
+        return connection.execute(
+            "INSERT INTO jobs (kind, lane, payload, created_at) VALUES (?, ?, ?, ?)",
+            (kind, lane, json.dumps(payload), now()),
+        ).lastrowid
+    except sqlite3.IntegrityError as exc:
+        conflict_lane = LANE_EXCLUSIVE if "exclusive job conflict" in str(exc) else lane
+        raise _job_conflict(lane, conflict_lane) from exc
+
+
+def _job_conflict(lane, conflict_lane):
+    messages = {
+        LANE_LOCAL: "로컬 파일 작업(검사·이동·삭제·XMP 연결)이 진행 중입니다.",
+        LANE_REMOTE: "원격 아카이브 작업(업로드·로컬 비우기·원격 인덱싱)이 진행 중입니다.",
+        LANE_EXCLUSIVE: "데이터 초기화 중입니다. 완료 후 다시 시도하세요.",
+    }
+    message = "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요." if lane == LANE_EXCLUSIVE else messages[conflict_lane]
+    return JobConflictError(message, conflict_lane=conflict_lane)
+
+
+def active_jobs_by_lane(connection):
+    rows = {row["lane"]: row for row in connection.execute("SELECT * FROM jobs WHERE status IN ('queued','running')")}
+    return {lane: rows.get(lane) for lane in LANES}
+
+
+def latest_jobs_by_lane(connection):
+    return {lane: connection.execute("SELECT * FROM jobs WHERE lane=? ORDER BY id DESC LIMIT 1", (lane,)).fetchone()
+            for lane in LANES}
+
+
+def has_active_jobs(connection, lanes=None):
+    if lanes is None:
+        return connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone() is not None
+    lanes = tuple(lanes)
+    if not lanes:
+        return False
+    placeholders = ",".join("?" for _ in lanes)
     return connection.execute(
-        "INSERT INTO jobs (kind, payload, created_at) VALUES (?, ?, ?)",
-        (kind, json.dumps(payload), now()),
-    ).lastrowid
+        f"SELECT 1 FROM jobs WHERE status IN ('queued','running') AND lane IN ({placeholders}) LIMIT 1", lanes,
+    ).fetchone() is not None
+
+
+def active_offload_media_ids(connection):
+    return {item["id"] for row in connection.execute(
+        "SELECT payload FROM jobs WHERE kind='offload' AND status IN ('queued','running')"
+    ) for item in json.loads(row["payload"]).get("files", [])}

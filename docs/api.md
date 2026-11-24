@@ -11,29 +11,35 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `200` | 조회·수정·취소 요청 처리 |
 | `201` | 이벤트 또는 SSH 키 생성 |
 | `202` | 비동기 작업 등록. 응답의 `id`는 작업 ID |
-| `400` | 유효하지 않은 이름·시간대·경로·요청 조합 |
+| `206` | 바이트 범위(`Range`) 부분 응답 |
+| `400` | 유효하지 않은 이름·시간대·경로·요청 조합·잘못된 또는 다중 `Range` |
 | `401`, `403` | SSH 인증 또는 접근 권한 문제 |
 | `404` | 파일·이벤트·작업·원격 경로가 없음 |
+| `405` | 허용하지 않는 HTTP 메서드 (예: `HEAD /api/managed/{file_id}/preview`) |
 | `409` | 검사 결과·파일·설정 변경, 경로 충돌, 활성 작업 존재 |
 | `413` | 복원 파일 128MiB 초과 또는 원격 한 폴더 항목 10,000개 초과 |
+| `415` | 지원하지 않는 확장자이거나 파일 종류(`kind`)와 확장자가 불일치 |
+| `416` | 요청한 바이트 범위가 파일 크기를 벗어남 (`Content-Range: bytes */N`) |
 | `422` | Pydantic 요청·쿼리 검증 실패 |
 | `502`, `504` | 원격 연결·프로토콜 오류 또는 시간 초과 |
 
-일반 앱 오류는 `{"detail":"설명"}`이고 요청 모델 검증 오류의 `detail`은 배열일 수 있다. 비동기 작업의 처리 실패는 작업 상태·결과에서 확인한다. 전체 작업을 합쳐 `queued` 또는 `running`인 작업은 하나만 허용한다.
+일반 앱 오류는 `{"detail":"설명"}`이고 요청 모델 검증 오류의 `detail`은 배열일 수 있다. Starlette `FileResponse`가 직접 반환하는 `400`/`416` 범위 오류는 `text/plain`일 수 있으며, `HEAD` 오류 응답은 본문을 보내지 않는다. 비동기 작업의 처리 실패는 작업 상태·결과에서 확인한다. `local`과 `remote`마다 `queued` 또는 `running` 작업을 하나씩 허용한다(1+1 병렬). 같은 레인 충돌은 해당 레인의 작업 안내를 409 `detail`로 반환한다. `exclusive` (`reset-all`)는 모든 레인과 상호 배제하며 동기 카탈로그 백업·복원도 전체 배타 잠금을 사용한다.
 
-## 화면 상태와 Incoming
+## 화면 상태, Incoming 및 보관 파일 미리보기
 
 | 메서드 | 경로 | 입력 | 반환·동작 |
 | --- | --- | --- | --- |
 | GET | `/api/health` | 없음 | `{"status":"ok"}` |
 | GET | `/api/state` | 없음 | 기본 시간대, 최근 완료 검사, Incoming, 마지막 작업, 이벤트, 보관 파일, 대기 XMP |
-| POST | `/api/jobs/scan` | 없음 | `202 {"id":작업ID}`. `scan` 등록 |
+| POST | `/api/jobs/scan` | 없음 | `202 {"id":작업ID,"lane":"local"}`. `scan` 등록 |
 | POST | `/api/jobs/move` | `{"ids":["파일ID"]}` | `202`. 최근 완료 검사에서 `ready`인 원본만 이동 등록 |
 | POST | `/api/jobs/delete` | `{"ids":["파일ID"]}` | `202`. 최근 검사에서 `ready`·`duplicate`인 사진만 삭제 등록 |
 | POST | `/api/jobs/offload` | `{"ids":["보관파일ID"]}` | `202`. 원격 아카이브에 검증된 사본(연결 XMP 포함)이 있는 `available` 파일의 로컬 원본 비우기 등록 |
 | POST | `/api/jobs/xmp-link` | `{"links":[{"id":"XMP검사ID","media_id":"보관파일ID"}]}` | `202`. 현재 연결 후보에 있는 원본으로 XMP 연결 등록 |
-| GET, HEAD | `/api/incoming/{file_id}/original` | 경로 ID | 원본 응답. 범위 요청은 `FileResponse`가 처리 |
+| GET, HEAD | `/api/incoming/{file_id}/original` | 경로 ID | Incoming 원본 응답. 범위 요청은 `FileResponse`가 처리 |
 | GET | `/api/incoming/{file_id}/preview` | 경로 ID | HEIC·HEIF는 최대 2200×2200 JPEG, 나머지는 원본 응답 |
+| GET, HEAD | `/api/managed/{file_id}/original` | 경로 ID | 보관(`available`) 원본 응답. 단일 바이트 `Range` 및 지문 기반 `ETag`/`If-Range` 지원 |
+| GET | `/api/managed/{file_id}/preview` | 경로 ID | HEIC·HEIF는 최대 2200×2200 JPEG(`200` 전체 응답, `Range` 무시), 나머지는 원본과 동일 (`HEAD`는 `405`) |
 
 `/api/state`의 주요 필드는 다음과 같다.
 
@@ -42,14 +48,31 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `timezone` | 기본 시간대 |
 | `scan` | 가장 최근 `done`인 `scan` 작업 또는 `null` |
 | `incoming` | 해당 검사의 파일 목록. `moved`·`deleted`는 제외 |
-| `job` | 종류와 관계없이 가장 최근 작업 또는 `null` |
+| `jobs` | `{local, remote, exclusive}`: 레인별 최신 작업 또는 `null` |
+| `activeJobs` | `{local, remote, exclusive}`: 레인별 현재 `queued`·`running` 작업 또는 `null` |
+| `job` | 하위 호환: 활성 exclusive → 활성 local/remote 중 가장 큰 id → 전체 최신 작업 → `null` |
 | `events` | `id`, `name`, `folder`, `parent`, `start`, `end`, `zone` |
-| `managed` | `available`·`archived` 원본의 보관 상태(`status`), 장비·촬영 시각·이벤트·확정 여부·아카이브 사본·다운로드/오프로드 가능 여부·썸네일·XMP |
+| `managed` | `available`·`archived` 원본의 보관 상태(`status`), 장비·촬영 시각·이벤트·확정 여부·아카이브 사본·다운로드/오프로드 가능 여부·썸네일·XMP·미리보기/원본 URL(`preview`, `original`, 로컬 `available`이며 지문·형식이 유효할 때만 문자열이고 `archived` 등은 `null`) |
 | `pendingXmp` | 최근 검사에서 아직 `linked`가 아닌 XMP와 연결 후보 |
 
-작업 표현은 `id`, `kind`, `status`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
+`scan`·`move`·`delete`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 취소 API는 명시한 작업 ID에만 적용한다.
 
-Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파일에만 허용한다. 노출 가능한 검사 항목이나 fingerprint가 없으면 404, 기록과 실제 파일의 상태가 다르면 409다. 정상 원본·미리보기 응답은 `private, no-store`와 `nosniff`를 설정한다.
+작업 표현은 `id`, `kind`, `lane`, `status`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
+
+Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파일에만 허용한다. 보관 파일 미리보기(`/api/managed/{file_id}/original`, `/preview`)는 `media.status='available'`이고 지문(`fingerprint`)이 있으며 지원 확장자·`kind`가 일치하는 파일에만 허용하며, 배정·확정 여부와 무관하게 열 수 있다. `managed` 원본은 단일 `Range`만 허용(다중·문법 오류·`end < start`·자릿수 한도 초과는 `400`, 파일 크기 초과·빈 파일/`bytes=-0`은 `416`과 `Content-Range: bytes */N`, 파일보다 큰 `suffix`는 전체 `206`으로 보정)하며 지문 해시 `ETag`로 `If-Range`를 처리한다.
+
+`managed` 원본·미리보기 오류 분류는 실제 구현(`managed_for_preview`, `classify_managed_access_error`, `render_heif_preview`)을 따른다.
+
+| 코드 | `managed` 오류 조건 |
+| --- | --- |
+| `400` | 다중 `Range`, 문법 오류, `end < start`, 자릿수 한도 초과 |
+| `403` | 파일·디렉터리 읽기 권한 오류(`PermissionError`, `EACCES`, `EPERM`) |
+| `404` | DB 레코드 없음, `status != 'available'`, 지문 없음, 실제 파일·마운트·상위 경로 없음(`FileNotFoundError`, `ENOENT`, `ENOTDIR`), 유효하지 않은 상대 경로(`ValueError`), 심볼릭 링크(`ELOOP`) |
+| `409` | 지문 불일치(원본 변경·교체), 비정규 파일(디렉터리·FIFO·소켓 등) 접근 실패, 기타 파일 I/O 오류, HEIC·HEIF 디코드·변환 실패 |
+| `415` | 지원하지 않는 확장자이거나 파일 종류(`kind`)와 확장자가 불일치 |
+| `416` | 요청한 바이트 범위가 파일 크기를 벗어나거나 빈 파일·`bytes=-0` 요청 (`Content-Range: bytes */N`) |
+
+`Cache-Control: private, no-store`와 `X-Content-Type-Options: nosniff`는 `managed` 미디어 핸들러와 공통 `VerifiedOriginal`·HEIF 변환 helper가 직접 생성하는 정상·오류 응답에 설정된다. 기존 Incoming의 DB 조회 단계 `HTTPException`(예: 검사 기록·지문 누락 `404`)과 FastAPI 자동 라우팅 `405` 응답에는 이 헤더를 추가하지 않는다.
 
 선택 요청의 `ids`는 최소 한 개가 필요하며 같은 ID는 한 번만 처리한다. XMP 연결의 `links`도 최소 한 개가 필요하다. 한 요청에 같은 XMP ID나 같은 원본 ID를 여러 번 지정하면 400이다.
 
@@ -101,9 +124,9 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | --- | --- | --- | --- |
 | GET | `/api/archive` | 쿼리 `path` (기본 `""`) | 저장 루트 안의 폴더 목록과 연결 식별자 |
 | GET | `/api/archive/download` | 쿼리 `path` 또는 `media_id`(+`kind`) | 원격 아카이브 정규 파일의 SFTP 스트리밍 다운로드 (`attachment`, `no-store`) |
-| POST | `/api/archive/transfers` | 전송 모델 | `202 {"id":작업ID,"count":파일수}` |
+| POST | `/api/archive/transfers` | 전송 모델 | `202 {"id":작업ID,"lane":"remote","count":파일수}` |
 | POST | `/api/archive/transfers/{job_id}/cancel` | 없음 | `upload` 작업의 취소 요청 후 작업 상태 반환 |
-| POST | `/api/archive/index` | `{"connection":"64자 식별자","path":"","full_rehash":false}` | `202 {"id":작업ID,"scope":"상대경로"}`. 원격 아카이브 전체 또는 하위 폴더 증분 인덱싱(`remote-index`) 등록 |
+| POST | `/api/archive/index` | `{"connection":"64자 식별자","path":"","full_rehash":false}` | `202 {"id":작업ID,"lane":"remote","scope":"상대경로"}`. 원격 아카이브 전체 또는 하위 폴더 증분 인덱싱(`remote-index`) 등록 |
 | POST | `/api/archive/index/{job_id}/cancel` | 없음 | `remote-index` 작업의 취소 요청 후 작업 상태 반환 |
 
 폴더 조회 응답은 `root`, `path`, `entries`, `connectionVersion`을 포함한다. `entries`에는 `name`, `kind` (`folder`·`file`·`link`), `size`, `modified`가 있다. `size`는 일반 파일만 바이트 크기이고 나머지는 `null`이며, `modified`는 원격 수정 시각의 Unix 타임스탬프다. `connectionVersion`은 현재 설정 식별자로 업로드 요청의 `connection`에 전달한다. 루트 밖 경로·상위 경로 이동을 거부한다.
@@ -167,7 +190,7 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | POST | `/api/settings/ssh-test/trust` | `{"token":"확인토큰"}` | 유효한 확인 요청의 호스트 키 저장 후 공개키 접속 확인 |
 | DELETE | `/api/settings/ssh-host-key` | 없음 | 현재 IP에 저장된 SSH 호스트 키 초기화 (활성 `upload`·`offload`·`remote-index` 작업 중에는 409) |
 | GET | `/api/settings/catalog/backup` | 없음 | SQLite 백업 파일 다운로드 |
-| POST | `/api/settings/catalog/reset` | `{"confirmation":"모든 데이터 삭제"}` | `202 {"id":작업ID,"kind":"reset-all","status":"queued"}`. 전체 로컬 데이터 초기화 등록 |
+| POST | `/api/settings/catalog/reset` | `{"confirmation":"모든 데이터 삭제"}` | `202 {"id":작업ID,"kind":"reset-all","lane":"exclusive","status":"queued"}`. 전체 로컬 데이터 초기화 등록 |
 | POST | `/api/settings/catalog/restore` | SQLite 파일의 원시 요청 본문 | `{"restored":true}`. multipart 업로드가 아님 |
 
 최초 접속 테스트는 `status=confirm_host`, `algorithm`, `fingerprint`, `token`을 반환한다. 토큰은 300초 동안 유효하며 IP 변경 시 사용할 수 없다. 인증 성공은 `{"status":"connected"}`다. 설정·원격 탐색·파일 기록·백업 응답은 `Cache-Control: no-store`를 설정한다.
