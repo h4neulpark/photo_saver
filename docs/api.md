@@ -1,5 +1,24 @@
 # API
 
+## 기기 → Incoming 청크 업로드
+
+사진 JPG·JPEG·PNG·WEBP·HEIC·HEIF, 영상 MP4·MOV, 동반 파일 XMP·THM·LRV를 허용한다. 모든 업로드 응답(오류 포함)에 Cache-Control: no-store와 X-Content-Type-Options: nosniff를 적용한다. 워커 작업을 생성하지 않으며 기존 reset-all 쓰기 차단(409)을 따른다.
+
+| 메서드 | 경로 | 입력 | 반환 |
+| --- | --- | --- | --- |
+| POST | /api/incoming/uploads | {"name":"IMG_0001.HEIC","size":123,"folder":"trip","last_modified_ms":1740000000000} | 201 {uploadId,name,folder,expectedSize,receivedBytes:0,chunkSize:8388608,maxChunkBytes:33554432} |
+| GET | /api/incoming/uploads/{upload_id} | 32자리 소문자 hex ID | 200 {uploadId,name,folder,expectedSize,receivedBytes}. 실제 임시 파일 크기 |
+| PUT | /api/incoming/uploads/{upload_id}/chunks?offset=0 | application/octet-stream 청크 | 200 {uploadId,receivedBytes,expectedSize} |
+| POST | /api/incoming/uploads/{upload_id}/complete | 없음 | 201 {path,name,folder,originalName,renamed,sizeBytes,kind,modifiedAt} |
+| DELETE | /api/incoming/uploads/{upload_id} | 없음 | 200 {"cancelled":true}. 없는 세션에도 멱등. 현재 전송 잠금 중이면 409 후 재시도 |
+
+folder 기본값은 빈 문자열(루트), last_modified_ms 기본값은 null이다. 이름·폴더는 앞뒤 공백 제거와 NFC 정규화를 거친다. 이름은 UTF-8 220바이트 이하, 폴더는 180자·6단계 이하 상대경로이며 숨김·상위 경로·빈 중간 세그먼트·금지 문자를 거부한다. 파일 크기는 양의 정수, 기본 최대 100GiB이다. 미지원 확장자는 415, 잘못된 요청/ID는 400, 없는 세션은 404, 마운트 없음/쓰기 불가는 503이다.
+
+청크는 기본 8MiB, 최대 32MiB이며 빈 청크·파일 크기 초과는 400, 파일/청크 한도 초과는 413이다. 오프셋 불일치는 409 {"detail":"전송 오프셋이 일치하지 않습니다.","expectedOffset":현재크기}로 동기화한다. 수신 중 단절·취소·쓰기 오류는 청크 시작 오프셋으로 롤백한다. 세션 잠금 경합과 미완료 게시 요청은 409다.
+
+완료 전 파일은 숨김 .photo-saver-uploads/ 폴더에만 존재하여 검사 대상에서 제외된다. 완료 시 폴더를 안전하게 생성하고 기존 파일을 덮어쓰지 않으며 NFC·대소문자 충돌 시 이름 (1).확장자부터 (9999)까지 시도한다. kind는 photo, video, companion이다. 수정시각은 1980-01-01 이상·서버 현재 시각 +1일 이하인 값만 보존한다. 최초 요청에서 파일 크기 +64MiB 여유 공간을 확인하며 부족/ENOSPC는 507이다. 유휴 2시간 초과 세션은 기동 시 및 신규 요청의 10분 간격 청소에서 잠금 획득 가능한 경우에만 제거한다.
+
+
 ## 공통 규칙
 
 Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API는 `/api` 아래에 있다. 요청·응답은 별도 표시가 없으면 JSON이다. FastAPI 자동 문서는 API 컨테이너의 `/docs`, OpenAPI는 `/openapi.json`에 생성되지만 현재 Nginx는 이 경로를 API로 프록시하지 않는다.
@@ -9,7 +28,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | 코드 | 주요 의미 |
 | --- | --- |
 | `200` | 조회·수정·취소 요청 처리 |
-| `201` | 이벤트 또는 SSH 키 생성 |
+| `201` | 이벤트·SSH 키·Incoming 업로드 세션 생성 또는 업로드 완료 |
 | `202` | 비동기 작업 등록. 응답의 `id`는 작업 ID |
 | `206` | 바이트 범위(`Range`) 부분 응답 |
 | `400` | 유효하지 않은 이름·시간대·경로·요청 조합·잘못된 또는 다중 `Range` |
@@ -17,7 +36,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `404` | 파일·이벤트·작업·원격 경로가 없음 |
 | `405` | 허용하지 않는 HTTP 메서드 (예: `HEAD /api/managed/{file_id}/preview`) |
 | `409` | 검사 결과·파일·설정 변경, 경로 충돌, 활성 작업 존재 |
-| `413` | 복원 파일 128MiB 초과 또는 원격 한 폴더 항목 10,000개 초과 |
+| `413` | 복원 파일 128MiB 초과, Incoming 파일·청크 한도 초과 또는 원격 한 폴더 항목 10,000개 초과 |
 | `415` | 지원하지 않는 확장자이거나 파일 종류(`kind`)와 확장자가 불일치 |
 | `416` | 요청한 바이트 범위가 파일 크기를 벗어남 (`Content-Range: bytes */N`) |
 | `422` | Pydantic 요청·쿼리 검증 실패 |
@@ -34,6 +53,8 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | POST | `/api/jobs/scan` | 없음 | `202 {"id":작업ID,"lane":"local"}`. `scan` 등록 |
 | POST | `/api/jobs/move` | `{"ids":["파일ID"]}` | `202`. 최근 완료 검사에서 `ready`인 원본만 이동 등록 |
 | POST | `/api/jobs/delete` | `{"ids":["파일ID"]}` | `202`. 최근 검사에서 `ready`·`duplicate`인 사진만 삭제 등록 |
+| POST | `/api/incoming/duplicates/plan` | `{"ids":["중복파일ID"]}` | 최근 검사에 근거한 해시별 정리 대상과 남길 사본 후보 |
+| POST | `/api/jobs/duplicate-cleanup` | `{"items":[{"id":"중복파일ID","keeperKind":"managed","keeperId":"사본ID"}]}` | `202`. 선택한 사본의 실제 내용 검증 및 Incoming 중복 정리 등록 |
 | POST | `/api/jobs/offload` | `{"ids":["보관파일ID"]}` | `202`. 원격 아카이브에 검증된 사본(연결 XMP 포함)이 있는 `available` 파일의 로컬 원본 비우기 등록 |
 | POST | `/api/jobs/xmp-link` | `{"links":[{"id":"XMP검사ID","media_id":"보관파일ID"}]}` | `202`. 현재 연결 후보에 있는 원본으로 XMP 연결 등록 |
 | GET, HEAD | `/api/incoming/{file_id}/original` | 경로 ID | Incoming 원본 응답. 범위 요청은 `FileResponse`가 처리 |
@@ -47,7 +68,8 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | --- | --- |
 | `timezone` | 기본 시간대 |
 | `scan` | 가장 최근 `done`인 `scan` 작업 또는 `null` |
-| `incoming` | 해당 검사의 파일 목록. `moved`·`deleted`는 제외 |
+| `incoming` | 해당 검사의 파일 목록. Incoming 기준 `path`, 중복 근거 `duplicateSource`, 동반 파일의 `companions`와 처리 상태를 포함한다. `moved`·`deleted`는 제외 |
+| `latestIncomingResult` | 검사 이후에도 조회 가능한 최근 Incoming 처리 작업 또는 `null`. 이동·삭제·중복 정리·XMP 연결의 결과를 제공 |
 | `jobs` | `{local, remote, exclusive}`: 레인별 최신 작업 또는 `null` |
 | `activeJobs` | `{local, remote, exclusive}`: 레인별 현재 `queued`·`running` 작업 또는 `null` |
 | `job` | 하위 호환: 활성 exclusive → 활성 local/remote 중 가장 큰 id → 전체 최신 작업 → `null` |
@@ -55,9 +77,11 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `managed` | `available`·`archived` 원본의 보관 상태(`status`), 장비·촬영 시각·이벤트·확정 여부·아카이브 사본·다운로드/오프로드 가능 여부·썸네일·XMP·미리보기/원본 URL(`preview`, `original`, 로컬 `available`이며 지문·형식이 유효할 때만 문자열이고 `archived` 등은 `null`) |
 | `pendingXmp` | 최근 검사에서 아직 `linked`가 아닌 XMP와 연결 후보 |
 
-`scan`·`move`·`delete`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 취소 API는 명시한 작업 ID에만 적용한다.
+`scan`·`move`·`delete`·`duplicate-cleanup`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 활성 중복 정리에서 남길 managed 사본도 offload 대상으로 등록할 수 없다. 취소 API는 명시한 작업 ID에만 적용한다.
 
 작업 표현은 `id`, `kind`, `lane`, `status`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
+
+중복 정리 계획은 `groups`를 돌려준다. 그룹에는 `sha`, 선택한 `files` (`id`·`path`·`sizeBytes`), 남길 수 있는 `keepers` (`kind`·`id`·`path`, 원격 검증 시각 `verifiedAt`)가 있다. 사본 종류는 `managed`·`remote`·`incoming`이며, 정리 등록 시 그룹별로 같은 사본을 지정한다. `incoming` 사본 ID는 정리 대상에서 제외해야 한다. 계획은 DB 조회 결과이며 실제 파일 검증은 작업 실행 시 수행한다. 중복 정리 결과는 `cleaned`·`review`·`freedBytes` 집계와 파일별 `items`의 경로·상태·사유를 포함한다.
 
 Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파일에만 허용한다. 보관 파일 미리보기(`/api/managed/{file_id}/original`, `/preview`)는 `media.status='available'`이고 지문(`fingerprint`)이 있으며 지원 확장자·`kind`가 일치하는 파일에만 허용하며, 배정·확정 여부와 무관하게 열 수 있다. `managed` 원본은 단일 `Range`만 허용(다중·문법 오류·`end < start`·자릿수 한도 초과는 `400`, 파일 크기 초과·빈 파일/`bytes=-0`은 `416`과 `Content-Range: bytes */N`, 파일보다 큰 `suffix`는 전체 `206`으로 보정)하며 지문 해시 `ETag`로 `If-Range`를 처리한다.
 

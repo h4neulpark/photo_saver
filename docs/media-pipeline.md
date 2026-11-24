@@ -1,5 +1,13 @@
 # 수집과 미디어 처리
 
+## 기기 업로드에서 검사까지
+
+Incoming의 **기기에서 업로드**는 사진 → 영상 → XMP·THM·LRV 순으로 전송한다. 미지원 형식과 0바이트 파일은 제외 결과를 남기며 다른 파일은 계속 처리한다. 기본 파일 한도는 100GiB, 청크는 8MiB(상한 32MiB)이고 .photo-saver-uploads/ staging에만 기록한다. scan_tree는 숨김 폴더를 제외하므로 미완료 파일을 분석하지 않는다.
+
+서버는 완료 시 크기 검증과 fsync 후 원자적으로 게시한다. 이름 충돌은 기존 원본을 보존하고 (1)부터 (9999)까지 번호를 붙인다. 유효한 last_modified_ms는 파일 수정시각에 보존하고 확장자만 검증하므로 실제 미디어 유효성·메타데이터 분석은 이후 기존 파일 검사에서 수행한다.
+
+같은 배치의 원본이 개명되면 정확한 파일명과 비모호 stem 매핑으로 IMG_0001.xmp 및 IMG_0001.HEIC.xmp를 각각 IMG_0001 (1).xmp, IMG_0001 (1).HEIC.xmp로 조정한다. 폴더별로 격리하며 동일 stem의 복수 원본이 있으면 stem 매핑을 적용하지 않는다. 기존 동반 파일 연결 규칙은 이후 검사에서 그대로 적용된다.
+
 이 문서는 현재 구현된 로컬 파일 처리 흐름을 정리한다. 관련 코드는 [worker.py](../backend/worker.py), [media.py](../backend/media.py), [companions.py](../backend/companions.py), [api.py](../backend/api.py)다.
 
 ## 처리 범위와 파일 배치
@@ -28,7 +36,7 @@
 
 ## 수동 검사와 중복 판정
 
-1. **Incoming Library → 새로 고침**은 `scan` 작업을 등록한다. 파일 감시나 주기적 자동 스캔은 구현되어 있지 않다.
+1. **Incoming Library → 파일 검사**는 `scan` 작업을 등록한다. 화면은 보관 파일 확인, Incoming 해시 계산, 썸네일 생성, 동반 파일 확인의 진행 단계를 표시한다.
 2. 워커는 `managed`를 먼저 색인한다. 기존 파일의 상태 지문이 같으면 저장한 해시와 분석 결과를 재사용한다. 변경되었거나 새로 발견한 파일은 SHA-256과 메타데이터를 다시 계산한다. 사라졌거나 읽을 수 없는 기존 파일은 `missing`으로 표시한다.
 3. `incoming`의 대상 목록을 수집하고, 대상이 있으면 0.4초 대기한 뒤 파일별 SHA-256을 계산한다. 목록 수집 당시 상태와 해시 계산 전후의 상태가 같아야 한다.
 4. 유효한 `managed` 파일의 해시, `remote_files(status='present')`의 원격 아카이브 해시, 또는 이번 검사에서 먼저 발견한 파일의 해시와 비교한다. 이름이 달라도 바이트가 같으면 중복이다. 로컬 `managed`에서 비운 파일이라도 원격 아카이브에 보관 중이면 `원격 아카이브의 <경로>에 이미 보관됨` 사유와 함께 `duplicate`로 분류한다. 같은 검사 안에서만 중복이면 첫 파일을 이동 후보로 남긴다.
@@ -43,9 +51,9 @@
 | `review` | 파일 변경, 읽기 실패, 이동·삭제 실패 등으로 재확인 필요 |
 | `moved` | 이동과 카탈로그 등록 완료 |
 | `deleting` | 사진 삭제 의도를 기록하고 처리 중 |
-| `deleted` | 사진 삭제 완료 |
+| `deleted` | 사진 삭제 또는 중복 정리 완료 |
 
-**확인 필요** 파일은 원본과 권한을 점검한 뒤 새로 고침하여 다시 검사한다. 이동·삭제된 항목은 일반 Incoming 목록에서 제외된다.
+**확인 필요** 파일은 표시된 사유에 따라 원본·접근 권한·원격 사본을 점검한 뒤 다시 검사한다. 이동·삭제된 항목의 경로와 파일별 결과는 처리 작업에 남으며 일반 Incoming 목록에서는 제외된다.
 
 ## 승인된 원본 이동과 복구
 
@@ -67,6 +75,12 @@
 
 재시작 후 `deleting` 파일이 이미 사라졌다면 삭제 완료로 복구한다. 처음 삭제를 시작할 때 사라졌거나 검사 후 변경된 파일은 `review`다. 삭제 후 같은 해시의 Incoming 항목을 다시 분류하여 남은 파일 중 하나가 이동 후보가 될 수 있도록 한다. `available`과 `archived` 어느 쪽에서도 참조하지 않게 된 해당 해시의 썸네일만 정리한다. 사진에 연결된 XMP·THM·LRV를 함께 삭제하는 동작은 없다.
 
+## 확인된 중복 정리
+
+`duplicate-cleanup`은 최근 검사에서 중복인 사진과 영상에 적용한다. 앱은 해시 그룹마다 사용자가 지정한 남길 사본과 정리할 Incoming 파일을 예약한다. 같은 Incoming 검사의 사본을 선택하면 그 사본은 정리 대상에서 제외한다. managed 사본은 활성 offload 목록에서 제외된 파일을 고르고, 정리가 진행되는 동안 해당 사본의 offload 등록을 차단한다.
+
+워커는 정리 대상의 지문과 SHA-256을 대조한다. 남길 로컬 사본은 파일 지문과 SHA-256을, 원격 사본은 현재 스토리지와 루트의 검증 기록 및 실시간 SFTP 파일의 SHA-256을 확인한다. 원격 해시는 업로드와 같은 SSH 우선·SFTP 대체 경로로 검사한다. 실제 삭제 직전에 남길 사본의 상태를 다시 확인한다. 불일치 또는 연결·읽기 실패 시 Incoming 파일을 보존하고 파일별 확인 사유를 기록한다. XMP·THM·LRV는 별도 보존한다.
+
 ## 메타데이터, 썸네일과 미리보기
 
 | 처리 | 현재 동작 |
@@ -75,7 +89,7 @@
 | 영상 분석 | `ffprobe`로 MOV/MP4 컨테이너와 스트림의 해상도·코덱·길이·장비·촬영 시각을 읽음 |
 | 사진 썸네일 | EXIF 회전을 반영하고 최대 `360×240` JPEG 생성 |
 | 영상 썸네일 | FFmpeg로 첫 영상 스트림의 대표 프레임 1장, 최대 `360×240`, 스레드 1개로 생성 |
-| 캐시 | `<SHA-256>-v1.jpg`; Incoming에서 만든 캐시를 이동 후에도 재사용 |
+| 캐시 | `<SHA-256>-v1.jpg`; Incoming에서 만든 캐시를 이동 후에도 재사용. Nginx `/thumbnails/`는 성공 응답(200·304)에 `Cache-Control: public, max-age=31536000, immutable`, 모든 응답에 `X-Content-Type-Options: nosniff`를 적용하며 404에는 장기 캐시를 부여하지 않음 |
 | 분석 실패 | 오류를 메타데이터에 기록하고 파일 수정 시각을 참고값으로 사용. 썸네일은 없을 수 있음 |
 
 Incoming 원본·미리보기 API는 최신 검사에 포함된 `ready`·`duplicate` 파일의 지문을 확인한다. 보관(`managed`) 파일도 `media.status=available`이고 지문이 유효하면 API의 `/managed-preview` 읽기 전용 마운트를 통해 `/api/managed/{file_id}/original`·`/preview`로 큰 사진 미리보기와 브라우저 영상 재생을 제공한다. 이때 파일 조회는 논리적 이벤트 폴더가 아니라 DB에 기록된 실제 물리 상대 경로(`managed/<파일 ID>/<원래 파일명>` 등)를 기준으로 하므로, 이벤트 배정·소분류 이동·확정 변경만으로 미리보기 경로나 파일 위치가 바뀌지 않는다.
@@ -112,7 +126,7 @@ XMP에서는 제목, 설명, 키워드, 도시·지역·국가·장소, GPS 문�
 
 ## 실행 제약
 
-워커는 `worker.lock`으로 단일 프로세스를 보장한다. `WorkerCoordinator`는 기본 0.4초 폴링 및 스레드 완료 이벤트로 큐를 확인하고 한 DB 쓰기 트랜잭션에서 claim한다. `local` 스레드는 `scan`·`move`·`delete`·`xmp-link`를, `remote` 스레드는 `upload`·`offload`·`remote-index`를 실행해 최대 1+1 병렬로 처리한다. 같은 레인에는 활성 작업 하나만 허용한다. `exclusive` 작업(`reset-all`)이 대기·실행 중이면 다른 레인의 claim을 막고, 기존 스레드와 DB running 작업이 모두 끝난 뒤 코디네이터가 직접 실행한다. 기동 시 두 레인의 stale running을 queued로 복구하며 SIGTERM·SIGINT는 새 claim을 중단하고 실행 중인 스레드가 끝나기를 기다린다.
+워커는 `worker.lock`으로 단일 프로세스를 보장한다. `WorkerCoordinator`는 기본 0.4초 폴링 및 스레드 완료 이벤트로 큐를 확인하고 한 DB 쓰기 트랜잭션에서 claim한다. `local` 스레드는 `scan`·`move`·`delete`·`duplicate-cleanup`·`xmp-link`를, `remote` 스레드는 `upload`·`offload`·`remote-index`를 실행해 최대 1+1 병렬로 처리한다. 같은 레인에는 활성 작업 하나만 허용한다. `exclusive` 작업(`reset-all`)이 대기·실행 중이면 다른 레인의 claim을 막고, 기존 스레드와 DB running 작업이 모두 끝난 뒤 코디네이터가 직접 실행한다. 기동 시 두 레인의 stale running을 queued로 복구하며 SIGTERM·SIGINT는 새 claim을 중단하고 실행 중인 스레드가 끝나기를 기다린다.
 
 병렬 스캔은 missing/XMP 해제 갱신을 available에만 적용하고 분석 upsert는 offloading·archived를 덮어쓰지 않는다. 로컬 비우기는 삭제 직전 status·sha·path·xmp_path·xmp_sha를 한 SQL로 확인해 offloading으로 전환한다. 정보가 달라졌으면 삭제 없이 409로 거부한다. 활성 offload 대상의 XMP 연결은 API와 워커에서 거부하며, XMP 이동 후 원본 상태가 바뀌어 연결에 실패하면 옮긴 XMP를 Incoming으로 돌려놓는다. 삭제 후 썸네일 정리는 available·archived·offloading·moving 참조를 모두 보존한다.
 

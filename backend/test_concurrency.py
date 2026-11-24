@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 import api
 import catalog
@@ -95,7 +96,7 @@ class ConcurrencyTests(unittest.TestCase):
                         db.execute("UPDATE jobs SET lane='exclusive' WHERE lane='remote'")
 
     def test_local_and_remote_allowed_concurrently_same_lane_rejected(self):
-        for local in ('scan', 'move', 'delete', 'xmp-link'):
+        for local in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup'):
             for remote in ('upload', 'offload', 'remote-index'):
                 with self.subTest(local=local, remote=remote):
                     a, b = self.queue(local), self.queue(remote)
@@ -107,6 +108,90 @@ class ConcurrencyTests(unittest.TestCase):
                         self.assertEqual(set(lane for lane, job in catalog.active_jobs_by_lane(db).items() if job), {'local', 'remote'})
                     self.complete(a)
                     self.complete(b)
+
+    def test_offload_refuses_a_managed_keeper_while_duplicate_cleanup_is_active(self):
+        cleanup = self.queue('duplicate-cleanup', {'files': [{'keeper': {'kind': 'managed', 'id': 'one'}}]})
+        with self.assertRaises(HTTPException) as error:
+            api.offload_files(offload.OffloadRequest(ids=['one']))
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIn('보존할 로컬 원본', error.exception.detail)
+        self.complete(cleanup)
+        with catalog.database() as db:
+            self.assertEqual(catalog.active_duplicate_keeper_ids(db), set())
+
+    def test_latest_incoming_result_survives_a_new_scan(self):
+        cleanup = self.queue('duplicate-cleanup')
+        self.complete(cleanup)
+        scan = self.queue('scan')
+        self.complete(scan)
+        snapshot = api.state()
+        self.assertEqual(snapshot['jobs']['local']['id'], scan)
+        self.assertEqual(snapshot['latestIncomingResult']['id'], cleanup)
+
+    def test_duplicate_video_plan_and_queue_use_the_local_worker(self):
+        keeper = self.managed / 'one/clip.MP4'
+        duplicate = self.incoming / 'copy.MP4'
+        duplicate.write_bytes(keeper.read_bytes())
+        sha, info = media.hash_file(self.incoming, duplicate.name)
+        scan = self.queue('scan')
+        self.complete(scan)
+        with catalog.database(write=True) as db:
+            db.execute(
+                """INSERT INTO scan_files (scan_id,id,path,sha,size,fingerprint,status,reason)
+                   VALUES (?,?,?,?,?,?,'duplicate','managed의 one/clip.MP4와 동일')""",
+                (scan, 'duplicate-video', duplicate.name, sha, info.st_size, media.fingerprint(info)),
+            )
+        client = TestClient(api.app)
+        response = client.post('/api/incoming/duplicates/plan', json={'ids': ['duplicate-video']})
+        self.assertEqual(response.status_code, 200)
+        plan = response.json()
+        self.assertEqual(plan['groups'][0]['files'][0]['id'], 'duplicate-video')
+        copy = plan['groups'][0]['keepers'][0]
+        self.assertEqual((copy['kind'], copy['id']), ('managed', 'one'))
+        response = client.post('/api/jobs/duplicate-cleanup', json={'items': [
+            {'id': 'duplicate-video', 'keeperKind': copy['kind'], 'keeperId': copy['id']},
+        ]})
+        self.assertEqual(response.status_code, 202)
+        queued = response.json()
+        self.assertEqual(queued['lane'], 'local')
+        coordinator = worker.WorkerCoordinator(self.incoming, self.managed)
+        coordinator.dispatch_once()
+        coordinator.running['local'].join(timeout=5)
+        result = api.state()['latestIncomingResult']
+        self.assertEqual((result['id'], result['status'], result['result']['cleaned']), (queued['id'], 'done', 1))
+        self.assertFalse(duplicate.exists())
+        self.assertTrue(keeper.is_file())
+
+    def test_duplicate_cleanup_http_rejects_invalid_selections_and_incoming_keeper_targets(self):
+        scan = self.queue('scan')
+        self.complete(scan)
+        sha = 'same-video-sha'
+        with catalog.database(write=True) as db:
+            db.executemany(
+                """INSERT INTO scan_files (scan_id,id,path,sha,size,fingerprint,status)
+                   VALUES (?,?,?,?,?,?,?)""",
+                [(scan, file_id, file_id + '.MP4', sha, 7, 'snapshot', status)
+                 for file_id, status in [('ready', 'ready'), ('first', 'duplicate'), ('second', 'duplicate')]],
+            )
+        client = TestClient(api.app)
+        self.assertEqual(client.post('/api/incoming/duplicates/plan', json={'ids': []}).status_code, 422)
+        for file_id in ('ready', 'nonexistent'):
+            response = client.post('/api/incoming/duplicates/plan', json={'ids': [file_id]})
+            self.assertEqual(response.status_code, 409)
+            self.assertIn('검사 결과가 변경', response.json()['detail'])
+        plan = client.post('/api/incoming/duplicates/plan', json={'ids': ['first', 'second']})
+        self.assertEqual(plan.status_code, 200)
+        keeper = next(item for item in plan.json()['groups'][0]['keepers'] if item['id'] == 'first')
+        first = {'id': 'first', 'keeperKind': keeper['kind'], 'keeperId': keeper['id']}
+        second = {**first, 'id': 'second'}
+        response = client.post('/api/jobs/duplicate-cleanup', json={'items': [second, second]})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('중복으로 선택', response.json()['detail'])
+        response = client.post('/api/jobs/duplicate-cleanup', json={'items': [first, second]})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('정리 대상에서 제외', response.json()['detail'])
+        with catalog.database() as db:
+            self.assertFalse(catalog.has_active_jobs(db))
 
     def test_exclusive_mutual_exclusion_both_directions(self):
         for kind in catalog.JOB_LANES:

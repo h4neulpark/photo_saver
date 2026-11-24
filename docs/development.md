@@ -1,5 +1,17 @@
 # 개발과 검증
 
+## Incoming 기기 업로드 검증
+
+[uploads.py](../backend/uploads.py), [test_uploads.py](../backend/test_uploads.py), [test_incoming_upload.cjs](../frontend/test_incoming_upload.cjs)가 청크 API와 브라우저 업로드를 구성한다. 운영 requirements.txt에는 패키지를 추가하지 않는다. FastAPI HTTP 테스트만 테스트 전용 이미지의 httpx 0.28.1을 사용한다.
+
+    node --check frontend/app.js
+    node --check frontend/test_incoming_upload.cjs
+    node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs
+
+업로드 백엔드 12개 테스트는 다중 청크/원자적 게시/검사 격리, 지원 형식·400/413/415, 경로·숨김·NFC·링크, 대소문자 충돌, 수정시각 범위, 409 오프셋·413 청크·단절/취소/OS 오류 롤백, DELETE 멱등·TTL/활성 잠금 보존, 507·마운트 503·reset-all 409, 실제 worker.scan_incoming과 동시 게시, 수정시각 설정 → 파일 fsync → 원자적 게시 순서를 검증한다. 폴더 각 세그먼트의 앞뒤/전체 공백·숨김·UTF-8 220바이트 초과도 거부한다.
+
+업로드 프론트엔드 17개 테스트는 영속 패널/썸네일/폴더 포커스, Safari 동기 파일 선택/입력 초기화, 다중 청크와 혼합 부분 실패·details 보존, 동반 파일 exact/stem/모호성, 네트워크 GET 재동기화·409·2회 재시도, AbortController·DELETE·대기 취소, 자동 scan 및 local/remote/exclusive 작업 공존, 폴더 드롭과 숨김 제외·2,000개 제한, 확장자 없는/숨김 파일의 API 전 사전 제외와 바이트 집계, 전체/현재 파일 바이트·진행률·화면 유지 안내, 상태별 결과 요약·저장 경로·최초 자동 펼침과 배치별 사용자 접기 보존, lastModified 정수화, 취소 정리 실패 안내의 즉시 표시를 검증한다. 실제 iOS/iPadOS 사진 선택기의 옵션과 백그라운드 제한은 실기기 수동 확인 대상이다.
+
 ## 소스 구성
 
 ```text
@@ -11,6 +23,7 @@ photo_saver/
 │   ├── requirements.txt    # Python 의존성 고정 버전
 │   ├── nginx.conf          # 정적 웹·썸네일·API 프록시
 │   ├── api.py              # FastAPI 앱과 이벤트·배치 API
+│   ├── uploads.py          # Incoming 기기 청크 업로드·원자적 게시·정리
 │   ├── catalog.py          # SQLite 스키마와 작업 등록
 │   ├── worker.py           # 로컬 처리와 작업 실행 루프
 │   ├── media.py            # 파일 안전성·미디어 분석
@@ -20,6 +33,7 @@ photo_saver/
 │   ├── archive.py          # SFTP 연결·폴더 탐색·단일 파일 다운로드
 │   ├── transfers.py        # 업로드·검증·취소·이력·remote_files 동기화
 │   ├── remote_index.py     # 원격 아카이브 전체·폴더별 증분 인덱싱
+│   ├── incoming_cleanup.py # Incoming 중복 정리 계획과 남길 사본 검증
 │   ├── offload.py          # 실시간 SFTP 확인 기반 로컬 원본 비우기(Safe Offload)
 │   ├── devices.py          # 촬영도구 이름 규칙·조회·변경
 │   ├── records.py          # 파일·아카이브·원격 인덱스 기록 조회
@@ -28,7 +42,9 @@ photo_saver/
 │   ├── index.html
 │   ├── app.js              # 해시 라우팅과 전체 UI
 │   ├── styles.css
-│   └── test_media_preview.cjs  # Node 내장 테스트 러너 기반 미리보기 UI 테스트
+│   ├── test_media_preview.cjs  # Node 내장 테스트 러너 기반 미리보기 UI 테스트
+│   ├── test_job_concurrency.cjs # 로컬·원격·배타 작업 UI 테스트
+│   └── test_incoming_upload.cjs # 기기 업로드·진행률·결과 상태·취소 테스트
 └── docs/                   # 현재 구현 문서
 ```
 
@@ -43,21 +59,22 @@ photo_saver/
 ```sh
 docker compose config --quiet
 docker compose build api
+printf 'FROM photo-saver-backend\nRUN pip install --no-cache-dir httpx==0.28.1\n' | docker build -t photo-saver-backend-tests -
 ```
 
-이미지에는 테스트 파일을 복사하지 않으므로 소스 디렉터리를 읽기 전용으로 마운트한다.
+이미지에는 테스트 파일을 복사하지 않으므로 소스 디렉터리를 읽기 전용으로 마운트한다. HTTP 라우팅 회귀 테스트의 FastAPI `TestClient`는 `httpx`가 필요하므로 위에서 만든 테스트 전용 이미지를 사용한다. 운영 이미지와 실행 중인 서비스에는 추가 의존성을 설치하지 않는다.
 
 ```sh
 docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
   -v "$PWD/backend:/app:ro" \
   -w /app \
-  photo-saver-backend \
+  photo-saver-backend-tests \
   python -m unittest test_concurrency -v
 
 docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
   -v "$PWD/backend:/app:ro" \
   -w /app \
-  photo-saver-backend \
+  photo-saver-backend-tests \
   python -m unittest discover -s . -p 'test_*.py' -v
 ```
 
@@ -67,18 +84,24 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
 node --check frontend/app.js
 node --check frontend/test_media_preview.cjs
 node --check frontend/test_job_concurrency.cjs
-node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs
+node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs
 git diff --check
 ```
 
 한 부문만 실행할 때는 마지막 백엔드 명령을 `python -m unittest test_transfers -v`처럼 지정한다. 테스트는 외부 SSH·OMV 연결을 모의 객체 또는 로컬 SFTP 대역으로 대체한다.
 
-2026-11-24 기준 위의 네트워크 차단·읽기 전용 컨테이너 명령으로 백엔드 unittest **120개**(`test_concurrency.py` 19개, `test_media_preview.py` 10개 포함)와 프론트엔드 `node --test` **15개**가 모두 통과했다. 별도 임시 디렉터리와 격리 Compose 프로젝트에서 `api` `/managed-preview` 읽기 전용 마운트, 워커 스캔 지문 일관성, Nginx 프록시 경유 `HEAD`·단일 `Range`(`206`)·`If-Range`·`416`(`bytes */N`)·다중 `Range`(`400`)·`405`와 `MEDIA_HEADERS`를 확인했고, 메모리 fixture 기반 헤드리스 Chrome에서 390×320·320×320·320×240(200% 확대) 오류 버튼 비클리핑/클릭 가능 여부와 폴링 자동 닫힘 후 `#event-search` 포커스 복귀도 검증했다. 실제 OMV 연결과 실기기/브라우저 실제 코덱(HEVC 등) 재생 검증은 수동 확인 항목으로 남긴다.
+2026-11-24 기준 위의 네트워크 차단·읽기 전용 테스트 컨테이너 명령으로 백엔드 unittest **153개**(업로드 12개 포함, `test_concurrency.py` 23개, `test_incoming_cleanup.py` 11개, `test_incoming_workflow.py` 6개, `test_media_preview.py` 10개 포함)와 프론트엔드 `node --test` **46개**(업로드 17개 포함)가 모두 통과했다. 이전 검증에서는 별도 임시 디렉터리와 격리 Compose 프로젝트에서 `api` `/managed-preview` 읽기 전용 마운트, 워커 스캔 지문 일관성, Nginx 프록시 경유 `HEAD`·단일 `Range`(`206`)·`If-Range`·`416`(`bytes */N`)·다중 `Range`(`400`)·`405`와 `MEDIA_HEADERS`를 확인했고, 메모리 fixture 기반 헤드리스 Chrome에서 390×320·320×320·320×240(200% 확대) 오류 버튼 비클리핑/클릭 가능 여부와 폴링 자동 닫힘 후 `#event-search` 포커스 복귀도 검증했다. 실제 OMV 연결과 실기기/브라우저 실제 코덱(HEVC 등) 재생 검증은 수동 확인 항목으로 남긴다.
 
 ## 테스트 범위
 
+썸네일 재로딩 회귀 테스트는 Incoming 표·카드와 이벤트 목록의 폴링·체크박스·검색·상태 변경에서 `<img>` 노드 동일성, 파일 추가·순서 변경·삭제 후 남은 행 보존, 썸네일 URL·보기 모드·필터 포함 여부 변경 시 필요한 DOM 교체를 확인한다. WeakMap 슬롯 캐시와 키 기반 행 조정, 세 페이지의 제자리 선택 갱신에서 선택 클래스·전체 선택의 indeterminate·작업 레인별 버튼 잠금·검색 포커스·스크롤도 검증한다. Nginx 문법 검사·리로드 후 실제 썸네일 200 및 조건부 304의 불변 캐시·nosniff, 없는 썸네일 404의 장기 캐시 부재·nosniff를 확인했다.
+
+Incoming 회귀 테스트는 실제 FastAPI HTTP 경로의 중복 정리 계획·작업 등록과 200/202/400/409/422 응답, 워커 파일 정리, SFTP 배치 장애와 종료 예외, 승격된 중복의 동반 파일 처리, 조회 중 폴링·취소·상태 경합, 409 상태 재조회, 기본 404 재빌드 안내, 결과 자동 펼침과 루트 파일명 중복 방지를 포함한다. `docker compose up -d --build` 후 API healthy·worker/frontend Up과 더미 ID `{"ids":["nonexistent"]}`를 보낸 정리 계획 API의 HTTP 409 JSON 응답을 확인했다. 이전 격리 HTTP·워커 실행에서는 테스트 MP4 7개를 검사하고 중복 6개를 정리한 뒤 지정한 사본과 XMP 보존을 확인했고, Chrome 테스트 데이터로 넓은 화면과 320px 화면의 일괄 선택, 보존 사본 변경, 확인창, 완료 결과를 확인했다.
+
 | 파일 | 주요 검증 |
 | --- | --- |
+| [test_incoming_cleanup.py](../backend/test_incoming_cleanup.py) | 로컬·같은 검사·원격 사본 선택, 원격 범위와 SHA-256, 변경·누락·연결 실패, 배치 중 SFTP 단절 후 채널 재사용 방지·로컬 정리 지속, 연결 종료 예외에도 완료 결과·그룹 갱신 보존, 삭제 직전 원격 404→409 변환, 중단 후 재실행, 동반 파일 보존 |
+| [test_incoming_workflow.py](../backend/test_incoming_workflow.py) | 검사 단계와 파일 수, 2단계 파일 변경 시 낡은 SHA·지문·썸네일 제거, 중복→이동 가능 승격 시 XMP·보조 파일 계획과 scan_xmp 정합성, 모호한 보조 파일 보존, 이동·삭제·XMP 파일별 결과, 이미 보관된 XMP |
 | [test_concurrency.py](../backend/test_concurrency.py) | 구버전 jobs 레인 마이그레이션·인덱스·직접 SQL 트리거, 전체 충돌 매트릭스, 실제 1+1 스레드 병렬 처리·배리어·중단 대기·재시작 복구, offload 중 scan/move/delete·XMP 경합과 원복, 신규·변경 XMP 연결 거부 및 조회 후 상태 전이에도 scan 완료·기존 XMP 보존, 썸네일 보존, SQLite 동시 쓰기, 백업·복원 배타 잠금·구버전 복원, 다중 레인 state |
 | [test_job_concurrency.cjs](../frontend/test_job_concurrency.cjs) | 레인별 버튼 활성·exclusive/동기 카탈로그 잠금, 동시 진행 배너·한 레인 종료 후 폴링, 명시적 원격 취소 ID, 원격 실행 중 Incoming 미리보기 삭제 격리 |
 | [test_archive.py](../backend/test_archive.py) | 루트 이탈 거부, 링크 경계, 특수 파일명, 빈 폴더·조회 제한, 접속 오류 매핑, 저장된 키만 사용하는 연결, 단일 파일 SFTP 다운로드·UTF-8 헤더·루트 불일치 거부, 호스트 키 초기화 |
@@ -111,3 +134,5 @@ git diff --check
 | UI | 다섯 해시 경로, 표·카드 전환, 키보드 이동, 좁은 화면, 오류·빈 상태 |
 
 입력·응답을 바꾸면 [API](api.md), DB 열·상태·제약을 바꾸면 [데이터 모델](data-model.md), 실행 변수·볼륨을 바꾸면 [실행과 운영](setup-and-operations.md)을 함께 갱신한다.
+
+기기 업로드 운영 검증에서는 Compose 재빌드·API healthy·Nginx 설정 검사/리로드, 두 preview 마운트 쓰기 EROFS와 upload 쓰기 성공, Nginx 경유 DNG 415·2청크 PUT 200·complete 201·미완료 DELETE 200을 확인했다. staging 잔여와 smoke_upload_check 폴더는 제거했고 Chrome fixture는 320·390·430·550·760·1280px에서 가로 넘침 없음과 최소 44px 버튼을 확인했다.

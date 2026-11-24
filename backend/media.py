@@ -95,6 +95,13 @@ def hash_file(root, path, expected=None):
     return digest, info
 
 
+def rename_noreplace(source_fd, source_name, target_fd, target_name):
+    """Atomically publish a file without replacing any existing directory entry."""
+    if _renameat2(source_fd, os.fsencode(source_name), target_fd, os.fsencode(target_name), RENAME_NOREPLACE):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target_name)
+
+
 def move_file(incoming, source, managed, target, expected, *, create_parent=True):
     if create_parent:
         parent_name, _ = relative_parts(target)
@@ -107,9 +114,7 @@ def move_file(incoming, source, managed, target, expected, *, create_parent=True
         with parent_directory(managed, target) as (target_fd, target_name):
             if fingerprint(regular_stat(source_fd, source_name)) != expected:
                 raise OSError("검사 후 파일 상태가 변경되었습니다.")
-            if _renameat2(source_fd, os.fsencode(source_name), target_fd, os.fsencode(target_name), RENAME_NOREPLACE):
-                error = ctypes.get_errno()
-                raise OSError(error, os.strerror(error), target)
+            rename_noreplace(source_fd, source_name, target_fd, target_name)
 
 
 def delete_photo(incoming, path, expected):
@@ -121,7 +126,7 @@ def delete_photo(incoming, path, expected):
 def delete_verified_file(incoming, path, expected):
     with parent_directory(incoming, path) as (fd, name):
         if fingerprint(regular_stat(fd, name)) != expected:
-            raise OSError("검사 이후 파일이 변경되었습니다. 새로 고침이 필요합니다.")
+            raise OSError("검사 이후 파일이 변경되었습니다. 다시 검사가 필요합니다.")
         os.unlink(name, dir_fd=fd)
 
 

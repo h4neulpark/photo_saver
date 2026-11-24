@@ -16,6 +16,7 @@ LANE_EXCLUSIVE = "exclusive"
 LANES = (LANE_LOCAL, LANE_REMOTE, LANE_EXCLUSIVE)
 JOB_LANES = {
     "scan": LANE_LOCAL, "move": LANE_LOCAL, "delete": LANE_LOCAL, "xmp-link": LANE_LOCAL,
+    "duplicate-cleanup": LANE_LOCAL,
     "upload": LANE_REMOTE, "offload": LANE_REMOTE, "remote-index": LANE_REMOTE,
     "reset-all": LANE_EXCLUSIVE,
 }
@@ -341,7 +342,7 @@ def queue_job(connection, kind, payload):
 
 def _job_conflict(lane, conflict_lane):
     messages = {
-        LANE_LOCAL: "로컬 파일 작업(검사·이동·삭제·XMP 연결)이 진행 중입니다.",
+        LANE_LOCAL: "로컬 파일 작업(검사·이동·중복 정리·삭제·XMP 연결)이 진행 중입니다.",
         LANE_REMOTE: "원격 아카이브 작업(업로드·로컬 비우기·원격 인덱싱)이 진행 중입니다.",
         LANE_EXCLUSIVE: "데이터 초기화 중입니다. 완료 후 다시 시도하세요.",
     }
@@ -375,3 +376,13 @@ def active_offload_media_ids(connection):
     return {item["id"] for row in connection.execute(
         "SELECT payload FROM jobs WHERE kind='offload' AND status IN ('queued','running')"
     ) for item in json.loads(row["payload"]).get("files", [])}
+
+
+def active_duplicate_keeper_ids(connection):
+    keepers = (
+        item.get("keeper", {}) for row in connection.execute(
+            "SELECT payload FROM jobs WHERE kind='duplicate-cleanup' AND status IN ('queued','running')"
+        )
+        for item in json.loads(row["payload"]).get("files", [])
+    )
+    return {keeper["id"] for keeper in keepers if keeper.get("kind") == "managed"}

@@ -64,10 +64,11 @@ function savedIncomingLayout() {
   }
 }
 
-const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
+const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
+  deviceUpload: { open: false, folder: '', autoScan: true, running: false, cancelling: false, activeUploadId: null, abortController: null, totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, batchId: 0, results: [], scanNote: '' },
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
-  incomingLayout: savedIncomingLayout(), preview: null,
+  incomingLayout: savedIncomingLayout(), preview: null, cleanupPlanning: false,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
@@ -92,6 +93,77 @@ const mediaPreview = document.getElementById('media-preview');
 const notice = document.getElementById('notice');
 let noticeTimeout;
 
+// Slots and keyed rows retain their DOM (including lazy-loaded images) across polls.
+const slotHtmlCache = new WeakMap();
+
+function setSlotHtml(element, html) {
+  if (!element || slotHtmlCache.get(element) === html) return false;
+  slotHtmlCache.set(element, html);
+  element.innerHTML = html;
+  return true;
+}
+
+function setClass(element, name, enabled) {
+  if (!element) return;
+  if (enabled) element.classList.add(name);
+  else element.classList.remove(name);
+}
+
+function setChecked(input, checked) {
+  if (!input) return;
+  input.checked = Boolean(checked);
+  if (checked) input.setAttribute('checked', '');
+  else input.removeAttribute('checked');
+}
+
+function setDisabled(control, disabled) {
+  if (!control) return;
+  control.disabled = Boolean(disabled);
+  if (disabled) control.setAttribute('disabled', '');
+  else control.removeAttribute('disabled');
+}
+
+function parseSingleElement(parentTag, html) {
+  const host = document.createElement(parentTag);
+  host.innerHTML = html;
+  return host.children[0] || null;
+}
+
+function reconcileKeyedChildren(container, parentTag, items, getKey, createNode, patchNode) {
+  const existingByKey = new Map();
+  const nextKeys = new Set(items.map(getKey));
+  for (const child of [...container.children]) {
+    const key = child.dataset?.itemKey;
+    if (!key || !nextKeys.has(key) || existingByKey.has(key)) child.remove();
+    else existingByKey.set(key, child);
+  }
+  const ordered = items.map(item => {
+    const key = getKey(item);
+    let node = existingByKey.get(key);
+    if (!node) {
+      node = createNode(item, parentTag);
+      if (node) node.dataset.itemKey = key;
+    }
+    if (node) patchNode(node, item);
+    return node;
+  }).filter(Boolean);
+  const current = container.children;
+  if (current.length === ordered.length && ordered.every((node, index) => current[index] === node)) return;
+  if (current.length < ordered.length && [...current].every((node, index) => ordered[index] === node)) {
+    for (let index = current.length; index < ordered.length; index += 1) container.appendChild(ordered[index]);
+    return;
+  }
+  if (typeof container.insertBefore === 'function') {
+    for (let index = 0; index < ordered.length; index += 1) {
+      const node = ordered[index];
+      const cursor = container.children[index] || null;
+      if (node !== cursor) container.insertBefore(node, cursor);
+    }
+  } else {
+    container.replaceChildren(...ordered);
+  }
+}
+
 
 async function api(path, method = 'GET', data) {
   let response;
@@ -108,7 +180,11 @@ async function api(path, method = 'GET', data) {
   }
   const result = await response.json().catch(() => null);
   if (!response.ok || !result) {
-    const error = new Error(typeof result?.detail === 'string' ? result.detail : '요청을 처리하지 못했습니다.');
+    const rawDetail = result?.detail;
+    const message = response.status === 404 && rawDetail === 'Not Found'
+      ? '요청한 API 경로를 찾을 수 없습니다. 백엔드 컨테이너가 최신 코드로 다시 빌드·재시작되었는지 확인하세요.'
+      : typeof rawDetail === 'string' ? rawDetail : '요청을 처리하지 못했습니다.';
+    const error = new Error(message);
     error.status = response.status;
     error.data = result;
     throw error;
@@ -116,7 +192,7 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-const jobLanes = { scan: 'local', move: 'local', delete: 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const jobLanes = { scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
 function jobActive(job = state.job) { return isJobActive(job); }
@@ -150,9 +226,19 @@ function setOptimisticJob(job) {
   state.activeJobs[lane] = isJobActive(job) ? job : null;
 }
 function activeJobsBar() {
+  const existing = laneJobsBar();
+  if (view.deviceUpload.running) {
+    const upload = view.deviceUpload;
+    const pill = '<div class="active-job-pill"><span role="status">기기 업로드 · ' + upload.completedFiles + '/' + upload.totalFiles + ' · ' + deviceUploadPercent() + '%</span>' + button('cancel-incoming-upload', upload.cancelling ? '중지 중…' : '중지', { disabled: upload.cancelling }) + '</div>';
+    return existing ? existing.slice(0, -6) + pill + '</div>' : '<div class="active-jobs-bar" aria-label="진행 중인 작업">' + pill + '</div>';
+  }
+  return existing;
+}
+
+function laneJobsBar() {
   if (!anyJobActive()) return '';
   const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
-  const kinds = { scan: '검사', move: '이동', delete: '삭제', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  const kinds = { scan: '검사', move: '이동', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
   return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
     const job = activeLaneJob(lane);
     if (!job) return '';
@@ -170,7 +256,8 @@ function jobMessage(job) {
   if (job.kind === 'remote-index') return `원격 인덱싱 완료 · 신규 해시 ${job.result.hashed || 0}개 · 변경 없음 ${job.result.unchanged || 0}개${job.result.missing ? ` · 누락 ${job.result.missing}개` : ''}`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
-  if (job.kind === 'xmp-link') return `XMP ${job.result.linked}개를 연결했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
+  if (job.kind === 'duplicate-cleanup') return `중복 ${job.result.cleaned || 0}개 정리${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
+  if (job.kind === 'xmp-link') return `XMP ${job.result.linked || 0}개 연결${job.result.alreadyStored ? ` · 이미 보관 ${job.result.alreadyStored}개` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
   return `${job.result.moved}개를 managed로 옮겼습니다.${job.result.xmp ? ` XMP ${job.result.xmp}개 보관.` : ''}${job.result.auxDeleted ? ` THM·LRV ${job.result.auxDeleted}개 삭제.` : ''}${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review || job.result.companionReview ? ` 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개.` : ''}`;
 }
 
@@ -201,10 +288,7 @@ async function syncState() {
     if (completed && view.page === 'catalog') await loadCatalog();
     const sourceKeys = new Set(sourceFiles().flatMap(sourceAssetKeys));
     for (const key of view.sourceSelection) if (!sourceKeys.has(key)) view.sourceSelection.delete(key);
-    const selectable = new Set(state.incoming.filter(canSelectIncoming).map(file => file.id));
-    for (const id of view.incomingSelection) {
-      if (!selectable.has(id)) view.incomingSelection.delete(id);
-    }
+    pruneIncomingSelection();
     const preservePreviewMessage = updatePreviewAfterDelete();
     reconcilePreview({ preserveMessage: preservePreviewMessage });
   } catch (error) {
@@ -274,7 +358,7 @@ function sizeLabel(size) {
 
 function fileThumbnail(file, interactive = false, card = false, source = 'incoming') {
   const picture = file.kind === 'photo';
-  const image = file.thumbnail ? `<img src="${escapeHtml(file.thumbnail)}" alt="" loading="lazy">` : '';
+  const image = file.thumbnail ? `<img src="${escapeHtml(file.thumbnail)}" alt="" loading="lazy" decoding="async">` : '';
   const contents = `${icon(picture ? 'photo' : 'video')}${image}`;
   const canPreview = source === 'managed' ? file.status === 'available' && Boolean(file.preview) : Boolean(file.preview);
   if (interactive && canPreview) {
@@ -286,25 +370,37 @@ function fileThumbnail(file, interactive = false, card = false, source = 'incomi
   return `<span class="thumb">${contents}</span>`;
 }
 
-function fileCell(file, detail, interactive = false, source = 'incoming') {
-  return `<div class="file-cell">
-    ${fileThumbnail(file, interactive, false, source)}
-    <div><strong>${escapeHtml(file.name)}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}</div>
-  </div>`;
-}
-
 const filterLabels = { all: '전체', ready: '이동 가능', duplicate: '중복', review: '확인 필요' };
+const keeperLabels = { managed: 'Mac 보관 사본', remote: 'OMV 보관 사본', incoming: '같은 Incoming 검사' };
+const companionLabels = {
+  move: '원본과 함께 이동', 'delete-after-move': '원본 이동 후 정리', link: '연결 가능',
+  linked: '연결됨', 'already-stored': '이미 보관됨', deleted: '정리됨', absent: '파일 없음', keep: '보존 필요', review: '확인 필요',
+};
 
 function canDeleteIncoming(file) {
-  return file.kind === 'photo' && ['ready', 'duplicate'].includes(file.status);
+  return file.kind === 'photo' && file.status === 'ready';
 }
 
 function canSelectIncoming(file) {
-  return file.status === 'ready' || canDeleteIncoming(file);
+  return file.status === 'ready' || file.status === 'duplicate';
 }
 
-function selectedIncoming(predicate) {
-  return state.incoming.filter(file => view.incomingSelection.has(file.id) && predicate(file));
+function selectedIncoming(predicate = canSelectIncoming) {
+  return filteredIncoming().filter(file => view.incomingSelection.has(file.id) && predicate(file));
+}
+
+function pruneIncomingSelection() {
+  const selectable = new Set(filteredIncoming().filter(canSelectIncoming).map(file => file.id));
+  for (const id of view.incomingSelection) if (!selectable.has(id)) view.incomingSelection.delete(id);
+}
+
+function incomingPath(file) {
+  return file.path ?? [file.folder, file.name].filter(Boolean).join('/');
+}
+
+function incomingReason(file) {
+  const source = file.duplicateSource;
+  return keeperLabels[source?.kind] ? `${keeperLabels[source.kind]} · ${source.path}` : file.reason;
 }
 
 function matchesXmp(file, query) {
@@ -315,68 +411,127 @@ function matchesXmp(file, query) {
 }
 
 function companionSummary(file) {
-  return [file.xmp ? 'XMP' : '', file.cameraAuxCount ? `이동 후 THM·LRV ${file.cameraAuxCount}개 삭제` : ''].filter(Boolean).join(' · ');
+  if (file.companions) return file.companions.map(item => `${item.path.split('/').at(-1)} ${companionLabels[item.disposition] || '확인 필요'}`).join(' · ');
+  return [file.xmp ? 'XMP' : '', file.cameraAuxCount && file.status === 'ready' ? `THM·LRV ${file.cameraAuxCount}개 원본 이동 후 정리` : ''].filter(Boolean).join(' · ');
 }
 
-function filteredIncoming() {
+function filteredIncoming(filter = view.incomingFilter) {
   const query = view.query.trim().toLocaleLowerCase();
   return state.incoming.filter(file =>
-    (view.incomingFilter === 'all' || file.status === view.incomingFilter) &&
+    (filter === 'all' || file.status === filter) &&
     (!view.incomingKind || file.kind === view.incomingKind) &&
-    (!query || file.name.toLocaleLowerCase().includes(query) || file.folder.toLocaleLowerCase().includes(query) || matchesXmp(file, query))
+    (!query || incomingPath(file).toLocaleLowerCase().includes(query) || matchesXmp(file, query))
   );
+}
+
+function incomingFilters() {
+  const results = filteredIncoming('all');
+  return Object.entries(filterLabels).map(([key, label]) => `<button type="button" class="filter" data-action="incoming-filter" data-value="${key}" aria-pressed="${view.incomingFilter === key}">${label}<span>${key === 'all' ? results.length : results.filter(file => file.status === key).length}</span></button>`).join('');
 }
 
 function checkbox(kind, id, label, selection) {
   return `<input type="checkbox" data-select="${kind}" value="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" ${selection.has(id) ? 'checked' : ''}>`;
 }
 
-function incomingCards(files, selectAll) {
-  return `${selectAll ? `<label class="card-select-all">${selectAll} 표시된 파일 모두 선택</label>` : ''}
-    <ul class="incoming-cards" aria-label="Incoming 카드 목록">${files.map(file => `<li class="incoming-card${view.incomingSelection.has(file.id) ? ' selected' : ''}">
-      <div class="card-image">
-        ${fileThumbnail(file, true, true)}
-        ${canSelectIncoming(file) ? `<label class="card-check">${checkbox('incoming', file.id, `${file.name} 선택`, view.incomingSelection)}</label>` : ''}
-      </div>
-      <div class="card-caption">
+function incomingCardCaption(file) {
+  const path = incomingPath(file);
+  const reason = incomingReason(file);
+  const companions = companionSummary(file);
+  return `
         <strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+        ${path !== file.name ? `<p class="small muted card-reason">${escapeHtml(path)}</p>` : ''}
         <div class="card-info">${badge(file.status, filterLabels[file.status] || '삭제 중')}<span class="small muted numbers">${sizeLabel(file.size)}</span></div>
-        ${file.reason ? `<p class="small muted card-reason">${escapeHtml(file.reason)}</p>` : ''}
-        ${companionSummary(file) ? `<p class="small muted card-reason">${companionSummary(file)}</p>` : ''}
-      </div>
-    </li>`).join('')}</ul>`;
+        ${reason ? `<p class="small muted card-reason">${escapeHtml(reason)}</p>` : ''}
+        ${companions ? `<p class="small muted card-reason">${escapeHtml(companions)}</p>` : ''}
+    `;
 }
 
-function incomingRows() {
+function incomingEmptyState() {
+  if (activeLaneJob('local')?.kind === 'scan' && !state.scan) return emptyState('refresh', '첫 검사 진행 중', '검사를 마치면 여기에 결과가 표시됩니다.');
+  if (!state.scan && !state.incoming.length) return emptyState('inbox', '아직 검사 결과가 없습니다.', '기기에서 업로드하거나 incoming 폴더에 파일을 넣고 파일 검사를 누르세요.');
+  if (view.query || view.incomingFilter !== 'all' || view.incomingKind) return emptyState('search', '조건에 맞는 파일이 없습니다.', button('reset-incoming-filters', '필터 초기화'));
+  return state.scan?.result?.checked
+    ? emptyState('check', '이번 검사에서 남은 사진·영상이 없습니다.', '파일을 추가하면 다시 검사하세요.')
+    : emptyState('inbox', '검사할 사진·영상이 없습니다.', '기기에서 업로드하거나 incoming 폴더에 파일을 넣은 뒤 다시 검사하세요.');
+}
+
+function createIncomingRow(_file, parentTag) {
+  return parseSingleElement(parentTag, view.incomingLayout === 'cards'
+    ? '<li class="incoming-card"><div class="card-image"><span class="thumb-slot"></span><span class="card-check-slot"></span></div><div class="card-caption"></div></li>'
+    : '<tr><td data-col="select"></td><td data-col="file"><div class="file-cell"><span class="thumb-slot"></span><div data-col="file-text"></div></div></td><td class="numbers muted" data-col="modified"></td><td class="numbers" data-col="size"></td><td data-col="status"></td></tr>');
+}
+
+function patchIncomingRow(node, file) {
+  const card = view.incomingLayout === 'cards';
+  const path = incomingPath(file);
+  setSlotHtml(node.querySelector('.thumb-slot'), fileThumbnail(file, true, card));
+  // Checked state belongs to selection synchronization, not the HTML slot cache.
+  const select = canSelectIncoming(file) ? checkbox('incoming', file.id, `${path} 선택`, new Set()) : '';
+  if (card) {
+    setSlotHtml(node.querySelector('.card-check-slot'), select ? `<label class="card-check">${select}</label>` : '');
+    setSlotHtml(node.querySelector('.card-caption'), incomingCardCaption(file));
+  } else {
+    setSlotHtml(node.querySelector('[data-col="select"]'), select);
+    const detail = [path !== file.name ? path : '', companionSummary(file)].filter(Boolean).join(' · ');
+    setSlotHtml(node.querySelector('[data-col="file-text"]'), `<strong>${escapeHtml(file.name)}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}`);
+    setSlotHtml(node.querySelector('[data-col="modified"]'), file.modifiedAt ? dateTimeFormatter(state.timezone).format(new Date(file.modifiedAt)) : '—');
+    setSlotHtml(node.querySelector('[data-col="size"]'), sizeLabel(file.size));
+    setSlotHtml(node.querySelector('[data-col="status"]'), `${badge(file.status, filterLabels[file.status] || '삭제 중')}${incomingReason(file) ? `<div class="small muted file-reason">${escapeHtml(incomingReason(file))}</div>` : ''}`);
+  }
+}
+
+function patchIncomingRows() {
+  const container = page.querySelector('#incoming-rows');
   const files = filteredIncoming();
-  if (!files.length) return emptyState('inbox', '표시할 파일이 없습니다.',
-    state.scan ? '파일을 추가하거나 검사 결과 필터를 확인하세요.' : 'incoming에 사진이나 영상을 넣고 새로 고침하세요.');
-  const available = files.filter(canSelectIncoming);
-  const selectAll = available.length ? checkbox('incoming-all', 'all', '표시된 파일 모두 선택', new Set(available.every(file => view.incomingSelection.has(file.id)) ? ['all'] : [])) : '';
-  if (view.incomingLayout === 'cards') return incomingCards(files, selectAll);
-  return `<table aria-label="Incoming 검사 결과">
-    <thead><tr>
-      <th scope="col">${selectAll}</th>
-      <th scope="col">파일</th><th scope="col">수정 일시</th><th scope="col">크기</th><th scope="col">검사 결과</th>
-    </tr></thead>
-    <tbody>${files.map(file => `<tr class="${view.incomingSelection.has(file.id) ? 'selected' : ''}">
-      <td>${canSelectIncoming(file) ? checkbox('incoming', file.id, `${file.name} 선택`, view.incomingSelection) : ''}</td>
-      <td>${fileCell(file, [file.folder, companionSummary(file)].filter(Boolean).join(' · '), true)}</td>
-      <td class="numbers muted">${file.modifiedAt ? dateTimeFormatter(state.timezone).format(new Date(file.modifiedAt)) : '—'}</td>
-      <td class="numbers">${sizeLabel(file.size)}</td>
-      <td>${badge(file.status, filterLabels[file.status] || '삭제 중')}${file.reason ? `<div class="small muted file-reason">${escapeHtml(file.reason)}</div>` : ''}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+  const mode = files.length ? view.incomingLayout : 'empty';
+  if (container.dataset.mode !== mode) {
+    container.dataset.mode = mode;
+    slotHtmlCache.delete(container);
+    container.innerHTML = mode === 'empty' ? '' : mode === 'cards'
+      ? '<div data-col="select-all"></div><ul class="incoming-cards" aria-label="Incoming 카드 목록"></ul>'
+      : '<table aria-label="Incoming 검사 결과"><thead><tr><th scope="col" data-col="select-all"></th><th scope="col">파일</th><th scope="col">수정 일시</th><th scope="col">크기</th><th scope="col">검사 결과</th></tr></thead><tbody></tbody></table>';
+  }
+  if (mode === 'empty') {
+    setSlotHtml(container, incomingEmptyState());
+    return;
+  }
+  const selectAll = files.some(canSelectIncoming) ? checkbox('incoming-all', 'all', '표시된 파일 모두 선택', new Set()) : '';
+  setSlotHtml(container.querySelector('[data-col="select-all"]'), mode === 'cards' && selectAll
+    ? `<label class="card-select-all">${selectAll} 표시된 파일 모두 선택</label>` : selectAll);
+  reconcileKeyedChildren(container.querySelector(mode === 'cards' ? 'ul' : 'tbody'), mode === 'cards' ? 'ul' : 'tbody',
+    files, file => file.id, createIncomingRow, patchIncomingRow);
+}
+
+function syncIncomingSelection() {
+  const container = page.querySelector('#incoming-rows');
+  if (!container) return;
+  for (const row of container.querySelectorAll('[data-item-key]')) {
+    const selected = view.incomingSelection.has(row.dataset.itemKey);
+    setClass(row, 'selected', selected);
+    setChecked(row.querySelector('[data-select="incoming"]'), selected);
+  }
+  const files = filteredIncoming().filter(canSelectIncoming);
+  const count = files.filter(file => view.incomingSelection.has(file.id)).length;
+  const all = container.querySelector('[data-select="incoming-all"]');
+  setChecked(all, files.length > 0 && count === files.length);
+  if (all) all.indeterminate = count > 0 && count < files.length;
+  renderIncomingActions();
 }
 
 function incomingActions() {
-  const count = view.incomingSelection.size;
-  const photos = selectedIncoming(canDeleteIncoming).length;
-  const movable = selectedIncoming(file => file.status === 'ready').length;
-  const moveLabel = movable && movable !== count ? `신규 ${movable}개를 managed로 이동` : '선택 항목을 managed로 이동';
-  return `<span class="small muted">${count}개 선택됨${photos && photos !== count ? ` · 사진 ${photos}개` : ''}</span>
-    <div>${button('delete-incoming', '사진 삭제', { glyph: 'trash', danger: true, disabled: !photos || localBusy() })}
-    ${button('move-incoming', moveLabel, { glyph: 'arrow', primary: true, disabled: !movable || localBusy() })}</div>`;
+  const files = selectedIncoming();
+  const photos = files.filter(canDeleteIncoming).length;
+  const movable = files.filter(file => file.status === 'ready').length;
+  const duplicates = files.filter(file => file.status === 'duplicate').length;
+  return `<span class="small muted">${files.length}개 선택${movable && duplicates ? ` · 이동 가능 ${movable}개 · 중복 ${duplicates}개` : ''}</span>
+    <div>${button('delete-incoming', photos ? `사진 ${photos}개 삭제` : '사진 삭제', { glyph: 'trash', danger: true, disabled: !photos || localBusy() })}
+    ${button('cleanup-incoming', view.cleanupPlanning ? '보관 사본 조회 중…' : duplicates ? `중복 ${duplicates}개 정리` : '중복 정리', { glyph: 'check', danger: true, disabled: !duplicates || localBusy() || view.cleanupPlanning })}
+    ${button('move-incoming', movable ? `신규 ${movable}개를 managed로 이동` : 'managed로 이동', { glyph: 'arrow', primary: true, disabled: !movable || localBusy() })}</div>`;
+}
+
+function renderIncomingActions() {
+  const bar = page.querySelector('#incoming-actions');
+  setSlotHtml(bar, incomingActions());
 }
 
 function pendingXmpLinks() {
@@ -404,38 +559,389 @@ function pendingXmpSection() {
   </section>`;
 }
 
-function incomingPage() {
-  const results = state.incoming.filter(file => !view.incomingKind || file.kind === view.incomingKind);
+function unmatchedCompanionsSection() {
+  const items = state.scan?.result?.unmatchedCompanions;
+  if (!items?.length) return '';
+  return `<details class="surface incoming-result unmatched-companions" ${page.querySelector('.unmatched-companions')?.open ? 'open' : ''}>
+    <summary>연결을 확인할 동반 파일 ${items.length}개</summary>
+    <ul>${items.map(item => `<li><strong>${escapeHtml(item.path)}</strong> <span class="small muted">${escapeHtml(companionLabels[item.disposition] || '확인 필요')}</span>
+      <p class="small">${escapeHtml(item.reason)}</p></li>`).join('')}</ul>
+  </details>`;
+}
+
+function incomingResultSection() {
+  const titles = { move: '파일 이동 결과', delete: '사진 삭제 결과', 'duplicate-cleanup': '중복 정리 결과', 'xmp-link': 'XMP 연결 결과' };
+  const job = state.latestIncomingResult || laneJob('local');
+  if (!titles[job?.kind] || isJobActive(job)) return '';
+  const result = job.result || {};
+  const items = result.items || [];
+  const itemLabels = { moved: '이동 완료', duplicate: '이미 보관됨', cleaned: '정리 완료', deleted: '삭제 완료', review: '확인 필요', linked: '연결 완료', 'already-stored': '이미 보관됨' };
+  const previous = page.querySelector('#incoming-result-items');
+  const expanded = previous?.dataset.jobId === String(job.id) ? previous.open : Boolean(result.review || result.companionReview);
+  return `<section class="surface incoming-result" aria-labelledby="incoming-result-title">
+    <div class="incoming-result-summary">
+      <div><h2 id="incoming-result-title">${titles[job.kind]}</h2><p class="small muted">${escapeHtml(jobMessage(job) || '작업을 완료하지 못했습니다.')}</p></div>
+      <div class="incoming-next-actions">
+        ${result.moved ? button('open-unassigned', '이벤트 관리의 미배정 열기', { glyph: 'arrow' }) : ''}
+        ${result.review || result.companionReview || job.status === 'failed' ? button('rescan-incoming', '다시 검사', { glyph: 'refresh', disabled: localBusy() }) : ''}
+      </div>
+    </div>
+    ${items.length ? `<details id="incoming-result-items" data-job-id="${job.id}" ${expanded ? 'open' : ''}>
+      <summary>파일별 결과 ${items.length}개</summary>
+      <ul>${items.map(item => `<li>
+        <strong>${escapeHtml(item.path || item.id || '경로 정보 없음')}</strong> <span class="small muted">${escapeHtml(itemLabels[item.status] || item.status)}</span>
+        ${item.reason ? `<p class="small">${escapeHtml(item.reason)}</p>` : ''}
+        ${item.companions?.length ? `<ul>${item.companions.map(companion => `<li class="small">${escapeHtml(companion.path)} · ${escapeHtml(companionLabels[companion.disposition] || '확인 필요')}${companion.reason ? ` · ${escapeHtml(companion.reason)}` : ''}</li>`).join('')}</ul>` : ''}
+      </li>`).join('')}</ul>
+    </details>` : ''}
+  </section>`;
+}
+
+function incomingScanStrip() {
   const job = activeLaneJob('exclusive') || laneJob('local');
   const active = isJobActive(job);
-  const failed = job?.status === 'failed';
-  const scanning = active && job.kind === 'scan';
+  const failedScan = job?.kind === 'scan' && job.status === 'failed';
+  const complete = state.scan?.result;
   const jobLabels = {
-    scan: 'incoming 검사 중', move: '선택한 파일 이동 및 분석 중', delete: '선택한 사진 삭제 중',
-    'xmp-link': 'XMP 연결 중', upload: '아카이브 업로드 중', offload: '로컬 원본 비우기 중',
-    'remote-index': '원격 아카이브 인덱싱 중', 'reset-all': '서버 데이터 초기화 중',
+    scan: '파일 검사 중', move: '파일 이동 및 분석 중', delete: '사진 삭제 중',
+    'duplicate-cleanup': '중복 정리 중', 'xmp-link': 'XMP 연결 중', 'reset-all': '서버 데이터 초기화 중',
   };
   const status = active ? (jobLabels[job.kind] || '작업 진행 중') :
-    failed ? '작업 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
-  const detail = failed ? job.result.error : active ? (scanning ? '중복을 확인하고 썸네일을 만들고 있습니다.' : '완료되면 결과에 반영됩니다.') :
-    state.scan ? `${dateTimeFormatter(state.timezone).format(new Date(state.scan.finishedAt))} · ${state.scan.result.checked}개 검사` : '새로 고침을 눌러 검사를 시작하세요.';
-  return `${header('Incoming Library', '사진과 영상을 검사하고 managed로 옮길 파일을 선택하세요.',
-    button('scan', scanning ? '검사 중…' : '새로 고침', { glyph: 'refresh', disabled: localBusy() || view.connecting }))}
-    <div class="scan-strip" role="status">
+    failedScan ? '파일 검사 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
+  const counts = complete && Number.isInteger(complete.ready) ? ` · 이동 가능 ${complete.ready} · 중복 ${complete.duplicate} · 확인 필요 ${complete.review}` : '';
+  const detail = failedScan ? (job.result.error || '다시 검사하세요.') : active ? (job.result?.phase || '작업을 준비하고 있습니다.') :
+    complete ? `${dateTimeFormatter(state.timezone).format(new Date(state.scan.finishedAt))} · ${complete.checked}개 검사${counts}` : '파일 검사를 눌러 시작하세요.';
+  const total = active ? job.result?.totalFiles : 0;
+  const completed = active ? job.result?.completedFiles ?? 0 : 0;
+  return `<div class="scan-strip" role="status">
       <span>${icon(active ? 'refresh' : 'check')} ${status}</span>
-      <span class="small">${escapeHtml(detail)}</span>
-    </div>
+      <span class="small incoming-progress">${escapeHtml(detail)}${total > 0 ? ` · ${completed} / ${total}<progress aria-label="${status} 진행률" value="${completed}" max="${total}"></progress>` : ''}
+        ${active && job.result?.current ? `<span class="incoming-path">${escapeHtml(job.result.current)}</span>` : ''}</span>
+    </div>`;
+}
+
+const devicePhotoExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
+const deviceVideoExtensions = new Set(['mp4', 'mov']);
+const deviceCompanionExtensions = new Set(['xmp', 'thm', 'lrv']);
+function deviceExtension(name) {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+}
+function deviceStem(name) {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(0, dot) : name;
+}
+function deviceUploadExclusionReason(file) {
+  if (file.name.startsWith('.')) return '숨김 파일 제외';
+  if (file.size <= 0) return '빈 파일 제외';
+  const extension = deviceExtension(file.name);
+  return devicePhotoExtensions.has(extension) || deviceVideoExtensions.has(extension) || deviceCompanionExtensions.has(extension) ? '' : '지원하지 않는 형식 제외';
+}
+function deviceKey(name) { return name.normalize('NFC').toLowerCase(); }
+function deviceUploadBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = Math.max(0, bytes), unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return Number(value.toFixed(unit && value < 10 ? 1 : 0)) + ' ' + units[unit];
+}
+function deviceUploadRenamed(item) {
+  return item.status === 'done' && Boolean(item.result?.renamed || item.result?.name && item.result.name !== item.name);
+}
+let incomingUploadDetails = { batchId: -1, open: false, userToggled: false, autoExpanded: false };
+function deviceUploadPercent() {
+  const upload = view.deviceUpload;
+  return upload.totalBytes ? Math.min(100, Math.floor(100 * upload.uploadedBytes / upload.totalBytes)) : 0;
+}
+
+function incomingUploadShell() {
+  return '<section id="incoming-upload-panel" class="surface incoming-upload-panel" hidden aria-labelledby="incoming-upload-title">' +
+    '<div class="surface-head"><h2 id="incoming-upload-title">기기에서 업로드</h2><div id="incoming-upload-head-actions"></div></div>' +
+    '<input id="incoming-upload-input" type="file" multiple hidden>' +
+    '<div class="incoming-upload-options"><label for="incoming-upload-folder">저장할 하위 폴더<input id="incoming-upload-folder" type="text" placeholder="예: 2026-11-24_iphone (선택)" maxlength="180"></label>' +
+    '<label class="incoming-upload-autoscan"><input id="incoming-upload-autoscan" type="checkbox">완료 후 파일 검사</label></div>' +
+    '<div class="incoming-upload-dropzone" data-incoming-upload-drop="true"><p>사진·영상·동반 파일을 여기에 놓으세요.</p><div id="incoming-upload-picker-actions"></div></div>' +
+    '<p class="small muted">iPhone·iPad 사진 보관함에서 원본 화질(HEIC·MOV)을 유지하려면 선택 화면 ‘옵션’에서 ‘현재 항목’을 선택하세요.</p>' +
+    '<div id="incoming-upload-progress" role="status" aria-live="polite"></div><div id="incoming-upload-results" class="incoming-upload-results"></div></section>';
+}
+
+function patchIncomingUpload() {
+  const upload = view.deviceUpload;
+  const panel = page.querySelector('#incoming-upload-panel');
+  if (!panel) return;
+  panel.hidden = !upload.open;
+  const folder = panel.querySelector('#incoming-upload-folder');
+  if (folder.value !== upload.folder) folder.value = upload.folder;
+  setDisabled(folder, upload.running);
+  const autoScan = panel.querySelector('#incoming-upload-autoscan');
+  autoScan.checked = upload.autoScan;
+  setDisabled(autoScan, upload.running);
+  setSlotHtml(panel.querySelector('#incoming-upload-head-actions'), upload.running ? button('cancel-incoming-upload', upload.cancelling ? '중지 중…' : '중지', { disabled: upload.cancelling }) : '');
+  setSlotHtml(panel.querySelector('#incoming-upload-picker-actions'), button('choose-incoming-upload-files', '사진·파일 선택', { glyph: 'upload', primary: true, disabled: upload.running || exclusiveActive() || view.connecting }));
+  const currentPercent = upload.currentTotal ? Math.min(100, Math.floor(100 * upload.currentLoaded / upload.currentTotal)) : 0;
+  setSlotHtml(panel.querySelector('#incoming-upload-progress'), upload.totalFiles ?
+    '<p>' + upload.completedFiles + '/' + upload.totalFiles + '개 · ' + deviceUploadBytes(upload.uploadedBytes) + ' / ' + deviceUploadBytes(upload.totalBytes) + ' (' + deviceUploadPercent() + '%)</p>' +
+    '<progress class="device-upload-progress" max="100" value="' + deviceUploadPercent() + '" aria-label="전체 기기 업로드 진행률"></progress>' +
+    (upload.currentName ? '<p class="small muted">' + escapeHtml(upload.currentName) + ' · ' + deviceUploadBytes(upload.currentLoaded) + ' / ' + deviceUploadBytes(upload.currentTotal) + ' (' + currentPercent + '%)</p><progress class="device-upload-progress" max="100" value="' + currentPercent + '" aria-label="현재 파일 업로드 진행률"></progress>' : '') +
+    (upload.running ? '<p class="small muted">업로드가 끝날 때까지 화면을 켜 두고 이 탭을 유지하세요.</p>' : '') : '');
+  const previousDetails = panel.querySelector('#incoming-upload-result-items');
+  if (incomingUploadDetails.batchId !== upload.batchId) incomingUploadDetails = { batchId: upload.batchId, open: false, userToggled: false, autoExpanded: false };
+  else if (previousDetails && previousDetails.open !== incomingUploadDetails.open) {
+    incomingUploadDetails.open = previousDetails.open;
+    incomingUploadDetails.userToggled = true;
+  }
+  const needsAttention = upload.results.some(item => item.status === 'failed' || item.status === 'skipped' || deviceUploadRenamed(item));
+  if (needsAttention && !incomingUploadDetails.userToggled && !incomingUploadDetails.autoExpanded) {
+    incomingUploadDetails.open = true;
+    incomingUploadDetails.autoExpanded = true;
+  }
+  const counts = [
+    ['완료', upload.results.filter(item => item.status === 'done').length],
+    ['이름 변경', upload.results.filter(deviceUploadRenamed).length],
+    ['제외', upload.results.filter(item => item.status === 'skipped').length],
+    ['실패', upload.results.filter(item => item.status === 'failed').length],
+    ['취소', upload.results.filter(item => item.status === 'cancelled').length],
+  ].filter(([, count]) => count > 0).map(([label, count]) => label + ' ' + count + '개').join(' · ');
+  const resultsChanged = setSlotHtml(panel.querySelector('#incoming-upload-results'), (upload.scanNote ? '<p role="status">' + escapeHtml(upload.scanNote) + '</p>' : '') + (upload.results.length ?
+    '<details id="incoming-upload-result-items"><summary>업로드 결과 · ' + counts + '</summary><ul>' +
+    upload.results.map(item => '<li>' + escapeHtml(item.name) + ' · ' + escapeHtml(item.message) +
+      (item.result?.path ? '<div class="small muted">' + (deviceUploadRenamed(item) ? '이름 변경: ' + escapeHtml(item.name) + ' → ' : '저장 경로: ') + escapeHtml(item.result.path) + '</div>' : '') + '</li>').join('') + '</ul></details>' : ''));
+  const details = panel.querySelector('#incoming-upload-result-items');
+  if (details) {
+    details.open = incomingUploadDetails.open;
+    if (resultsChanged) {
+      const detailsState = incomingUploadDetails;
+      // Native summary activation can happen between two polling renders.
+      details.addEventListener('click', event => {
+        if (event.target.closest('summary')) detailsState.userToggled = true;
+      });
+      details.addEventListener('toggle', () => {
+        if (details.open !== detailsState.open) {
+          detailsState.open = details.open;
+          detailsState.userToggled = true;
+        }
+      });
+    }
+  }
+}
+
+function refreshDeviceUpload() {
+  if (view.page === 'incoming') { patchIncomingUpload(); patchPageStatus(); }
+  else render();
+}
+
+async function deviceUploadRequest(path, method = 'GET', body, signal) {
+  const binary = body && typeof body !== 'string';
+  const response = await fetch('/api/incoming/uploads' + path, {
+    method, cache: 'no-store', signal,
+    headers: body ? { 'Content-Type': binary ? 'application/octet-stream' : 'application/json' } : undefined, body,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(result.detail || '업로드 요청에 실패했습니다.');
+    error.status = response.status;
+    error.expectedOffset = result.expectedOffset;
+    throw error;
+  }
+  return result;
+}
+
+// Kept separate so retry timing can be replaced in the deterministic DOM tests.
+function deviceUploadDelay(ms) { return new Promise(resolve => window.setTimeout(resolve, ms)); }
+function deviceUploadAborted() {
+  const error = new Error('업로드를 중지했습니다.');
+  error.name = 'AbortError';
+  return error;
+}
+function checkDeviceUploadCancelled(upload) { if (upload.cancelling) throw deviceUploadAborted(); }
+
+async function deleteDeviceUpload(uploadId) {
+  if (!uploadId) return;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await deviceUploadRequest('/' + uploadId, 'DELETE'); return; }
+    catch (error) {
+      if (error.status === 404) return;
+      if (error.status !== 409 || attempt === 2) throw error;
+      await deviceUploadDelay(attempt ? 2000 : 800);
+    }
+  }
+}
+
+async function cancelIncomingUpload() {
+  const upload = view.deviceUpload;
+  if (!upload.running) return;
+  upload.cancelling = true;
+  upload.abortController?.abort();
+  refreshDeviceUpload();
+  try { await deleteDeviceUpload(upload.activeUploadId); }
+  catch {
+    upload.scanNote = '임시 업로드 정리를 확인하지 못했습니다. 남은 임시 파일은 2시간 후 정리됩니다.';
+    refreshDeviceUpload();
+  }
+}
+
+async function uploadDeviceFile(file, name, folder) {
+  const upload = view.deviceUpload;
+  const signal = upload.abortController?.signal;
+  checkDeviceUploadCancelled(upload);
+  // Do not abort creation: receiving its ID lets cancellation always delete it.
+  const session = await deviceUploadRequest('', 'POST', JSON.stringify({ name, size: file.size, folder, last_modified_ms: Number.isFinite(file.lastModified) ? Math.trunc(file.lastModified) : null }));
+  upload.activeUploadId = session.uploadId;
+  checkDeviceUploadCancelled(upload);
+  let offset = 0, retries = 0;
+  const chunkSize = Math.max(1, Math.min(session.chunkSize, session.maxChunkBytes || session.chunkSize));
+  while (offset < file.size) {
+    checkDeviceUploadCancelled(upload);
+    try {
+      const sent = await deviceUploadRequest('/' + session.uploadId + '/chunks?offset=' + offset, 'PUT', file.slice(offset, offset + chunkSize), signal);
+      if (!Number.isInteger(sent.receivedBytes) || sent.receivedBytes <= offset || sent.receivedBytes > file.size) throw new Error('잘못된 업로드 진행률입니다.');
+      upload.uploadedBytes += sent.receivedBytes - offset;
+      offset = sent.receivedBytes;
+      upload.currentLoaded = offset;
+      retries = 0;
+      refreshDeviceUpload();
+    } catch (error) {
+      checkDeviceUploadCancelled(upload);
+      if (error.name === 'AbortError') throw error;
+      const offsetConflict = error.status === 409 && Number.isInteger(error.expectedOffset);
+      if ((!offsetConflict && error.status >= 400 && error.status < 500) || error.status === 507 || retries >= 2) throw error;
+      await deviceUploadDelay([800, 2000][retries++]);
+      checkDeviceUploadCancelled(upload);
+      const status = offsetConflict ? { receivedBytes: error.expectedOffset } : await deviceUploadRequest('/' + session.uploadId, 'GET', undefined, signal);
+      if (!Number.isInteger(status.receivedBytes) || status.receivedBytes < 0 || status.receivedBytes > file.size) throw new Error('잘못된 업로드 오프셋입니다.');
+      upload.uploadedBytes += status.receivedBytes - offset;
+      offset = status.receivedBytes;
+      upload.currentLoaded = offset;
+      refreshDeviceUpload();
+    }
+  }
+  checkDeviceUploadCancelled(upload);
+  // Completion can publish the file; let its response settle before cancelling.
+  const result = await deviceUploadRequest('/' + session.uploadId + '/complete', 'POST');
+  upload.activeUploadId = null;
+  return result;
+}
+
+async function startIncomingUpload(entries) {
+  const upload = view.deviceUpload;
+  if (upload.running || exclusiveActive() || view.connecting || !entries.length) return;
+  Object.assign(upload, { open: true, running: true, cancelling: false, totalFiles: Math.min(entries.length, 2000), completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, results: [], scanNote: '', activeUploadId: null, batchId: upload.batchId + 1, abortController: typeof AbortController === 'function' ? new AbortController() : null });
+  const queue = entries.slice(0, 2000).map(entry => entry.file ? entry : { file: entry, folder: '' });
+  if (entries.length > 2000) upload.scanNote = '한 번에 2,000개까지 업로드합니다. 나머지 파일은 다시 선택하세요.';
+  const rank = file => devicePhotoExtensions.has(deviceExtension(file.name)) ? 0 : deviceVideoExtensions.has(deviceExtension(file.name)) ? 1 : 2;
+  queue.sort((a, b) => rank(a.file) - rank(b.file));
+  upload.totalBytes = queue.reduce((sum, entry) => sum + (deviceUploadExclusionReason(entry.file) ? 0 : entry.file.size), 0);
+  const exact = new Map(), stems = new Map(), stemSources = new Map();
+  const folderFor = entry => [upload.folder.trim().normalize('NFC').replace(/\/+$/, ''), entry.folder || ''].filter(Boolean).join('/');
+  for (const entry of queue) {
+    if (deviceUploadExclusionReason(entry.file) || rank(entry.file) === 2) continue;
+    const key = folderFor(entry) + '/' + deviceKey(deviceStem(entry.file.name));
+    stemSources.set(key, (stemSources.get(key) || 0) + 1);
+  }
+  let wakeLock;
+  refreshDeviceUpload();
+  try {
+    if (typeof navigator !== 'undefined' && navigator.wakeLock?.request) {
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch { /* Upload works without a screen lock. */ }
+    }
+    for (const entry of queue) {
+      const file = entry.file, extension = deviceExtension(file.name), folder = folderFor(entry);
+      upload.currentName = file.name; upload.currentLoaded = 0; upload.currentTotal = file.size;
+      refreshDeviceUpload();
+      if (upload.cancelling) {
+        upload.results.push({ name: file.name, status: 'cancelled', message: '중지됨' });
+      } else if (deviceUploadExclusionReason(file)) {
+        upload.results.push({ name: file.name, status: 'skipped', message: deviceUploadExclusionReason(file) });
+      } else {
+        try {
+          let name = file.name;
+          if (deviceCompanionExtensions.has(extension)) {
+            const base = deviceStem(name), key = folder + '/' + deviceKey(base);
+            const replacement = exact.get(key) || (stemSources.get(key) === 1 ? stems.get(key) : null);
+            if (replacement) name = replacement + name.slice(name.lastIndexOf('.'));
+          }
+          const result = await uploadDeviceFile(file, name, folder);
+          upload.results.push({ name: file.name, status: 'done', message: result.renamed || name !== file.name ? '완료 → ' + result.name : '완료', result });
+          if (!deviceCompanionExtensions.has(extension)) {
+            exact.set(folder + '/' + deviceKey(file.name), result.name);
+            const key = folder + '/' + deviceKey(deviceStem(file.name));
+            if (stemSources.get(key) === 1) stems.set(key, deviceStem(result.name));
+          }
+        } catch (error) {
+          upload.results.push({ name: file.name, status: upload.cancelling || error.name === 'AbortError' ? 'cancelled' : 'failed', message: upload.cancelling ? '중지됨' : error.message });
+          try { await deleteDeviceUpload(upload.activeUploadId); }
+          catch { upload.scanNote = '남은 임시 파일은 2시간 후 정리됩니다.'; }
+          upload.activeUploadId = null;
+        }
+      }
+      upload.completedFiles++;
+      refreshDeviceUpload();
+    }
+  } finally {
+    try { await wakeLock?.release(); } catch { /* Lock may already have been released by the OS. */ }
+    upload.running = false; upload.abortController = null; upload.currentName = '';
+    if (upload.results.some(item => item.status === 'done') && upload.autoScan) {
+      if (!localBusy() && !exclusiveActive()) {
+        try { await submitJob('scan'); upload.scanNote = '업로드 완료 후 파일 검사를 시작했습니다.'; }
+        catch (error) { upload.scanNote = '파일 검사를 시작하지 못했습니다. ' + error.message; }
+      } else upload.scanNote = '진행 중인 로컬 작업이 끝난 뒤 파일 검사를 누르세요.';
+    }
+    refreshDeviceUpload();
+  }
+}
+
+async function collectIncomingDrop(dataTransfer) {
+  const collected = [];
+  async function visit(entry, folder) {
+    if (!entry || entry.name.startsWith('.') || collected.length >= 2000) return;
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      if (collected.length < 2000) collected.push({ file, folder });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      while (collected.length < 2000) {
+        const children = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+        if (!children.length) break;
+        for (const child of children) await visit(child, [folder, entry.name].filter(Boolean).join('/'));
+      }
+    }
+  }
+  const items = Array.from(dataTransfer.items || []);
+  if (items.some(item => typeof item.webkitGetAsEntry === 'function')) {
+    // Capture entries during the drop event while the data store is available.
+    const entries = items.map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+    for (const entry of entries) await visit(entry, '');
+  } else {
+    for (const file of Array.from(dataTransfer.files || []).slice(0, 2000)) if (!file.name.startsWith('.')) collected.push({ file, folder: '' });
+  }
+  return collected;
+}
+
+window.addEventListener('beforeunload', event => {
+  if (!view.deviceUpload.running) return;
+  event.preventDefault(); event.returnValue = '';
+});
+window.addEventListener('pagehide', () => {
+  const upload = view.deviceUpload;
+  if (!upload.running || !upload.activeUploadId) return;
+  upload.cancelling = true;
+  upload.abortController?.abort();
+  fetch('/api/incoming/uploads/' + upload.activeUploadId, { method: 'DELETE', keepalive: true }).catch(() => {});
+});
+
+function mountIncomingPage() {
+  page.innerHTML = `<main aria-labelledby="page-title" data-page="incoming">
+    <div id="page-active-jobs"></div><div id="page-load-error"></div>
+    <div id="incoming-header"></div><div id="incoming-scan-strip"></div>
+    ${incomingUploadShell()}
     <section class="surface" aria-labelledby="incoming-title">
       <div class="surface-head"><h2 id="incoming-title">검사 결과</h2>
-        <div class="view-switch" role="group" aria-label="보기 방식">
+        <div class="view-switch" id="incoming-view-switch" role="group" aria-label="보기 방식">
           <button class="filter" type="button" data-action="incoming-layout" data-value="table" aria-pressed="${view.incomingLayout === 'table'}">${icon('table')} 표 보기</button>
           <button class="filter" type="button" data-action="incoming-layout" data-value="cards" aria-pressed="${view.incomingLayout === 'cards'}">${icon('grid')} 카드 보기</button>
         </div>
       </div>
       <div class="filter-bar">
-        <div class="filters" aria-label="검사 결과 필터">
-          ${Object.entries(filterLabels).map(([key, label]) => `<button type="button" class="filter" data-action="incoming-filter" data-value="${key}" aria-pressed="${view.incomingFilter === key}">${label}<span>${key === 'all' ? results.length : results.filter(file => file.status === key).length}</span></button>`).join('')}
-        </div>
+        <div class="filters" id="incoming-filters" aria-label="검사 결과 필터"></div>
         <div class="field-control">
           <select id="incoming-kind" aria-label="파일 형식 필터">
             <option value="">모든 형식</option>
@@ -445,9 +951,41 @@ function incomingPage() {
           <label class="search">${icon('search')}<span class="sr-only">파일 검색</span><input type="search" id="file-search" placeholder="파일 검색" value="${escapeHtml(view.query)}"></label>
         </div>
       </div>
-      <div class="table-wrap" id="incoming-rows">${incomingRows()}</div>
-      <div class="action-bar" id="incoming-actions">${incomingActions()}</div>
-    </section>${pendingXmpSection()}`;
+      <div class="table-wrap" id="incoming-rows"></div>
+      <div class="action-bar" id="incoming-actions"></div>
+    </section><div id="incoming-result-slot"></div><div id="incoming-xmp-slot"></div><div id="incoming-unmatched-slot"></div>
+  </main>`;
+}
+
+function patchPageStatus() {
+  setSlotHtml(page.querySelector('#page-active-jobs'), activeJobsBar());
+  setSlotHtml(page.querySelector('#page-load-error'), view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '');
+}
+
+function patchIncomingPage() {
+  patchPageStatus();
+  const scanning = activeLaneJob('local')?.kind === 'scan';
+  setSlotHtml(page.querySelector('#incoming-header'), header('Incoming Library', '기기에서 업로드하거나 incoming 폴더에 넣은 사진과 영상을 검사하고 정리합니다.',
+    '<div class="page-header-actions">' + button('toggle-incoming-upload', '기기에서 업로드', { glyph: 'upload', disabled: exclusiveActive() || view.connecting, extra: 'aria-expanded="' + view.deviceUpload.open + '" aria-controls="incoming-upload-panel"' }) +
+    button('scan', scanning ? '검사 중…' : '파일 검사', { glyph: 'refresh', disabled: localBusy() || view.connecting }) + '</div>'));
+  setSlotHtml(page.querySelector('#incoming-scan-strip'), incomingScanStrip());
+  patchIncomingUpload();
+  setSlotHtml(page.querySelector('#incoming-filters'), incomingFilters());
+  for (const control of page.querySelectorAll('#incoming-view-switch button')) {
+    control.setAttribute('aria-pressed', String(control.dataset.value === view.incomingLayout));
+  }
+  const kind = page.querySelector('#incoming-kind');
+  if (kind.value !== view.incomingKind) kind.value = view.incomingKind;
+  const search = page.querySelector('#file-search');
+  if (search.value !== view.query) search.value = view.query;
+  patchIncomingRows();
+  syncIncomingSelection();
+  setSlotHtml(page.querySelector('#incoming-result-slot'), incomingResultSection());
+  setSlotHtml(page.querySelector('#incoming-unmatched-slot'), unmatchedCompanionsSection());
+  const xmpScroll = page.querySelector('.xmp-matches')?.scrollTop || 0;
+  if (setSlotHtml(page.querySelector('#incoming-xmp-slot'), pendingXmpSection())) {
+    page.querySelector('.xmp-matches')?.scrollTo(0, xmpScroll);
+  }
 }
 
 function eventById(id) {
@@ -527,91 +1065,128 @@ function eventFileStatus(file) {
   return `${primary}${file.archived ? '<div class="file-reason small muted">아카이브 사본 있음</div>' : ''}`;
 }
 
-function eventPage() {
-  const event = eventById(view.eventId);
-  const files = footageForEvent(view.eventId);
-  const filtered = filteredEventFiles(files);
-  const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
-  const dates = [...new Set(files.map(eventDateForFile).filter(Boolean))].sort();
+function mountEventsPage() {
+  page.innerHTML = `<main aria-labelledby="page-title" data-page="events">
+    <div id="page-active-jobs"></div><div id="page-load-error"></div>
+    <div id="events-header"></div><div id="events-offload-slot"></div>
+    <div class="event-split">
+      <section class="surface" aria-label="이벤트 목록">
+        <div class="surface-head"><h2>이벤트</h2></div><div class="event-list" id="event-list"></div>
+      </section>
+      <section class="surface" aria-label="이벤트 푸티지">
+        <div class="surface-head event-heading" id="event-heading"></div>
+        <div class="event-tools">
+          <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색"></label>
+          <select id="event-storage" aria-label="보관 위치 필터"><option value="">모든 위치</option><option value="available">로컬 보유</option><option value="archived">아카이브 보관</option></select>
+          <select id="event-device" aria-label="촬영 장비 필터"></select>
+          <select id="event-date" aria-label="촬영일 필터"></select>
+          <div class="event-tools-actions" id="event-tools-actions"></div>
+        </div>
+        <div class="table-wrap" id="event-rows"></div>
+        <div class="action-bar" id="event-actions"></div>
+      </section>
+    </div></main>`;
+}
+
+function createEventRow(_file, parentTag) {
+  return parseSingleElement(parentTag, '<tr><td data-col="select"></td><td data-col="file"><div class="file-cell"><span class="thumb-slot"></span><div data-col="file-text"></div></div><div data-col="file-links"></div></td><td class="numbers muted" data-col="time"></td><td data-col="status"></td></tr>');
+}
+
+function patchEventRow(node, file, footageDate) {
+  setSlotHtml(node.querySelector('[data-col="select"]'), checkbox('event', file.id, `${file.name} 선택`, new Set()));
+  setSlotHtml(node.querySelector('.thumb-slot'), fileThumbnail(file, true, false, 'managed'));
+  setSlotHtml(node.querySelector('[data-col="file-text"]'), `<strong>${escapeHtml(file.name)}</strong><span class="small muted">${escapeHtml(file.device || '장비 확인 필요')}</span>`);
+  const links = node.querySelector('[data-col="file-links"]');
+  setClass(links, 'file-links', Boolean(file.xmp || file.canDownload));
+  setSlotHtml(links, `${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}${file.canDownload ? `<a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a>` : ''}`);
+  setSlotHtml(node.querySelector('[data-col="time"]'), `${file.time ? footageDate.format(new Date(file.time)) : '—'}
+    ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
+    ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
+    ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정" ${exclusiveActive() ? 'disabled' : ''}>촬영 시각 지정</button>` : ''}`);
+  setSlotHtml(node.querySelector('[data-col="status"]'), eventFileStatus(file));
+}
+
+function patchEventRows(event, filtered) {
+  const container = page.querySelector('#event-rows');
+  const mode = filtered.length ? 'table' : 'empty';
+  if (container.dataset.mode !== mode) {
+    container.dataset.mode = mode;
+    slotHtmlCache.delete(container);
+    container.innerHTML = mode === 'empty' ? '' : '<table aria-label="이벤트별 파일"><thead><tr><th scope="col" data-col="select-all"></th><th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">배치 상태</th></tr></thead><tbody></tbody></table>';
+  }
+  if (mode === 'empty') {
+    const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
+    setSlotHtml(container, emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : ''));
+    return;
+  }
+  setSlotHtml(container.querySelector('[data-col="select-all"]'), checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set()));
   const parent = event?.parent ? eventById(event.parent) : event;
   const footageDate = dateTimeFormatter(parent?.zone || state.timezone);
-  const destinations = eventDestinations(event);
-  const devices = [...new Set(files.map(file => file.device).filter(Boolean))];
-  const selected = view.eventSelection.size;
-  const offloadable = filtered.filter(file => view.eventSelection.has(file.id) && file.canOffload);
-  const offloadLabel = offloadable.length && offloadable.length !== selected ? `아카이브 검증 ${offloadable.length}개 로컬 비우기` : '로컬 원본 비우기';
+  reconcileKeyedChildren(container.querySelector('tbody'), 'tbody', filtered, file => file.id, createEventRow,
+    (node, file) => patchEventRow(node, file, footageDate));
+}
+
+function syncEventSelection(event = eventById(view.eventId), filtered = filteredEventFiles(footageForEvent(view.eventId))) {
+  const container = page.querySelector('#event-rows');
+  if (!container) return;
+  for (const row of container.querySelectorAll('[data-item-key]')) {
+    const selected = view.eventSelection.has(row.dataset.itemKey);
+    setClass(row, 'selected', selected);
+    setChecked(row.querySelector('[data-select="event"]'), selected);
+  }
+  const count = filtered.filter(file => view.eventSelection.has(file.id)).length;
+  const all = container.querySelector('[data-select="event-all"]');
+  setChecked(all, filtered.length > 0 && count === filtered.length);
+  if (all) all.indeterminate = count > 0 && count < filtered.length;
   const confirmButton = event ? button('confirm-event', '선택 배치 확정', {
     glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed),
   }) : '';
-  return `${header('이벤트 관리', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
-    button('new-event', '이벤트 생성', { glyph: 'plus', primary: true }))}
-    ${offloadStatus()}
-    <div class="event-split">
-      <section class="surface" aria-label="이벤트 목록">
-        <div class="surface-head"><h2>이벤트</h2></div>
-        <div class="event-list">
-          ${eventLink('all', '전체 파일', state.managed.length)}
-          ${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}
-          ${state.events.filter(item => !item.parent).map(item => {
-            const children = childEvents(item.id);
-            const total = footageForEvent(item.id).length + children.reduce((sum, child) => sum + footageForEvent(child.id).length, 0);
-            return eventLink(item.id, eventLabel(item), total) + children.map(child => eventLink(child.id, eventLabel(child), footageForEvent(child.id).length, true)).join('');
-          }).join('')}
-        </div>
-      </section>
-      <section class="surface" aria-label="이벤트 푸티지">
-        <div class="surface-head event-heading">
-          <div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 푸티지')}</h2>
-            <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div>
-          </div>
-          ${event ? `<div class="event-header-actions">
-            ${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}
-            ${button('edit-event', event.parent ? '소분류 수정' : '이벤트 수정', { glyph: 'edit' })}
-            ${button('delete-event', event.parent ? '소분류 삭제' : '이벤트 삭제', { glyph: 'trash', danger: true })}
-          </div>` : ''}
-        </div>
-        <div class="event-tools">
-          <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색" value="${escapeHtml(view.eventQuery)}"></label>
-          <select id="event-storage" aria-label="보관 위치 필터">
-            <option value="">모든 위치</option>
-            <option value="available" ${view.eventStorage === 'available' ? 'selected' : ''}>로컬 보유</option>
-            <option value="archived" ${view.eventStorage === 'archived' ? 'selected' : ''}>아카이브 보관</option>
-          </select>
-          <select id="event-device" aria-label="촬영 장비 필터"><option value="">모든 장비</option>
-            <option value="missing" ${view.eventDevice === 'missing' ? 'selected' : ''}>장비 확인 필요</option>${devices.map(device =>
-            `<option value="device:${escapeHtml(device)}" ${view.eventDevice === `device:${device}` ? 'selected' : ''}>${escapeHtml(device)}</option>`).join('')}</select>
-          <select id="event-date" aria-label="촬영일 필터"><option value="">모든 촬영일</option>${dates.map(date =>
-            `<option ${view.eventDate === date ? 'selected' : ''}>${date}</option>`).join('')}</select>
-          ${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}
-          ${confirmButton}
-        </div>
-        <div class="table-wrap" id="event-rows">${filtered.length ? `<table aria-label="이벤트별 파일">
-          <thead><tr><th scope="col">${checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set(filtered.every(file => view.eventSelection.has(file.id)) ? ['all'] : []))}</th>
-            <th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">배치 상태</th></tr></thead>
-          <tbody>${filtered.map(file => `<tr class="${view.eventSelection.has(file.id) ? 'selected' : ''}">
-            <td>${checkbox('event', file.id, `${file.name} 선택`, view.eventSelection)}</td>
-            <td>${fileCell(file, file.device || '장비 확인 필요', true, 'managed')}${(file.xmp || file.canDownload) ? `<div class="file-links">${file.xmp ? `<button type="button" class="time-edit-link" data-action="view-xmp" data-value="${escapeHtml(file.id)}">XMP 정보</button>` : ''}${file.canDownload ? `<a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a>` : ''}</div>` : ''}</td>
-            <td class="numbers muted">${file.time ? footageDate.format(new Date(file.time)) : '—'}
-              ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
-              ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
-              ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정" ${exclusiveActive() ? 'disabled' : ''}>촬영 시각 지정</button>` : ''}</td>
-            <td>${eventFileStatus(file)}</td>
-          </tr>`).join('')}</tbody>
-        </table>` : emptyState('video', '표시할 푸티지가 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : '')}</div>
-        <div class="action-bar">
-          <div>
-            ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트" ${exclusiveActive() ? 'disabled' : ''}><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>
-            ${button('move-event', '이동', { disabled: true })}` : ''}
-            ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
-            ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || remoteBusy() })}
-          </div>
-          ${confirmButton}
-        </div>
-      </section>
-    </div>`;
+  setSlotHtml(page.querySelector('#event-tools-actions'), `${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}${confirmButton}`);
+  const selected = view.eventSelection.size;
+  const offloadable = filtered.filter(file => view.eventSelection.has(file.id) && file.canOffload);
+  const offloadLabel = offloadable.length && offloadable.length !== selected ? `아카이브 검증 ${offloadable.length}개 로컬 비우기` : '로컬 원본 비우기';
+  const destinations = eventDestinations(event);
+  setSlotHtml(page.querySelector('#event-actions'), `<div>
+    ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트" ${exclusiveActive() ? 'disabled' : ''}><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>${button('move-event', '이동', { disabled: true })}` : ''}
+    ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
+    ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || remoteBusy() })}
+    </div>${confirmButton}`);
+  updateEventActions();
 }
 
-
+function patchEventsPage() {
+  patchPageStatus();
+  setSlotHtml(page.querySelector('#events-header'), header('이벤트 관리', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
+    button('new-event', '이벤트 생성', { glyph: 'plus', primary: true })));
+  setSlotHtml(page.querySelector('#events-offload-slot'), offloadStatus());
+  setSlotHtml(page.querySelector('#event-list'), `${eventLink('all', '전체 파일', state.managed.length)}${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}${state.events.filter(item => !item.parent).map(item => {
+    const children = childEvents(item.id);
+    const total = footageForEvent(item.id).length + children.reduce((sum, child) => sum + footageForEvent(child.id).length, 0);
+    return eventLink(item.id, eventLabel(item), total) + children.map(child => eventLink(child.id, eventLabel(child), footageForEvent(child.id).length, true)).join('');
+  }).join('')}`);
+  const event = eventById(view.eventId);
+  const parent = event?.parent ? eventById(event.parent) : event;
+  const files = footageForEvent(view.eventId);
+  const filtered = filteredEventFiles(files);
+  const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
+  setSlotHtml(page.querySelector('#event-heading'), `<div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 푸티지')}</h2>
+    <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div></div>
+    ${event ? `<div class="event-header-actions">${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}${button('edit-event', event.parent ? '소분류 수정' : '이벤트 수정', { glyph: 'edit' })}${button('delete-event', event.parent ? '소분류 삭제' : '이벤트 삭제', { glyph: 'trash', danger: true })}</div>` : ''}`);
+  const search = page.querySelector('#event-search');
+  if (search.value !== view.eventQuery) search.value = view.eventQuery;
+  const storage = page.querySelector('#event-storage');
+  if (storage.value !== view.eventStorage) storage.value = view.eventStorage;
+  const devices = [...new Set(files.map(file => file.device).filter(Boolean))];
+  const device = page.querySelector('#event-device');
+  setSlotHtml(device, `<option value="">모든 장비</option><option value="missing">장비 확인 필요</option>${devices.map(name => `<option value="device:${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}`);
+  if (device.value !== view.eventDevice) device.value = view.eventDevice;
+  const dates = [...new Set(files.map(eventDateForFile).filter(Boolean))].sort();
+  const date = page.querySelector('#event-date');
+  setSlotHtml(date, `<option value="">모든 촬영일</option>${dates.map(day => `<option value="${day}">${day}</option>`).join('')}`);
+  if (date.value !== view.eventDate) date.value = view.eventDate;
+  patchEventRows(event, filtered);
+  syncEventSelection(event, filtered);
+}
 
 function sourceFolders(file) {
   const event = eventById(file.eventId);
@@ -662,7 +1237,7 @@ function archivePage() {
           <span class="mono archive-path">${escapeHtml(['/managed', ...view.sourcePath].join('/'))}</span>
         </div>
         <div class="source-selection"><label>${checkbox('source-all', 'all', '표시된 Source 항목 모두 선택', new Set(allAssets.length && allAssets.every(key => view.sourceSelection.has(key)) ? ['all'] : []))} 모두 선택</label>
-          <span class="small muted" role="status">${view.sourceSelection.size}개 파일 선택</span></div>
+          <span class="small muted" id="source-selection-count" role="status">${view.sourceSelection.size}개 파일 선택</span></div>
         ${entries.length ? `<ul class="tree">${entries.map((entry, index) => {
           const name = escapeHtml(entry.name);
           const selected = entry.assets.every(key => view.sourceSelection.has(key));
@@ -1343,7 +1918,9 @@ function confirmCatalogReset() {
   confirmation.addEventListener('input', () => { submit.disabled = confirmation.value !== '모든 데이터 삭제'; });
 }
 
-function showDialog(title, content, submitLabel, handler, { danger = false } = {}) {
+function showDialog(title, content, submitLabel, handler, { danger = false, scrollBody = false } = {}) {
+  if (scrollBody) dialog.classList.add('dialog-scroll-body');
+  else dialog.classList.remove('dialog-scroll-body');
   dialog.innerHTML = `<form id="dialog-form">
     <div class="dialog-head"><h2 id="dialog-title">${title}</h2>${smallButton('close-dialog', '닫기', 'close')}</div>
     <div class="dialog-body">${content}<div class="form-error" id="dialog-error" role="alert" hidden></div></div>
@@ -1371,6 +1948,7 @@ function showDialog(title, content, submitLabel, handler, { danger = false } = {
     }
   });
   dialog.showModal();
+  if (scrollBody) dialog.querySelector('.dialog-body').scrollTop = 0;
 }
 
 
@@ -1560,6 +2138,7 @@ function showXmp(id) {
 }
 
 function chooseEvent(id) {
+  if (view.eventId !== id) page.querySelector('#event-rows')?.scrollTo(0, 0);
   view.eventId = id;
   view.eventSelection.clear();
   view.eventStorage = '';
@@ -1573,7 +2152,7 @@ function updateEventActions() {
   const target = page.querySelector('#move-event-target');
   if (target) {
     target.value = view.eventTarget || '';
-    page.querySelector('[data-action="move-event"]').disabled = exclusiveActive() || !target.value || !view.eventSelection.size;
+    setDisabled(page.querySelector('[data-action="move-event"]'), exclusiveActive() || !target.value || !view.eventSelection.size);
   }
 }
 
@@ -1583,37 +2162,28 @@ function render() {
   const catalogScroll = page.querySelector('.catalog-table-wrap');
   const catalogScrollPosition = catalogScroll ? { top: catalogScroll.scrollTop, left: catalogScroll.scrollLeft } : null;
   const folderScroll = page.querySelector('.catalog-folder-list')?.scrollTop || 0;
-  const incomingTable = page.querySelector('#incoming-rows');
-  const tableScroll = incomingTable ? { top: incomingTable.scrollTop, left: incomingTable.scrollLeft } : null;
-  const eventTable = page.querySelector('#event-rows');
-  const eventScroll = eventTable ? { top: eventTable.scrollTop, left: eventTable.scrollLeft } : null;
-  const xmpScroll = page.querySelector('.xmp-matches')?.scrollTop;
   const active = document.activeElement;
   const keepFocus = active && page.contains(active);
   const route = location.hash.slice(1);
   const current = navigation.find(item => item.id === route) || navigation[0];
   const pageChanged = view.page !== current.id;
-  const views = { incoming: incomingPage, events: eventPage, archive: archivePage, catalog: catalogPage, settings: settingsPage };
+  const views = { archive: archivePage, catalog: catalogPage, settings: settingsPage };
   view.page = current.id;
-  nav.innerHTML = navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join('');
+  setSlotHtml(nav, navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join(''));
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
-  page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
-  document.title = `${current.title} · Photo Saver`;
-  if (view.page === 'events') updateEventActions();
-  if (view.page === 'archive') {
-    const entries = sourceEntries();
-    page.querySelectorAll('[data-select="source"]').forEach(input => {
-      const keys = entries[Number(input.value)]?.assets || [];
-      input.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
-      input.disabled = remoteBusy() || view.uploadStarting;
-    });
-    const all = page.querySelector('[data-select="source-all"]');
-    const keys = entries.flatMap(entry => entry.assets);
-    if (all) {
-      all.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !keys.every(key => view.sourceSelection.has(key));
-      all.disabled = !keys.length || remoteBusy() || view.uploadStarting;
-    }
+  const existingMain = page.querySelector('main');
+  const inPlace = !pageChanged && existingMain?.dataset.page === view.page && (view.page === 'incoming' || view.page === 'events');
+  if (view.page === 'incoming') {
+    if (!inPlace) mountIncomingPage();
+    patchIncomingPage();
+  } else if (view.page === 'events') {
+    if (!inPlace) mountEventsPage();
+    patchEventsPage();
+  } else {
+    page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
   }
+  document.title = `${current.title} · Photo Saver`;
+  if (view.page === 'archive') syncSourceSelection();
   if (pageChanged) {
     pendingPreviewFocus = null;
     window.scrollTo(0, 0);
@@ -1621,9 +2191,6 @@ function render() {
   }
   if (catalogScrollPosition) page.querySelector('.catalog-table-wrap')?.scrollTo(catalogScrollPosition);
   page.querySelector('.catalog-folder-list')?.scrollTo(0, folderScroll);
-  if (tableScroll) page.querySelector('#incoming-rows')?.scrollTo(tableScroll);
-  if (eventScroll) page.querySelector('#event-rows')?.scrollTo(eventScroll);
-  if (xmpScroll) page.querySelector('.xmp-matches')?.scrollTo(0, xmpScroll);
   if (pendingPreviewFocus) {
     const focusIntent = pendingPreviewFocus;
     pendingPreviewFocus = null;
@@ -1632,7 +2199,7 @@ function render() {
       return;
     }
   }
-  if (keepFocus) {
+  if (keepFocus && !page.contains(active)) {
     const replacement = [...page.querySelectorAll('button, input, select')].find(element => {
       if (active.id) return element.id === active.id;
       if (active.dataset.action) return element.dataset.action === active.dataset.action && element.dataset.value === active.dataset.value;
@@ -1656,21 +2223,54 @@ function toggleSelection(selection, ids, checked) {
   }
 }
 
+function updateIncomingSearch(value) {
+  view.query = value;
+  pruneIncomingSelection();
+  setSlotHtml(page.querySelector('#incoming-filters'), incomingFilters());
+  patchIncomingRows();
+  syncIncomingSelection();
+}
+
+function syncSourceSelection() {
+  const entries = sourceEntries();
+  const busy = remoteBusy() || view.uploadStarting;
+  for (const input of page.querySelectorAll('[data-select="source"]')) {
+    const keys = entries[Number(input.value)]?.assets || [];
+    const selected = keys.length > 0 && keys.every(key => view.sourceSelection.has(key));
+    setChecked(input, selected);
+    input.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !selected;
+    setDisabled(input, busy);
+    setClass(input.closest('.tree-row'), 'source-selected', selected);
+  }
+  const keys = entries.flatMap(entry => entry.assets);
+  const selected = keys.length > 0 && keys.every(key => view.sourceSelection.has(key));
+  const all = page.querySelector('[data-select="source-all"]');
+  setChecked(all, selected);
+  if (all) all.indeterminate = keys.some(key => view.sourceSelection.has(key)) && !selected;
+  setDisabled(all, !keys.length || busy);
+  const count = page.querySelector('#source-selection-count');
+  const label = `${view.sourceSelection.size}개 파일 선택`;
+  if (count && count.textContent !== label) count.textContent = label;
+  setDisabled(page.querySelector('[data-action="upload-archive"]'), busy || !view.archive || view.archiveBusy || !view.sourceSelection.size);
+}
+
 function handleSelection(control) {
   const kind = control.dataset.select;
   const id = control.value;
   if (kind === 'incoming' || kind === 'incoming-all') {
     const ids = kind === 'incoming' ? [id] : filteredIncoming().filter(canSelectIncoming).map(file => file.id);
     toggleSelection(view.incomingSelection, ids, control.checked);
+    syncIncomingSelection();
   } else if (kind === 'source' || kind === 'source-all') {
     const entries = sourceEntries();
     const keys = kind === 'source-all' ? entries.flatMap(entry => entry.assets) : entries[Number(id)]?.assets || [];
     toggleSelection(view.sourceSelection, keys, control.checked);
+    syncSourceSelection();
   } else {
     const ids = kind === 'event' ? [id] : filteredEventFiles(footageForEvent(view.eventId)).map(file => file.id);
     toggleSelection(view.eventSelection, ids, control.checked);
+    syncEventSelection();
   }
-  render();
 }
 
 
@@ -1687,8 +2287,83 @@ function confirmDeleteIncoming() {
   const photos = selectedIncoming(canDeleteIncoming);
   if (!photos.length) return;
   showDialog('선택한 사진 삭제', `<p>아래 사진 ${photos.length}개를 incoming에서 영구 삭제합니다.</p>
-    <ul class="preview-paths mono">${photos.map(file => `<li>${escapeHtml(file.folder ? `${file.folder}/${file.name}` : file.name)}</li>`).join('')}</ul>`,
+    <ul class="preview-paths mono">${photos.map(file => `<li>${escapeHtml(incomingPath(file))}</li>`).join('')}</ul>`,
   `사진 ${photos.length}개 삭제`, () => submitJob('delete', { ids: photos.map(file => file.id) }), { danger: true });
+}
+
+function cleanupTargets(group, keeper) {
+  if (!keeper) return [];
+  return group.files.filter(file => keeper.kind !== 'incoming' || file.id !== keeper.id);
+}
+
+function cleanupGroupFiles(group, keeper, filesById) {
+  const targets = new Set(cleanupTargets(group, keeper).map(file => file.id));
+  return `<ul class="cleanup-files">${group.files.map(file => {
+    const companions = filesById.get(file.id)?.companions || [];
+    const action = targets.has(file.id) ? '정리' : keeper ? '남김' : '보류';
+    return `<li><span class="incoming-path">${escapeHtml(file.path)}</span>
+      <span class="small muted">${action} · ${sizeLabel(file.sizeBytes == null ? null : file.sizeBytes / 1e6)}</span>
+      ${companions.map(item => `<div class="small muted incoming-path">${escapeHtml(item.path)} · ${item.disposition === 'linked' ? '연결됨' : 'Incoming에 보존'}
+        ${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</div>`).join('')}
+    </li>`;
+  }).join('')}</ul>`;
+}
+
+async function confirmIncomingCleanup() {
+  const selected = selectedIncoming(file => file.status === 'duplicate');
+  if (!selected.length || localBusy() || view.cleanupPlanning) return;
+  const filesById = new Map(selected.map(file => [file.id, file]));
+  view.cleanupPlanning = true;
+  renderIncomingActions();
+  let cleanupPlan;
+  try {
+    cleanupPlan = await api('incoming/duplicates/plan', 'POST', { ids: [...filesById.keys()] });
+  } catch (error) {
+    if (error.status === 409) await syncState();
+    throw error;
+  } finally {
+    view.cleanupPlanning = false;
+    renderIncomingActions();
+  }
+  const { groups } = cleanupPlan;
+  const current = new Set(selectedIncoming(file => file.status === 'duplicate').map(file => file.id));
+  if (view.page !== 'incoming' || localBusy() || dialog.open || mediaPreview.open ||
+      [...filesById.keys()].some(id => !current.has(id))) return;
+
+  const keepers = groups.map(group => group.keepers[0]);
+  const targetItems = () => groups.flatMap((group, index) => {
+    const keeper = keepers[index];
+    return cleanupTargets(group, keeper).map(file => ({ id: file.id, keeperKind: keeper.kind, keeperId: keeper.id }));
+  });
+  const blocked = groups.reduce((sum, group) => sum + (group.keepers.length ? 0 : group.files.length), 0);
+  const summary = () => {
+    const targets = groups.flatMap((group, index) => cleanupTargets(group, keepers[index]));
+    const totalBytes = targets.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
+    return `정리 ${targets.length}개 · ${sizeLabel(totalBytes / 1e6)}${blocked ? ` · 보류 ${blocked}개` : ''}`;
+  };
+  const keeperLabel = keeper => {
+    const verified = keeper.verifiedAt ? ` · 최근 검증 ${catalogTime(keeper.verifiedAt)}` : '';
+    return escapeHtml(`${keeperLabels[keeper.kind]} · ${keeper.path}${verified}`);
+  };
+  showDialog('중복 파일 정리', `<p>남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. Incoming에 남아 있는 XMP와 카메라 보조 파일은 보존합니다.</p>
+    <p id="cleanup-summary" class="numbers" role="status">${summary()}</p>
+    <div class="cleanup-groups">${groups.map((group, index) => `<section class="cleanup-group" aria-label="중복 묶음 ${index + 1}">
+      ${group.keepers.length > 1 ? `<label>남길 사본<select data-keeper-group="${index}" aria-describedby="keeper-detail-${index}">${group.keepers.map((keeper, option) => `<option value="${option}">${keeperLabel(keeper)}</option>`).join('')}</select></label>` : ''}
+      ${keepers[index] ? `<p id="keeper-detail-${index}" class="small incoming-path">${group.keepers.length === 1 ? '<strong>남길 사본</strong> ' : ''}${keeperLabel(keepers[index])}</p>` : ''}
+      ${group.reason || !keepers[index] ? `<p class="small muted">${escapeHtml(group.reason || '남길 사본을 찾지 못했습니다.')}</p>` : ''}
+      <div data-cleanup-group-files="${index}">${cleanupGroupFiles(group, keepers[index], filesById)}</div>
+    </section>`).join('')}</div>`,
+  '검증 후 정리', targetItems().length ? () => submitJob('duplicate-cleanup', { items: targetItems() }) : null, { danger: true, scrollBody: true });
+
+  for (const select of dialog.querySelectorAll('[data-keeper-group]')) {
+    select.addEventListener('change', () => {
+      const index = Number(select.dataset.keeperGroup);
+      keepers[index] = groups[index].keepers[Number(select.value)];
+      dialog.querySelector(`#keeper-detail-${index}`).innerHTML = keeperLabel(keepers[index]);
+      dialog.querySelector(`[data-cleanup-group-files="${index}"]`).innerHTML = cleanupGroupFiles(groups[index], keepers[index], filesById);
+      dialog.querySelector('#cleanup-summary').textContent = summary();
+    });
+  }
 }
 
 function previewCollection(source) {
@@ -1723,24 +2398,26 @@ function previewMetaHtml(source, file) {
     const eventName = previewEventLabel(file);
     return `<span class="mono">${escapeHtml(`managed/${file.path}`)}</span> · ${sizeLabel(file.size)}${eventName ? ` · 이벤트: ${escapeHtml(eventName)}` : ''}`;
   }
-  return `${escapeHtml(file.folder ? `incoming/${file.folder}` : 'incoming')} · ${sizeLabel(file.size)}`;
+  return `<span class="mono">${escapeHtml(`incoming/${incomingPath(file)}`)}</span> · ${sizeLabel(file.size)}
+    ${incomingReason(file) ? `<span class="preview-detail">${escapeHtml(incomingReason(file))}</span>` : ''}
+    ${companionSummary(file) ? `<span class="preview-detail">${escapeHtml(companionSummary(file))}</span>` : ''}`;
 }
 
 function defaultPreviewErrorMessage(source) {
   if (source === 'managed') {
     return '미리보기를 열 수 없습니다. 브라우저에서 지원하지 않는 형식이거나 원본을 읽을 수 없습니다. 원본 열기로 확인하거나 다시 시도하세요.';
   }
-  return '미리보기를 열 수 없습니다. 원본 파일을 열거나 Incoming Library를 새로 고침하세요.';
+  return '미리보기를 열 수 없습니다. 원본을 열거나 Incoming Library에서 파일을 다시 검사하세요.';
 }
 
 function diagnosticMessageForStatus(source, file, status) {
   if (status === 404) {
     return source === 'managed'
-      ? '로컬 원본을 찾을 수 없습니다. 원본이 이동·비우기 되었는지 확인하거나 Incoming Library의 새로 고침으로 다시 검사하세요.'
-      : '원본 파일을 찾을 수 없습니다. Incoming Library를 새로 고침하세요.';
+      ? '로컬 원본을 찾을 수 없습니다. 원본이 이동·비우기 되었는지 확인하거나 Incoming Library에서 다시 검사하세요.'
+      : '원본 파일을 찾을 수 없습니다. Incoming Library에서 다시 검사하세요.';
   }
   if (status === 403) return '로컬 원본의 읽기 권한이 없습니다. 파일·폴더 권한을 확인하세요.';
-  if (status === 409) return '원본 파일이 변경되었습니다. 원본을 확인한 뒤 Incoming Library의 새로 고침으로 다시 검사하세요.';
+  if (status === 409) return '원본 파일이 변경되었습니다. 원본을 확인한 뒤 Incoming Library에서 다시 검사하세요.';
   if (status === 415) return '미리보기를 지원하지 않는 파일 형식입니다. 원본 열기로 확인하세요.';
   if (status === 200 || status === 206) {
     return file.kind === 'video'
@@ -1915,11 +2592,15 @@ function renderPreviewFooter() {
     if (footer.dataset.renderedHtml !== html) {
       footer.dataset.renderedHtml = html;
       footer.innerHTML = html;
-      if (!preview.busy) footer.querySelector('[data-action="perform-preview-delete"]')?.focus();
+      if (!preview.busy) footer.querySelector('[data-action="cancel-preview-delete"]')?.focus();
     }
     return;
   }
   const original = file.original ? `<a class="button" href="${escapeHtml(file.original)}" target="_blank" rel="noopener">원본 열기</a>` : '';
+  const selected = view.incomingSelection.has(file.id);
+  const selection = isIncoming && canSelectIncoming(file) ? button('toggle-preview-selection', '이 파일 선택', {
+    disabled: localBusy(), extra: `aria-pressed="${selected}"`,
+  }) : '';
   const hint = preview.message
     ? escapeHtml(preview.message)
     : isIncoming
@@ -1930,7 +2611,7 @@ function renderPreviewFooter() {
       ${button('next-preview', '다음', { glyph: 'right', disabled: preview.index === preview.ids.length - 1 })}
     </div>
     <div class="preview-controls">
-      ${original}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
+      ${original}${selection}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
     </div>
     <p class="preview-hint small muted" ${preview.message ? 'role="status"' : ''}>${hint}</p>`;
   if (footer.dataset.renderedHtml !== html) {
@@ -2027,6 +2708,16 @@ function requestPreviewDelete() {
   renderPreviewFooter();
 }
 
+function togglePreviewSelection() {
+  const file = currentPreviewFile();
+  if (view.preview?.source !== 'incoming' || !file || !canSelectIncoming(file) || localBusy()) return;
+  toggleSelection(view.incomingSelection, [file.id], !view.incomingSelection.has(file.id));
+  if (view.page === 'incoming') syncIncomingSelection();
+  else render();
+  renderPreviewFooter();
+  mediaPreview.querySelector('[data-action="toggle-preview-selection"]')?.focus();
+}
+
 function cancelPreviewDelete() {
   const preview = view.preview;
   if (!preview || preview.source !== 'incoming' || preview.busy) return;
@@ -2089,7 +2780,7 @@ function updatePreviewAfterDelete() {
   }
   preview.message = job.status === 'failed'
     ? (job.result?.error || '사진을 삭제하지 못했습니다.')
-    : '사진이 변경되었거나 삭제할 수 없습니다. 새로 고침 후 다시 확인하세요.';
+    : '사진이 변경되었거나 삭제할 수 없습니다. 다시 검사한 뒤 확인하세요.';
   renderPreviewFooter();
   return true;
 }
@@ -2099,6 +2790,7 @@ const previewActions = {
   'next-preview': () => stepPreview(1),
   'close-preview': () => closeMediaPreview(),
   'retry-preview': retryPreview,
+  'toggle-preview-selection': togglePreviewSelection,
   'request-preview-delete': requestPreviewDelete,
   'cancel-preview-delete': cancelPreviewDelete,
   'perform-preview-delete': performPreviewDelete,
@@ -2134,8 +2826,14 @@ function confirmOffload() {
 
 const actions = {
   scan() { return submitJob('scan'); },
-  'incoming-filter'(value) { view.incomingFilter = value; },
+  'rescan-incoming'() { return submitJob('scan'); },
+  'incoming-filter'(value) { view.incomingFilter = value; pruneIncomingSelection(); },
+  'reset-incoming-filters'() {
+    view.query = ''; view.incomingKind = ''; view.incomingFilter = 'all';
+    pruneIncomingSelection();
+  },
   'incoming-layout'(value) {
+    if (view.incomingLayout === value) return;
     view.incomingLayout = value;
     page.querySelector('#incoming-rows').scrollTo(0, 0);
     try {
@@ -2148,6 +2846,8 @@ const actions = {
   'preview-managed': openManagedPreview,
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
+  'cleanup-incoming': confirmIncomingCleanup,
+  'open-unassigned'() { chooseEvent('unassigned'); location.hash = 'events'; },
   'link-xmp'() { return submitJob('xmp-link', { links: pendingXmpLinks() }); },
   'view-xmp': showXmp,
   'refresh-devices': loadDevices,
@@ -2220,19 +2920,51 @@ const actions = {
 
 page.addEventListener('click', async event => {
   const control = event.target.closest('button[data-action]');
-  if (!control) return;
+  if (!control || control.disabled) return;
+  if (control.dataset.action === 'choose-incoming-upload-files') {
+    // Safari requires the picker to open inside the original user gesture.
+    if (!view.deviceUpload.running && !exclusiveActive() && !view.connecting) page.querySelector('#incoming-upload-input')?.click();
+    return;
+  }
+  if (control.dataset.action === 'toggle-incoming-upload') {
+    view.deviceUpload.open = !view.deviceUpload.open;
+    render();
+    return;
+  }
+  if (control.dataset.action === 'cancel-incoming-upload') { await cancelIncomingUpload(); return; }
   try {
     control.disabled = true;
     await actions[control.dataset.action](control.dataset.value);
   } catch (error) {
     announce(error.message);
   } finally {
-    control.disabled = false;
+    control.disabled = control.getAttribute('disabled') !== null;
     if (!dialog.open && !mediaPreview.open) render();
   }
 });
 
 const archiveDragType = 'application/x-photo-saver';
+
+page.addEventListener('dragover', event => {
+  const zone = event.target.closest('[data-incoming-upload-drop]');
+  if (!zone || view.dragSource || view.deviceUpload.running || exclusiveActive()) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+  zone.classList.add('is-dragover');
+});
+page.addEventListener('dragleave', event => {
+  const zone = event.target.closest('[data-incoming-upload-drop]');
+  if (zone && !zone.contains(event.relatedTarget)) zone.classList.remove('is-dragover');
+});
+page.addEventListener('drop', async event => {
+  const zone = event.target.closest('[data-incoming-upload-drop]');
+  if (!zone || view.dragSource) return;
+  event.preventDefault();
+  zone.classList.remove('is-dragover');
+  if (view.deviceUpload.running || exclusiveActive()) return;
+  try { await startIncomingUpload(await collectIncomingDrop(event.dataTransfer)); }
+  catch (error) { announce('파일을 읽지 못했습니다. ' + error.message); }
+});
 
 function clearArchiveDrag() {
   view.dragSource = null;
@@ -2297,7 +3029,15 @@ page.addEventListener('submit', event => {
 
 page.addEventListener('change', event => {
   const control = event.target;
-  if (control.id === 'catalog-scope') {
+  if (control.id === 'incoming-upload-input') {
+    const files = Array.from(control.files || []);
+    control.value = '';
+    startIncomingUpload(files).catch(error => announce(error.message));
+  } else if (control.id === 'incoming-upload-folder') {
+    view.deviceUpload.folder = control.value;
+  } else if (control.id === 'incoming-upload-autoscan') {
+    view.deviceUpload.autoScan = control.checked;
+  } else if (control.id === 'catalog-scope') {
     view.catalogScope = control.value;
   } else if (control.dataset.select) {
     handleSelection(control);
@@ -2309,6 +3049,7 @@ page.addEventListener('change', event => {
     render();
   } else if (control.id === 'incoming-kind') {
     view.incomingKind = control.value;
+    pruneIncomingSelection();
     render();
   } else if (control.id === 'event-storage') {
     view.eventStorage = control.value;
@@ -2329,26 +3070,29 @@ page.addEventListener('change', event => {
 });
 
 page.addEventListener('input', event => {
+  if (event.target.id === 'incoming-upload-folder') view.deviceUpload.folder = event.target.value;
+});
+
+page.addEventListener('input', event => {
   if (event.target.id === 'catalog-query') {
     view.catalogQuery = event.target.value;
     return;
   }
   if (event.target.id === 'event-search') {
-    const { selectionStart, selectionEnd, value } = event.target;
-    view.eventQuery = value;
-    render();
-    page.querySelector('#event-search').setSelectionRange(selectionStart, selectionEnd);
+    view.eventQuery = event.target.value;
+    patchEventsPage();
     return;
   }
   if (event.target.id !== 'file-search') return;
-  view.query = event.target.value;
-  document.getElementById('incoming-rows').innerHTML = incomingRows();
+  updateIncomingSearch(event.target.value);
 });
 
 page.addEventListener('keydown', event => {
   const card = event.target.closest('[data-card-preview]');
   if (!card) return;
   if (event.key === 'Delete' || event.key === 'Backspace') {
+    const file = state.incoming.find(item => item.id === card.dataset.value);
+    if (!file || !canDeleteIncoming(file) || localBusy()) return;
     event.preventDefault();
     if (!event.repeat) {
       openIncomingPreview(card.dataset.value);
@@ -2388,6 +3132,8 @@ mediaPreview.addEventListener('keydown', event => {
   if (!preview || event.altKey || event.ctrlKey || event.metaKey) return;
   if (event.key === 'Delete' || event.key === 'Backspace') {
     if (preview.source !== 'incoming' || isEditableOrMediaTarget(event.target)) return;
+    const file = currentPreviewFile(preview);
+    if (!file || !canDeleteIncoming(file) || localBusy()) return;
     event.preventDefault();
     if (!event.repeat && !preview.confirming) requestPreviewDelete();
   } else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !isEditableOrMediaTarget(event.target)) {

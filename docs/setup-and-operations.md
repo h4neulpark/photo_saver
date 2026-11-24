@@ -1,5 +1,23 @@
 # 실행과 운영
 
+## Incoming 기기 업로드 운영
+
+API에 기존 Incoming 디렉터리를 /incoming-upload로 읽기·쓰기 바인드한다(create_host_path: false). /incoming-preview와 /managed-preview는 계속 읽기 전용이다. API 프로세스에는 Incoming 쓰기 권한과 파일 크기 +64MiB 이상의 여유 공간이 필요하다. 신규 의존성은 없다.
+
+업로드 전용 Nginx location /api/incoming/uploads는 client_max_body_size 36m, proxy_request_buffering off, proxy_buffering off, HTTP/1.1과 송수신 타임아웃 300s를 사용한다. 기존 /api/와 /thumbnails/ 설정은 유지한다. Compose 재빌드 후 컨테이너 안에 새 location이 보이지 않으면 단일 파일 바인드 마운트의 이전 inode가 남은 것이므로 frontend를 재생성한다.
+
+    docker compose up -d --build
+    docker compose exec -T frontend grep -n "incoming/uploads" /etc/nginx/conf.d/default.conf
+    docker compose up -d --force-recreate frontend
+    docker compose exec -T frontend nginx -t
+    curl --fail http://127.0.0.1:8888/api/health
+
+uploads.py는 컨테이너 환경 PHOTO_SAVER_INCOMING_UPLOAD(기본 /incoming-upload), PHOTO_SAVER_MAX_UPLOAD_BYTES(기본 107374182400)를 읽는다. Compose는 이 두 변수를 자동 전달하지 않으므로 운영 오버라이드의 api.environment와 실제 마운트를 함께 맞춰야 한다.
+
+API 기동 및 신규 업로드 시 10분 간격으로 유휴 2시간 초과 staging 세션을 정리하며 잠금 중인 세션은 보존한다. 기동 정리 오류는 로그를 남기고 기동을 계속한다. 취소 응답 409는 청크 롤백이 끝난 뒤 재시도하고, 507은 디스크 공간, 503은 마운트/권한을 확인한다. 브라우저 새로고침 뒤 자동 재개는 지원하지 않는다. 원격 아카이브 업로드와 달리 기기 청크 전송은 일시 통신 장애를 최대 2회 재시도한다.
+
+실환경 검증은 smoke_upload_check 임시 폴더의 테스트 파일과 해당 세션만 사용하고 끝나면 즉시 제거한다. 기존 Incoming·Managed·아카이브 파일은 변경하지 않는다.
+
 ## 기본 실행
 
 프로젝트 루트에서 실행한다. Docker Engine과 Compose가 필요하다. Mac에서는 Docker Desktop 등 Linux 컨테이너 실행 환경을 사용한다.
@@ -12,7 +30,7 @@ docker compose up -d --build
 
 브라우저에서 `http://127.0.0.1:8888`을 연다. 기존 `.env`는 위 명령으로 덮어쓰지 않는다. 이 명령의 디렉터리 생성은 기본값 기준이며, 라이브러리 위치를 바꿨으면 설정한 경로에 두 디렉터리를 먼저 생성한다.
 
-`incoming`에 사진·영상을 넣고 화면의 **새로 고침**을 눌러 검사를 시작한다. 앱 시작이나 폴더 변경만으로 검사를 자동 실행하지 않는다. 전체 사용 흐름은 [사용자 가이드](user-guide.md)에 정리했다.
+`incoming`에 사진·영상을 넣고 화면의 **파일 검사**를 눌러 검사를 시작한다. 파일을 추가하거나 변경하면 다시 검사한다. 전체 사용 흐름은 [사용자 가이드](user-guide.md)에 정리했다.
 
 ## 환경 변수
 
@@ -106,13 +124,15 @@ docker compose down
 | 컨테이너 생성 시 경로 오류 | 설정한 라이브러리와 Incoming·Managed 디렉터리 존재 여부, Docker 파일 공유 접근 |
 | 워커가 시작하지 않음 | 두 디렉터리의 권한·상대 경로·중첩·같은 파일시스템 조건, `worker` 로그 |
 | API는 정상이지만 검사가 계속 대기 | `worker` 실행 상태와 로그. 헬스 체크는 API만 검사 |
+| 새 기능 요청에서 404 Not Found | `frontend`는 호스트 소스를 바인드 마운트하지만 `api`·`worker`는 빌드 이미지의 코드를 실행한다. `docker compose up -d --build`로 두 백엔드 서비스를 재빌드·재기동하고 `docker compose ps`에서 API healthy와 worker Up을 확인 |
 | 파일이 보이지 않음 | 지원 확장자, 수동 검사 여부, 심볼릭 링크 여부. 복사 중이거나 변경된 파일은 확인 필요 상태 가능 |
-| 미리보기에서 파일 변경·권한 오류 | 검사 후 Incoming 또는 Managed 원본이 변경·이동되었는지와 `/incoming-preview`·`/managed-preview` 읽기 권한·마운트 여부를 확인하고 Incoming Library 새로 고침 |
-| 작업 등록에서 409 | 검사·이동·삭제·XMP 연결·업로드 전체 중 다른 활성 작업이 있는지 확인 |
+| 미리보기에서 파일 변경·권한 오류 | 검사 후 Incoming 또는 Managed 원본이 변경·이동되었는지와 `/incoming-preview`·`/managed-preview` 읽기 권한·마운트 여부를 확인하고 Incoming Library에서 다시 검사 |
+| 작업 등록에서 409 | 같은 작업 레인이나 초기화의 활성 작업이 있는지, 선택한 파일과 남길 사본 상태가 바뀌었는지 확인 |
+| 중복 정리에서 원격 사본 확인 실패 | OMV 연결, 현재 설정된 저장 경로와 원격 인덱스를 확인하고 Incoming을 다시 검사 |
 | SSH 인증 실패 | `.env` 계정 반영 여부, 공개키 등록, SSH 서비스의 22번 포트, 서버 호스트 키 승인 |
 | 서버 호스트 키 불일치 | 서버의 실제 키와 저장된 키를 운영자가 확인. 정상 교체라면 설정의 **호스트 키 초기화** 후 접속 테스트로 다시 신뢰 |
 | 원격 폴더를 조회할 수 없음 | IP·절대경로·읽기 권한·SFTP 지원·연결 상태 |
 | 일부 파일 업로드 실패 | 대상 동명 파일의 해시 충돌, 로컬 원본 변경, 원격 쓰기 권한과 디스크 공간, 실패 목록 |
 | 백업·복원에서 409/413 | 진행 작업 종료 여부, 복원 파일 128MiB 제한 |
 
-현재 네트워크 장애 후 자동 대기·백오프 재시도는 없다. 완료한 파일은 유지되므로 연결을 복구한 뒤 필요한 항목을 다시 선택해 업로드한다. 로그인·권한 관리가 없는 로컬 단일 사용자 구성으로, 웹 포트는 기본적으로 루프백에만 공개한다.
+원격 아카이브 전송은 현재 네트워크 장애 후 자동 대기·백오프 재시도가 없다. 완료한 파일은 유지되므로 연결을 복구한 뒤 필요한 항목을 다시 선택해 업로드한다. 로그인·권한 관리가 없는 로컬 단일 사용자 구성으로, 웹 포트는 기본적으로 루프백에만 공개한다.

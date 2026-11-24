@@ -425,12 +425,13 @@ function createHarness(fetchImpl) {
 
   const api = vm.runInContext(
     `({
-      state, view, page, mediaPreview, notice,
+      state, view, page, mediaPreview, dialog, notice,
       render, syncState, loadRoute, clearCatalogViews,
       openIncomingPreview, openManagedPreview, currentPreviewFile,
       stepPreview, closeMediaPreview, reconcilePreview, retryPreview,
       requestPreviewDelete, performPreviewDelete, disposePreviewMedia,
       chooseEvent,
+      confirmIncomingCleanup, api,
     })`,
     context,
   );
@@ -593,6 +594,7 @@ test('managed Delete/Backspace never deletes while incoming delete guard stays i
   h.mediaPreview.dispatchEvent({ type: 'keydown', key: 'Delete', target: h.mediaPreview });
   assert.equal(h.view.preview.confirming, true);
   assert.ok(h.mediaPreview.querySelector('[data-action="perform-preview-delete"]'));
+  assert.equal(h.doc.activeElement.dataset.action, 'cancel-preview-delete');
   const cancelEvent = { type: 'cancel', target: h.mediaPreview };
   const notPrevented = h.mediaPreview.dispatchEvent(cancelEvent);
   assert.equal(notPrevented, false);
@@ -976,4 +978,529 @@ test('R3: polling auto-close restores focus to connected fallback after render a
   while (h.doc.pendingCloseEvents.length) h.doc.pendingCloseEvents.shift()();
   assert.equal(h.view.preview, null);
   assert.notEqual(h.doc.activeElement.id, 'event-search');
+});
+
+test('Incoming filters clear hidden selections and search updates counts and executable actions', async () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.incoming = [
+    makeIncoming('photo'),
+    makeIncoming('clip', { name: 'scene.mp4', kind: 'video', status: 'duplicate' }),
+    makeIncoming('image', { status: 'duplicate' }),
+  ];
+  h.render();
+  const all = h.page.querySelector('[data-select="incoming-all"]');
+  all.checked = true;
+  h.page.dispatchEvent({ type: 'change', target: all });
+  assert.equal(h.view.incomingSelection.size, 3);
+
+  const duplicates = h.page.querySelector('[data-action="incoming-filter"][data-value="duplicate"]');
+  h.page.dispatchEvent({ type: 'click', target: duplicates });
+  await flushMicrotasks();
+  assert.equal(h.view.incomingSelection.has('photo'), false);
+  assert.equal(h.page.querySelector('[data-action="move-incoming"]').disabled, true);
+  assert.equal(h.page.querySelector('[data-action="delete-incoming"]').disabled, true);
+  assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, false);
+
+  const query = h.page.querySelector('#file-search');
+  query.value = 'scene';
+  h.page.dispatchEvent({ type: 'input', target: query });
+  assert.equal(h.view.incomingSelection.size, 1);
+  assert.equal(h.view.incomingSelection.has('clip'), true);
+  assert.match(h.page.querySelector('[data-action="incoming-filter"][data-value="duplicate"]').textContent, /중복1/);
+  assert.equal(h.page.querySelectorAll('[data-select="incoming"]').length, 1);
+});
+
+test('duplicate video preview shares the selection and shows the recorded keeper and companion', () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.incoming = [makeIncoming('dup', {
+    name: 'video.mp4', path: 'Card/DCIM/video.mp4', kind: 'video', status: 'duplicate',
+    duplicateSource: { kind: 'remote', path: 'Archive/video.mp4' },
+    companions: [{ path: 'Card/DCIM/video.xmp', kind: 'xmp', disposition: 'keep' }],
+  })];
+  h.render();
+  h.openIncomingPreview('dup');
+  const meta = h.mediaPreview.querySelector('.preview-meta').textContent;
+  assert.match(meta, /incoming\/Card\/DCIM\/video.mp4/);
+  assert.match(meta, /OMV 보관 사본.*Archive\/video.mp4/);
+  assert.match(meta, /video.xmp 보존 필요/);
+  assert.equal(h.mediaPreview.querySelector('[data-action="request-preview-delete"]'), null);
+  const toggle = h.mediaPreview.querySelector('[data-action="toggle-preview-selection"]');
+  h.mediaPreview.dispatchEvent({ type: 'click', target: toggle });
+  assert.equal(h.view.incomingSelection.has('dup'), true);
+  assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, false);
+  assert.equal(h.mediaPreview.querySelector('[data-action="toggle-preview-selection"]').getAttribute('aria-pressed'), 'true');
+});
+
+test('duplicate cleanup sends only removals after choosing an Incoming keeper and omits blocked groups', async () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.incoming = [
+    makeIncoming('a', { status: 'duplicate', kind: 'video', path: 'DCIM/a.mp4', companions: [{ path: 'DCIM/a.xmp', kind: 'xmp', disposition: 'keep', reason: '고유 XMP' }] }),
+    makeIncoming('b', { status: 'duplicate', kind: 'video', path: 'DCIM/b.mp4' }),
+    makeIncoming('c', { status: 'duplicate', path: 'DCIM/c.jpg' }),
+  ];
+  h.state.incoming.forEach(file => h.view.incomingSelection.add(file.id));
+  h.render();
+  const groups = [
+    {
+      files: [{ id: 'a', path: 'DCIM/a.mp4', sizeBytes: 2000000 }, { id: 'b', path: 'DCIM/b.mp4', sizeBytes: 2000000 }],
+      keepers: [{ kind: 'remote', id: 'r', path: 'Archive/a.mp4' }, { kind: 'incoming', id: 'b', path: 'DCIM/b.mp4' }],
+    },
+    { files: [{ id: 'c', path: 'DCIM/c.jpg', sizeBytes: 10 }], keepers: [], reason: '사본을 확인할 수 없습니다.' },
+  ];
+  const response = payload => Promise.resolve({ ok: true, json: async () => payload });
+  h.setFetch(url => {
+    if (url === '/api/incoming/duplicates/plan') return response({ groups });
+    if (url === '/api/jobs/duplicate-cleanup') return response({ id: 31 });
+    return response({ incoming: h.state.incoming, managed: [], events: [], pendingXmp: [], job: null });
+  });
+  await h.confirmIncomingCleanup();
+  assert.equal(h.dialog.open, true);
+  assert.match(h.dialog.textContent, /DCIM\/a.xmp.*Incoming에 보존/);
+  assert.match(h.dialog.textContent, /사본을 확인할 수 없습니다/);
+  assert.match(h.dialog.querySelector('#cleanup-summary').textContent, /정리 2개.*보류 1개/);
+  const keeper = h.dialog.querySelector('[data-keeper-group]');
+  keeper.value = '1';
+  h.dialog.dispatchEvent({ type: 'change', target: keeper });
+  assert.match(h.dialog.querySelector('#cleanup-summary').textContent, /정리 1개.*보류 1개/);
+  const form = h.dialog.querySelector('form');
+  h.dialog.dispatchEvent({ type: 'submit', target: form, currentTarget: form });
+  await flushMicrotasks();
+  const jobRequest = h.fetchCalls.find(call => call.url === '/api/jobs/duplicate-cleanup');
+  assert.deepEqual(JSON.parse(jobRequest.opts.body), { items: [{ id: 'a', keeperKind: 'incoming', keeperId: 'b' }] });
+});
+
+test('a new scan shows stage progress while the latest processing result remains available', () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  const scan = { id: 8, kind: 'scan', status: 'running', result: { phase: '신규 파일 해시 검사', completedFiles: 2, totalFiles: 6, current: 'DCIM/a.mp4' } };
+  h.state.jobs.local = scan;
+  h.state.activeJobs.local = scan;
+  h.state.latestIncomingResult = {
+    id: 7, kind: 'duplicate-cleanup', status: 'done',
+    result: { cleaned: 1, review: 1, items: [{ path: 'DCIM/b.mp4', status: 'review', reason: '원격 사본을 확인할 수 없습니다.' }] },
+  };
+  h.render();
+  const progress = h.page.querySelector('progress');
+  assert.equal(progress.getAttribute('value'), '2');
+  assert.equal(progress.getAttribute('max'), '6');
+  assert.match(h.page.querySelector('.incoming-progress').textContent, /신규 파일 해시 검사/);
+  assert.match(h.page.querySelector('.incoming-result').textContent, /DCIM\/b.mp4/);
+  assert.match(h.page.querySelector('.incoming-result').textContent, /원격 사본을 확인할 수 없습니다/);
+  assert.equal(h.page.querySelector('[data-action="rescan-incoming"]').disabled, true);
+});
+
+function cleanupHarness() {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.incoming = [makeIncoming('dup', { status: 'duplicate', kind: 'video' })];
+  h.view.incomingSelection.add('dup');
+  h.render();
+  let resolvePlan;
+  h.setFetch(url => {
+    if (url === '/api/incoming/duplicates/plan') return new Promise(resolve => { resolvePlan = resolve; });
+    return new Promise(() => {});
+  });
+  return {
+    h,
+    finish() {
+      resolvePlan({ ok: true, status: 200, json: async () => ({ groups: [{
+        files: [{ id: 'dup', path: 'dup.mp4', sizeBytes: 7 }],
+        keepers: [{ kind: 'managed', id: 'keeper', path: 'kept.mp4' }],
+      }] }) });
+    },
+  };
+}
+
+test('duplicate cleanup click survives polling render and modal cancel without sticking disabled', async () => {
+  const { h, finish } = cleanupHarness();
+  h.page.dispatchEvent({ type: 'click', target: h.page.querySelector('[data-action="cleanup-incoming"]') });
+  await flushMicrotasks();
+  assert.equal(h.view.cleanupPlanning, true);
+  assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, true);
+  assert.match(h.page.querySelector('[data-action="cleanup-incoming"]').textContent, /보관 사본 조회 중…/);
+  h.render();
+  assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, true);
+  finish();
+  await flushMicrotasks();
+  assert.equal(h.dialog.open, true);
+  h.dialog.dispatchEvent({ type: 'click', target: h.dialog.querySelector('[data-action="close-dialog"]') });
+  await flushMicrotasks();
+  assert.equal(h.dialog.open, false);
+  assert.equal(h.view.cleanupPlanning, false);
+  assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, false);
+  assert.match(h.page.querySelector('[data-action="cleanup-incoming"]').textContent, /중복 1개 정리/);
+});
+
+test('duplicate cleanup aborts modal when localBusy or status changes during plan fetch', async () => {
+  for (const change of ['busy', 'status', 'selection', 'route', 'dialog', 'preview']) {
+    const { h, finish } = cleanupHarness();
+    const pending = h.confirmIncomingCleanup();
+    if (change === 'busy') {
+      const local = { id: 44, kind: 'scan', status: 'running' };
+      h.state.jobs.local = local;
+      h.state.activeJobs.local = local;
+    } else if (change === 'status') h.state.incoming[0].status = 'ready';
+    else if (change === 'selection') h.view.incomingSelection.clear();
+    else if (change === 'route') h.win.dispatchHashChange('#events');
+    else if (change === 'dialog') { h.dialog.innerHTML = '<p>existing dialog</p>'; h.dialog.showModal(); }
+    else h.openIncomingPreview('dup');
+    finish();
+    await pending;
+    assert.equal(h.view.cleanupPlanning, false, change);
+    if (change === 'dialog') assert.equal(h.dialog.textContent, 'existing dialog');
+    else assert.equal(h.dialog.open, false, change);
+    if (change === 'preview') assert.equal(h.mediaPreview.open, true);
+  }
+});
+
+test('duplicate cleanup 409 refreshes state and releases the planning button', async () => {
+  const { h } = cleanupHarness();
+  let stateRequests = 0;
+  h.setFetch(async url => {
+    if (url === '/api/incoming/duplicates/plan') return { ok: false, status: 409, json: async () => ({ detail: '검사 결과가 변경되었습니다.' }) };
+    assert.equal(url, '/api/state');
+    stateRequests += 1;
+    return { ok: true, status: 200, json: async () => ({
+      timezone: 'Asia/Seoul', incoming: [makeIncoming('dup', { status: 'ready' })],
+      managed: [], events: [], pendingXmp: [], scan: null, job: null,
+    }) };
+  });
+  await assert.rejects(h.confirmIncomingCleanup(), error => error.status === 409);
+  assert.equal(stateRequests, 1);
+  assert.equal(h.state.incoming[0].status, 'ready');
+  assert.equal(h.view.cleanupPlanning, false);
+  assert.equal(h.dialog.open, false);
+  assert.doesNotMatch(h.page.querySelector('[data-action="cleanup-incoming"]').textContent, /조회 중/);
+});
+
+test('api maps FastAPI default 404 Not Found to actionable Korean message', async () => {
+  const h = createHarness();
+  for (const detail of ['Not Found', '파일을 찾을 수 없습니다.']) {
+    h.setFetch(async () => ({ ok: false, status: 404, json: async () => ({ detail }) }));
+    await assert.rejects(h.api('incoming/duplicates/plan', 'POST', { ids: ['dup'] }), error => {
+      assert.equal(error.status, 404);
+      if (detail === 'Not Found') assert.match(error.message, /백엔드 컨테이너.*다시 빌드·재시작/);
+      else assert.equal(error.message, detail);
+      return true;
+    });
+  }
+});
+
+test('incomingResultSection handles null item path and auto-expands on companionReview', () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.latestIncomingResult = { id: 91, kind: 'move', status: 'done', result: {
+    review: 0, companionReview: 1, items: [
+      { id: 'missing-id', path: null, status: 'review' },
+      { path: null, status: 'review' },
+    ],
+  } };
+  h.render();
+  const details = h.page.querySelector('#incoming-result-items');
+  assert.notEqual(details.getAttribute('open'), null);
+  assert.match(details.textContent, /missing-id/);
+  assert.match(details.textContent, /경로 정보 없음/);
+  assert.doesNotMatch(details.textContent, /null/);
+  // Retain a user's collapsed state on the next poll of the same job.
+  details.open = false;
+  h.render();
+  assert.equal(h.page.querySelector('#incoming-result-items').getAttribute('open'), null);
+});
+
+test('incoming table renders root filenames once and keeps nested paths and companion summaries', () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.view.incomingLayout = 'table';
+  h.state.incoming = [
+    makeIncoming('root', { name: 'root.jpg', folder: '', companions: [{ path: 'root.THM', kind: 'thm', disposition: 'keep' }] }),
+    makeIncoming('nested', { name: 'nested.jpg', folder: 'DCIM' }),
+  ];
+  h.render();
+  const cells = h.page.querySelector('tbody').children.map(row => row.children[1].textContent);
+  assert.equal((cells[0].match(/root\.jpg/g) || []).length, 1);
+  assert.match(cells[0], /THM/);
+  assert.match(cells[1], /DCIM\/nested.jpg/);
+});
+
+function setPollingJob(h, lane, job) {
+  h.state.jobs[lane] = job;
+  h.state.activeJobs[lane] = job && ['queued', 'running'].includes(job.status) ? job : null;
+}
+
+function changeSelection(h, kind, value, checked) {
+  const input = h.page.querySelector(`[data-select="${kind}"][value="${value}"]`);
+  assert.ok(input, `missing ${kind} ${value}`);
+  input.checked = checked;
+  h.page.dispatchEvent({ type: 'change', target: input });
+  return input;
+}
+
+function keyedImage(h, id) {
+  return h.page.querySelector(`[data-item-key="${id}"] img`);
+}
+
+test('Incoming polling render and checkbox selection preserve thumbnail img nodes across table and card views', async () => {
+  for (const layout of ['table', 'cards']) {
+    const h = createHarness();
+    h.win.dispatchHashChange('#incoming');
+    h.view.connecting = false;
+    h.view.incomingLayout = layout;
+    h.state.incoming = [makeIncoming('i1'), makeIncoming('i2', { status: 'duplicate' })];
+    h.state.pendingXmp = [{ id: 'xmp', path: 'sidecar.XMP', status: 'pending', recommended: 'm1',
+      candidates: [{ id: 'm1', name: 'original.mp4' }, { id: 'm2', name: 'second.mp4' }] }];
+    h.render();
+    const main = h.page.querySelector('main');
+    const rows = h.page.querySelector('#incoming-rows');
+    const first = keyedImage(h, 'i1');
+    const second = keyedImage(h, 'i2');
+    assert.equal(first.getAttribute('decoding'), 'async');
+    const unchanged = () => {
+      assert.equal(h.page.querySelector('main'), main, layout);
+      assert.equal(keyedImage(h, 'i1'), first, layout);
+      assert.equal(keyedImage(h, 'i2'), second, layout);
+    };
+    rows.scrollTop = 90;
+    for (let completedFiles = 1; completedFiles <= 3; completedFiles += 1) {
+      setPollingJob(h, 'local', { id: 51, kind: 'duplicate-cleanup', status: 'running', result: {
+        phase: `검증 ${completedFiles}`, totalFiles: 4, completedFiles,
+      } });
+      h.render();
+      unchanged();
+      assert.equal(h.page.querySelector('.incoming-progress progress').getAttribute('value'), String(completedFiles));
+      assert.equal(h.page.querySelector('[data-action="move-incoming"]').disabled, true);
+      assert.equal(rows.scrollTop, 90);
+    }
+    setPollingJob(h, 'local', null);
+    h.render();
+    const input = changeSelection(h, 'incoming', 'i1', true);
+    unchanged();
+    assert.equal(h.page.querySelector('[data-select="incoming"][value="i1"]'), input);
+    assert.equal(input.checked, true);
+    assert.equal(h.page.querySelector('[data-item-key="i1"]').classList.contains('selected'), true);
+    assert.equal(h.page.querySelector('[data-select="incoming-all"]').indeterminate, true);
+    assert.equal(h.page.querySelector('[data-action="move-incoming"]').disabled, false);
+    changeSelection(h, 'incoming-all', 'all', true);
+    unchanged();
+    assert.equal(h.page.querySelector('[data-select="incoming-all"]').checked, true);
+    assert.equal(h.page.querySelector('[data-select="incoming-all"]').indeterminate, false);
+    assert.match(h.page.querySelector('#incoming-actions').textContent, /2개 선택/);
+    h.openIncomingPreview('i1');
+    h.mediaPreview.dispatchEvent({ type: 'click', target: h.mediaPreview.querySelector('[data-action="toggle-preview-selection"]') });
+    unchanged();
+    assert.equal(input.checked, false);
+    assert.equal(h.page.querySelector('[data-item-key="i1"]').classList.contains('selected'), false);
+    assert.equal(h.page.querySelector('[data-select="incoming-all"]').indeterminate, true);
+    h.closeMediaPreview();
+    const xmp = h.page.querySelector('[data-xmp-id="xmp"]');
+    h.page.querySelector('.xmp-matches').scrollTop = 47;
+    xmp.value = 'm2';
+    h.page.dispatchEvent({ type: 'change', target: xmp });
+    unchanged();
+    assert.equal(h.view.xmpChoices.get('xmp'), 'm2');
+    assert.equal(h.page.querySelector('.xmp-matches').scrollTop, 47);
+
+    // Searching without excluding a file preserves its input, caret/focus, and image.
+    const search = h.page.querySelector('#file-search');
+    search.focus();
+    search.value = 'inc_';
+    h.page.dispatchEvent({ type: 'input', target: search });
+    unchanged();
+    h.render();
+    assert.equal(h.page.querySelector('#file-search'), search);
+    assert.equal(h.doc.activeElement, search);
+    assert.equal(search.focusCalls.length, 1);
+    // An unchanged layout click is a no-op, including the user's scroll position.
+    h.page.dispatchEvent({ type: 'click', target: h.page.querySelector(`[data-action="incoming-layout"][data-value="${layout}"]`) });
+    await flushMicrotasks();
+    unchanged();
+    assert.equal(rows.scrollTop, 90);
+
+    // Append and reorder exercise both reconciler paths without replacing existing images.
+    const thirdFile = makeIncoming('i3');
+    h.state.incoming.push(thirdFile);
+    h.render();
+    unchanged();
+    const third = keyedImage(h, 'i3');
+    h.state.incoming = [thirdFile, ...h.state.incoming.slice(0, 2).reverse()];
+    h.render();
+    unchanged();
+    assert.equal(keyedImage(h, 'i3'), third);
+    assert.deepEqual(h.page.querySelectorAll('[data-item-key]').map(row => row.dataset.itemKey), ['i3', 'i2', 'i1']);
+
+    h.state.incoming = h.state.incoming.filter(file => file.id !== 'i1');
+    h.state.incoming.find(file => file.id === 'i2').status = 'ready';
+    h.render();
+    assert.equal(keyedImage(h, 'i1'), null);
+    assert.equal(keyedImage(h, 'i2'), second);
+    assert.equal(keyedImage(h, 'i3'), third);
+    assert.match(h.page.querySelector('[data-item-key="i2"]').textContent, /이동 가능/);
+    h.state.incoming.find(file => file.id === 'i2').thumbnail = '/thumbnails/new-content-v1.jpg';
+    h.render();
+    const newSecond = keyedImage(h, 'i2');
+    assert.notEqual(newSecond, second);
+    assert.equal(newSecond.getAttribute('src'), '/thumbnails/new-content-v1.jpg');
+    assert.equal(keyedImage(h, 'i3'), third);
+    search.value = 'inc_i3';
+    h.page.dispatchEvent({ type: 'input', target: search });
+    assert.equal(keyedImage(h, 'i2'), null);
+    assert.equal(keyedImage(h, 'i3'), third);
+    search.value = '';
+    h.page.dispatchEvent({ type: 'input', target: search });
+    assert.notEqual(keyedImage(h, 'i2'), newSecond);
+    assert.equal(keyedImage(h, 'i3'), third);
+    h.view.incomingLayout = layout === 'table' ? 'cards' : 'table';
+    h.render();
+    assert.notEqual(keyedImage(h, 'i3'), third);
+    assert.equal(h.page.querySelector('main'), main);
+    assert.equal(rows.dataset.mode, h.view.incomingLayout);
+  }
+});
+
+test('Events polling render, checkbox selection, search input, and status updates preserve thumbnail img nodes', () => {
+  const h = createHarness();
+  h.state.events = [
+    { id: 'ev1', name: 'Trip', folder: 'Trip', parent: null, start: '2026-06-01', end: '2026-06-03', zone: 'Asia/Seoul' },
+    { id: 'ev2', name: 'Next', folder: 'Next', parent: null },
+  ];
+  h.state.managed = [makeManaged('m1', { canOffload: true }), makeManaged('m2', { canOffload: true })];
+  h.view.eventId = 'ev1';
+  h.render();
+  const main = h.page.querySelector('main');
+  const first = keyedImage(h, 'm1');
+  let second = keyedImage(h, 'm2');
+  const rows = h.page.querySelector('#event-rows');
+  rows.scrollTop = 135;
+  const unchanged = () => {
+    assert.equal(h.page.querySelector('main'), main);
+    assert.equal(keyedImage(h, 'm1'), first);
+    assert.equal(keyedImage(h, 'm2'), second);
+    assert.equal(rows.scrollTop, 135);
+  };
+  for (const kind of ['offload', 'upload']) {
+    for (let completedFiles = 1; completedFiles <= 2; completedFiles += 1) {
+      setPollingJob(h, 'remote', { id: 61, kind, status: 'running', result: { phase: `전송 ${completedFiles}`, totalFiles: 3, completedFiles } });
+      h.render();
+      unchanged();
+      assert.equal(h.page.querySelector('[data-action="offload-media"]').disabled, true);
+      if (kind === 'offload') assert.equal(h.page.querySelector('.upload-status progress').getAttribute('value'), String(Math.round(completedFiles / 3 * 100)));
+    }
+  }
+  setPollingJob(h, 'remote', null);
+  h.render();
+  const input = changeSelection(h, 'event', 'm1', true);
+  unchanged();
+  assert.equal(h.page.querySelector('[data-select="event"][value="m1"]'), input);
+  assert.equal(h.page.querySelector('[data-item-key="m1"]').classList.contains('selected'), true);
+  assert.equal(h.page.querySelector('[data-select="event-all"]').indeterminate, true);
+  assert.equal(h.page.querySelector('[data-action="offload-media"]').disabled, false);
+  assert.equal(h.page.querySelector('[data-action="edit-media"]').disabled, false);
+  const target = h.page.querySelector('#move-event-target');
+  target.value = 'ev2';
+  h.page.dispatchEvent({ type: 'change', target });
+  assert.equal(h.page.querySelector('[data-action="move-event"]').disabled, false);
+  changeSelection(h, 'event-all', 'all', true);
+  unchanged();
+  assert.equal(h.page.querySelector('[data-select="event-all"]').checked, true);
+  assert.equal(h.page.querySelector('[data-select="event-all"]').indeterminate, false);
+  assert.equal(h.page.querySelector('#move-event-target').value, 'ev2');
+  changeSelection(h, 'event-all', 'all', false);
+  assert.equal(h.page.querySelector('[data-action="edit-media"]').disabled, true);
+  assert.equal(h.page.querySelector('[data-action="move-event"]').disabled, true);
+  const search = h.page.querySelector('#event-search');
+  // Some fixtures omit isConnected; containment must be enough to retain focus.
+  Object.defineProperty(search, 'isConnected', { value: undefined });
+  search.focus();
+  search.value = 'm';
+  h.page.dispatchEvent({ type: 'input', target: search });
+  unchanged();
+  h.render();
+  assert.equal(h.page.querySelector('#event-search'), search);
+  assert.equal(h.doc.activeElement, search);
+  assert.equal(search.focusCalls.length, 1);
+  search.value = 'm1';
+  h.page.dispatchEvent({ type: 'input', target: search });
+  assert.equal(keyedImage(h, 'm1'), first);
+  assert.equal(keyedImage(h, 'm2'), null);
+  search.value = '';
+  h.page.dispatchEvent({ type: 'input', target: search });
+  assert.equal(keyedImage(h, 'm1'), first);
+  assert.notEqual(keyedImage(h, 'm2'), second);
+  second = keyedImage(h, 'm2');
+  changeSelection(h, 'event', 'm1', true);
+  h.state.managed[0].confirmed = true;
+  h.render();
+  unchanged();
+  assert.match(h.page.querySelector('[data-item-key="m1"] [data-col="status"]').textContent, /확정/);
+  assert.equal(h.page.querySelector('[data-action="confirm-event"]').disabled, true);
+  h.state.managed[0].status = 'archived';
+  h.state.managed[0].preview = null;
+  h.render();
+  assert.equal(h.page.querySelector('[data-item-key="m1"] button.thumb'), null);
+  assert.ok(h.page.querySelector('[data-item-key="m1"] span.thumb'));
+  assert.notEqual(keyedImage(h, 'm1'), first);
+  assert.equal(keyedImage(h, 'm2'), second);
+  h.chooseEvent('ev1');
+  assert.equal(rows.scrollTop, 135);
+  h.chooseEvent('ev2');
+  assert.equal(rows.scrollTop, 0);
+});
+
+test('Archive source selection updates checkboxes, indeterminate state, count, and upload button in place', () => {
+  const h = createHarness();
+  h.state.events = [{ id: 'ev1', name: 'Trip', folder: 'Trip', parent: null }, { id: 'ev2', name: 'Next', folder: 'Next', parent: null }];
+  h.state.managed = [
+    makeManaged('m1', { confirmed: true, xmp: { name: 'm1.xmp' } }),
+    makeManaged('m2', { confirmed: true }),
+    makeManaged('m3', { confirmed: true, eventId: 'ev2' }),
+  ];
+  h.view.archive = { root: '/archive', path: '', entries: [] };
+  h.view.sourceSelection.add('m1:media');
+  h.win.dispatchHashChange('#archive');
+  const main = h.page.querySelector('main');
+  const first = h.page.querySelector('[data-select="source"][value="0"]');
+  const all = h.page.querySelector('[data-select="source-all"]');
+  const upload = h.page.querySelector('[data-action="upload-archive"]');
+  const count = h.page.querySelector('#source-selection-count');
+  assert.equal(first.checked, false);
+  assert.equal(first.indeterminate, true);
+  assert.equal(all.indeterminate, true);
+  assert.equal(count.textContent, '1개 파일 선택');
+  const unchanged = () => {
+    assert.equal(h.page.querySelector('main'), main);
+    assert.equal(h.page.querySelector('[data-select="source"][value="0"]'), first);
+    assert.equal(h.page.querySelector('[data-action="upload-archive"]'), upload);
+  };
+  changeSelection(h, 'source', '0', true);
+  unchanged();
+  assert.equal(first.indeterminate, false);
+  assert.equal(first.checked, true);
+  assert.equal(first.closest('.tree-row').classList.contains('source-selected'), true);
+  assert.equal(count.textContent, '3개 파일 선택');
+  assert.equal(all.indeterminate, true);
+  assert.equal(upload.disabled, false);
+  changeSelection(h, 'source-all', 'all', true);
+  unchanged();
+  assert.equal(all.checked, true);
+  assert.equal(all.indeterminate, false);
+  assert.equal(count.textContent, '4개 파일 선택');
+  assert.equal(h.page.querySelectorAll('.source-selected').length, 2);
+  changeSelection(h, 'source', '0', false);
+  unchanged();
+  assert.equal(first.closest('.tree-row').classList.contains('source-selected'), false);
+  assert.equal(all.checked, false);
+  assert.equal(all.indeterminate, true);
+  assert.equal(count.textContent, '1개 파일 선택');
+  changeSelection(h, 'source-all', 'all', false);
+  unchanged();
+  assert.equal(all.indeterminate, false);
+  assert.equal(upload.disabled, true);
+  assert.equal(count.textContent, '0개 파일 선택');
+  setPollingJob(h, 'remote', { id: 71, kind: 'upload', status: 'running', result: {} });
+  h.render();
+  assert.equal(h.page.querySelector('[data-select="source"]').disabled, true);
+  assert.equal(h.page.querySelector('[data-select="source-all"]').disabled, true);
+  assert.equal(h.page.querySelector('[data-action="upload-archive"]').disabled, true);
 });

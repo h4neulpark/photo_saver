@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from archive import (
     archive_config, archive_connection, archive_revision as config_identity, resolve_remote_file, storage_id_for,
 )
-from catalog import LANE_REMOTE, database, now, queue_job
+from catalog import LANE_REMOTE, active_duplicate_keeper_ids, database, now, queue_job
 from media import delete_verified_file, directory, fingerprint, regular_file, relative_parts
 from settings import fail
 from transfers import sftp_disconnected
@@ -33,6 +33,8 @@ def find_remote_copy(db, sha, storage_id, archive_root):
 
 def queue_offload(db, request):
     ids = list(dict.fromkeys(request.ids))
+    if active_duplicate_keeper_ids(db).intersection(ids):
+        fail(409, "Incoming 중복 정리에서 보존할 로컬 원본입니다. 정리 완료 후 다시 시도하세요.")
     config = archive_config()
     storage_id = storage_id_for(config)
     files = []

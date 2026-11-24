@@ -81,6 +81,19 @@ test('local scan/move leaves Archive and Events remote actions enabled', () => {
   }
 });
 
+test('duplicate cleanup is disabled during local jobs and remains enabled during remote upload', () => {
+  const h = ready();
+  h.state.incoming[0].status = 'duplicate';
+  for (const kind of ['scan', 'move', 'duplicate-cleanup']) {
+    setJobs(h, job(16, kind), null);
+    route(h, 'incoming');
+    assert.equal(disabled(h, 'cleanup-incoming'), true, kind);
+  }
+  setJobs(h, null, job(17, 'upload'));
+  route(h, 'incoming');
+  assert.equal(disabled(h, 'cleanup-incoming'), false);
+});
+
 test('exclusive reset and synchronous catalog barrier lock local, remote and settings actions', () => {
   const h = ready();
   for (const synchronous of [false, true]) {

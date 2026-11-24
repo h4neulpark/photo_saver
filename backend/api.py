@@ -5,6 +5,7 @@ import logging
 import re
 import sqlite3
 import unicodedata
+import uploads
 from contextlib import ExitStack, asynccontextmanager
 from datetime import date, datetime, timezone
 from io import BytesIO
@@ -27,6 +28,7 @@ from archive import active_storage_scope, router as archive_router
 from transfers import RemoteDuplicateError, TransferRequest, queue_transfer
 from offload import OffloadRequest, queue_offload
 from remote_index import RemoteIndexRequest, queue_remote_index
+from incoming_cleanup import plan_duplicate_cleanup, queue_duplicate_cleanup
 from records import router as records_router
 from devices import router as devices_router, device_names, effective_device, device_sql, device_folder
 
@@ -38,6 +40,10 @@ async def lifespan(_app):
     storage_id = ensure_storage_id()
     with database(write=True) as db:
         backfill_remote_files(db, storage_id)
+    try:
+        await run_in_threadpool(uploads.cleanup_stale_uploads)
+    except Exception:
+        logging.getLogger(__name__).exception("업로드 임시 파일 정리에 실패했습니다.")
     yield
 
 
@@ -46,6 +52,7 @@ app.include_router(settings_router)
 app.include_router(archive_router)
 app.include_router(records_router)
 app.include_router(devices_router)
+app.include_router(uploads.router)
 
 
 @app.exception_handler(RemoteDuplicateError)
@@ -67,8 +74,12 @@ def reset_in_progress():
 @app.middleware("http")
 async def guard_reset(request, call_next):
     if request.method not in {"GET", "HEAD", "OPTIONS"} and await run_in_threadpool(reset_in_progress):
-        return JSONResponse({"detail": "데이터 초기화 중입니다. 완료 후 다시 시도하세요."}, status_code=409)
-    return await call_next(request)
+        response = JSONResponse({"detail": "데이터 초기화 중입니다. 완료 후 다시 시도하세요."}, status_code=409)
+    else:
+        response = await call_next(request)
+    if request.url.path.startswith("/api/incoming/uploads"):
+        response.headers.update(uploads.UPLOAD_HEADERS)
+    return response
 
 
 logger = logging.getLogger(__name__)
@@ -83,13 +94,13 @@ MEDIA_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options":
 SINGLE_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(?:(?P<start>\d+)-(?P<end>\d*)|-(?P<suffix>\d+))\s*$", re.IGNORECASE)
 MAX_RANGE_DIGITS = 32
 MAX_RANGE_TOKEN_LEN = 64
-STALE_PREVIEW = "파일이 변경되었거나 이동했습니다. Incoming Library를 새로 고침하세요."
-INCOMING_HEIF_ERROR = "사진을 미리 볼 수 없습니다. 새로 고침하거나 원본 파일을 확인하세요."
+STALE_PREVIEW = "파일이 변경되었거나 이동했습니다. Incoming Library에서 다시 검사하세요."
+INCOMING_HEIF_ERROR = "사진을 미리 볼 수 없습니다. 다시 검사하거나 원본 파일을 확인하세요."
 MANAGED_UNAVAILABLE = "로컬 원본을 미리 볼 수 없습니다."
 MANAGED_NOT_FOUND = "로컬 원본을 찾을 수 없습니다."
 MANAGED_PERMISSION_DENIED = "로컬 원본의 읽기 권한을 확인하세요."
-MANAGED_STALE_PREVIEW = "로컬 원본이 변경되었습니다. 원본을 확인한 뒤 Incoming Library에서 새로 고침하여 다시 검사하세요."
-MANAGED_ACCESS_ERROR = "로컬 원본을 읽을 수 없습니다. 원본을 확인한 뒤 Incoming Library에서 새로 고침하여 다시 검사하세요."
+MANAGED_STALE_PREVIEW = "로컬 원본이 변경되었습니다. 원본을 확인한 뒤 Incoming Library에서 다시 검사하세요."
+MANAGED_ACCESS_ERROR = "로컬 원본을 읽을 수 없습니다. 원본을 확인한 뒤 Incoming Library에서 다시 검사하세요."
 MANAGED_UNSUPPORTED = "미리보기를 지원하지 않는 파일 형식입니다."
 MANAGED_HEIF_ERROR = "사진을 미리 볼 수 없습니다. 원본을 확인한 뒤 다시 검사하거나 원본 파일을 열어 확인하세요."
 MANAGED_RANGE_ERROR = "단일 바이트 범위 요청만 지원합니다."
@@ -98,6 +109,16 @@ MANAGED_RANGE_UNSATISFIABLE = "요청한 바이트 범위가 파일 크기를 �
 
 class Selection(BaseModel):
     ids: list[str] = Field(min_length=1)
+
+
+class DuplicateCleanupItem(BaseModel):
+    id: str
+    keeperKind: Literal["managed", "remote", "incoming"]
+    keeperId: str
+
+
+class DuplicateCleanupSelection(BaseModel):
+    items: list[DuplicateCleanupItem] = Field(min_length=1)
 
 
 class EventFields(BaseModel):
@@ -285,20 +306,54 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
     }
 
 
+def view_duplicate_source(row):
+    if row["status"] != "duplicate":
+        return None
+    reason = row["reason"]
+    for kind, prefix, suffix in (
+        ("managed", "managed의 ", "와 동일"),
+        ("remote", "원격 아카이브의 ", "에 이미 보관됨"),
+        ("incoming", "이번 검사의 ", "와 동일"),
+    ):
+        if reason.startswith(prefix) and reason.endswith(suffix):
+            return {"kind": kind, "path": reason[len(prefix):-len(suffix)]}
+    return None
+
+
+def view_scan_companion(item, status):
+    kind = item.get("kind") or PurePosixPath(item["path"]).suffix.lower().lstrip(".")
+    disposition = item.get("disposition")
+    reason = item.get("reason", "")
+    if not disposition:
+        disposition = "keep"
+        if status == "ready":
+            disposition = "move" if kind == "xmp" else "delete-after-move"
+    elif status != "ready" and disposition in {"move", "delete-after-move"}:
+        disposition = "keep"
+        reason = "원본이 이동 대상이 아니므로 동반 파일을 보존합니다."
+    return {
+        "path": item["path"], "kind": kind, "disposition": disposition,
+        "reason": reason, "pendingId": item.get("pendingId"),
+    }
+
+
 def view_scan_file(row):
     path = PurePosixPath(row["path"])
     companions = json.loads(row["companions"])
     xmp = next((item for item in companions if item.get("metadata") is not None), None)
+    companion_views = [view_scan_companion(item, row["status"]) for item in companions]
     return {
-        "id": row["id"], "name": path.name, "folder": "" if str(path.parent) == "." else str(path.parent),
+        "id": row["id"], "path": row["path"], "name": path.name,
+        "folder": "" if str(path.parent) == "." else str(path.parent),
         "kind": "photo" if path.suffix.lower() in PHOTOS else "video",
         "modifiedAt": row["modified_at"], "size": display_size(row["size"]),
         "thumbnail": f"/thumbnails/{row['thumbnail']}" if row["thumbnail"] else None,
         "preview": f"/api/incoming/{row['id']}/preview" if row["status"] in {"ready", "duplicate"} else None,
         "original": f"/api/incoming/{row['id']}/original" if row["status"] in {"ready", "duplicate"} else None,
-        "status": row["status"], "reason": row["reason"],
+        "status": row["status"], "reason": row["reason"], "duplicateSource": view_duplicate_source(row),
         "xmp": {**xmp["metadata"], "name": PurePosixPath(xmp["path"]).name} if xmp else None,
-        "cameraAuxCount": sum(item.get("metadata") is None for item in companions),
+        "cameraAuxCount": sum(item["disposition"] == "delete-after-move" for item in companion_views),
+        "companions": companion_views,
     }
 
 
@@ -620,6 +675,10 @@ def state():
         media.sort(key=lambda item: (item["time"] or "", item["name"]))
         active = active_jobs_by_lane(db)
         jobs = latest_jobs_by_lane(db)
+        latest_incoming_result = db.execute(
+            """SELECT * FROM jobs WHERE lane='local' AND kind<>'scan'
+               AND status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
         compat_job = active['exclusive'] or max(
             (row for row in active.values() if row), key=lambda row: row['id'], default=None,
         )
@@ -628,6 +687,7 @@ def state():
         return {
             "timezone": DEFAULT_ZONE,
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
+            "latestIncomingResult": view_job(latest_incoming_result),
             "job": view_job(compat_job),
             "jobs": {lane: view_job(row) for lane, row in jobs.items()},
             "activeJobs": {lane: view_job(row) for lane, row in active.items()},
@@ -700,6 +760,18 @@ def delete_photos(selection: Selection):
     return queue_incoming_selection(selection, "delete")
 
 
+@app.post("/api/incoming/duplicates/plan")
+def incoming_duplicate_plan(selection: Selection):
+    with database() as db:
+        return plan_duplicate_cleanup(db, selection.ids)
+
+
+@app.post("/api/jobs/duplicate-cleanup", status_code=202)
+def clean_incoming_duplicates(selection: DuplicateCleanupSelection):
+    with database(write=True) as db:
+        return queue_duplicate_cleanup(db, [item.model_dump() for item in selection.items])
+
+
 @app.post("/api/jobs/offload", status_code=202)
 def offload_files(request: OffloadRequest):
     with database(write=True) as db:
@@ -720,7 +792,7 @@ def link_xmp(selection: XmpSelection):
         if any(link.media_id in offloading for link in links):
             error(409, "로컬 원본 비우기가 진행 중인 파일에는 XMP를 연결할 수 없습니다.")
         if any(link.media_id not in pending.get(link.id, ()) for link in links):
-            error(409, "XMP 연결 후보가 변경되었습니다. 새로 고침하세요.")
+            error(409, "XMP 연결 후보가 변경되었습니다. 다시 검사하세요.")
         try:
             return {"id": queue_job(db, "xmp-link", selection.model_dump()), "lane": LANE_LOCAL}
         except ValueError as exc:
@@ -735,7 +807,7 @@ def queue_incoming_selection(selection, kind):
             "SELECT id, path, status FROM scan_files WHERE scan_id=?", (scan["id"],)
         )} if scan else {}
         if any(file_id not in scanned for file_id in ids):
-            error(409, "검사 결과가 바뀌었습니다. 새로 고침한 뒤 다시 선택하세요.")
+            error(409, "검사 결과가 바뀌었습니다. 다시 검사한 뒤 선택하세요.")
         rows = [scanned[file_id] for file_id in ids]
         if kind == "move" and any(row["status"] != "ready" for row in rows):
             error(409, "이동 가능한 파일을 다시 선택하세요.")

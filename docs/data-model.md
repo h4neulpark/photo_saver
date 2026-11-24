@@ -25,8 +25,8 @@ erDiagram
 | 필드 | 내용 |
 | --- | --- |
 | `id` | 정수 기본 키 |
-| `kind` | `scan`, `move`, `delete`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
-| `lane` | `local` (`scan`, `move`, `delete`, `xmp-link`), `remote` (`upload`, `offload`, `remote-index`), `exclusive` (`reset-all`). 기본 `exclusive` |
+| `kind` | `scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
+| `lane` | `local` (`scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`), `remote` (`upload`, `offload`, `remote-index`), `exclusive` (`reset-all`). 기본 `exclusive` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
