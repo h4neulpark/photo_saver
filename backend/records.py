@@ -13,6 +13,15 @@ from devices import device_sql
 
 router = APIRouter(prefix='/api/catalog')
 VERIFIED = "('uploaded','skipped','legacy_verified')"
+EVENT_LABEL_SQL = """CASE
+    WHEN p.id IS NOT NULL THEN coalesce(nullif(p.folder, ''), p.name) || ' / ' || e.name
+    ELSE coalesce(nullif(e.folder, ''), e.name)
+END"""
+CAPTURED_AT_SQL = """coalesce(
+    m.user_time, m.capture_time,
+    CASE WHEN m.xmp_metadata IS NOT NULL AND json_valid(m.xmp_metadata)
+         THEN json_extract(m.xmp_metadata, '$.date.time') END
+)"""
 FILE_VERIFIED_SQL = f"""(
     EXISTS (SELECT 1 FROM archive_history a WHERE a.file_id=files.file_id AND a.kind=files.asset_kind AND a.sha=files.sha AND a.outcome IN {VERIFIED})
     OR EXISTS (SELECT 1 FROM remote_files rf WHERE rf.sha=files.sha AND rf.status='present')
@@ -39,23 +48,25 @@ WITH archive_history AS (
     SELECT 'managed:'||m.id AS record_key,m.id AS file_id,m.kind,'media' AS asset_kind,
            m.name,m.path AS local_path,m.original_path,m.sha,m.size,'managed' AS location,
            m.status,m.confirmed,{device_sql()} AS device,
-           CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END AS event_name,m.event_id,e.parent_id AS parent_id
+           {EVENT_LABEL_SQL} AS event_name,m.event_id,e.parent_id AS parent_id,
+           {CAPTURED_AT_SQL} AS captured_at,coalesce(p.zone,e.zone) AS event_zone
     FROM media m LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
     UNION ALL
     SELECT 'xmp:'||m.id,m.id,'xmp','xmp',NULL,m.xmp_path,NULL,m.xmp_sha,NULL,
            'managed',m.status,m.confirmed,{device_sql()},
-           CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END,m.event_id,e.parent_id
+           {EVENT_LABEL_SQL},m.event_id,e.parent_id,
+           {CAPTURED_AT_SQL},coalesce(p.zone,e.zone)
     FROM media m LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
     WHERE m.xmp_path IS NOT NULL AND m.xmp_sha IS NOT NULL
     UNION ALL
     SELECT 'incoming:'||s.id,s.id,
            CASE WHEN lower(s.path) LIKE '%.mp4' OR lower(s.path) LIKE '%.mov' THEN 'video' ELSE 'photo' END,
-           'media',NULL,s.path,NULL,s.sha,s.size,'incoming',s.status,0,'',NULL,NULL,NULL
+           'media',NULL,s.path,NULL,s.sha,s.size,'incoming',s.status,0,'',NULL,NULL,NULL,NULL,NULL
     FROM scan_files s WHERE s.sha IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM media m WHERE m.id=s.id AND m.sha=s.sha)
 ), archive_files AS (
     SELECT a.*,m.event_id,e.parent_id,{device_sql()} AS device,
-           CASE WHEN p.id IS NOT NULL THEN p.name||' / '||e.name ELSE e.name END AS event_name
+           {EVENT_LABEL_SQL} AS event_name,m.original_path AS original_path
     FROM archive_history a LEFT JOIN media m ON m.id=a.file_id
     LEFT JOIN events e ON e.id=m.event_id LEFT JOIN events p ON p.id=e.parent_id
 ), remote_view AS (
@@ -172,7 +183,7 @@ def catalog_records(
             folders, unassigned = [], 0
             remote_folders, remote_root_count = build_remote_folders(db)
         else:
-            folders = [dict(row) for row in db.execute(CTE + f"""SELECT e.id,e.name,e.parent_id,e.start,
+            folders = [dict(row) for row in db.execute(CTE + f"""SELECT e.id,e.name,e.folder,e.parent_id,e.start,e.zone,
                        count(t.record_key) AS count FROM events e LEFT JOIN {table} t ON t.event_id=e.id
                        GROUP BY e.id ORDER BY e.start DESC,e.name,e.id""")]
             device_counts = [dict(row) for row in db.execute(CTE + f"SELECT event_id,device,count(*) AS count FROM {table} GROUP BY event_id,device ORDER BY device")]
@@ -185,6 +196,33 @@ def catalog_records(
         page = min(page, pages)
         extra = f", {FILE_VERIFIED_SQL} AS has_archive" if view == 'files' else ''
         rows = [dict(row) for row in db.execute(CTE + f'SELECT * {extra} FROM {table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', [*params, page_size, (page - 1) * page_size])]
+        if view == 'remote':
+            hashes = list(dict.fromkeys(row['sha'] for row in rows if row['sha'] is not None))
+            matches = {sha: {} for sha in hashes}
+            if hashes:
+                placeholders = ','.join('?' for _ in hashes)
+                linked_media = db.execute(f"""
+                    SELECT m.id,m.sha,m.xmp_sha,m.event_id,{EVENT_LABEL_SQL} AS event_label
+                    FROM media m LEFT JOIN events e ON e.id=m.event_id
+                    LEFT JOIN events p ON p.id=e.parent_id
+                    WHERE m.status IN ('available','archived')
+                      AND (m.sha IN ({placeholders}) OR m.xmp_sha IN ({placeholders}))
+                    ORDER BY coalesce(p.start,e.start) DESC,event_label ASC,m.id ASC
+                """, [*hashes, *hashes])
+                for media in linked_media:
+                    for sha in {media['sha'], media['xmp_sha']}:
+                        if sha in matches:
+                            matches[sha][media['id']] = media
+            for row in rows:
+                linked = list(matches.get(row['sha'], {}).values())
+                events = list(dict.fromkeys(media['event_label'] for media in linked if media['event_label']))
+                row.update(
+                    catalog_events=events,
+                    catalog_event_name=events[0] if events else None,
+                    catalog_match_count=len(linked),
+                    catalog_has_unassigned=any(media['event_id'] is None for media in linked),
+                    catalog_file_ids=[media['id'] for media in linked],
+                )
         active_storage_id, active_root = active_storage_scope()
         present_remote = {}
         if view == 'files' and active_root:
@@ -230,4 +268,5 @@ def catalog_records(
         },
         'folders': folders, 'unassigned': unassigned,
         'remoteFolders': remote_folders, 'remoteRootCount': remote_root_count,
+        'activeArchiveRoot': active_root,
     }, headers=NO_STORE)

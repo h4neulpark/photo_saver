@@ -160,6 +160,122 @@ class CatalogRecordsTests(unittest.TestCase):
             self.assertFalse(any(row['can_download'] for row in self.query(view='files')['rows']))
             self.assertFalse(any(row['can_download'] for row in self.query(view='archives')['rows']))
 
+    def test_date_prefixed_event_labels_search_and_folder_metadata(self):
+        self.fixture.add_file('top', 'top.MP4', b'top')
+        self.fixture.run_job(self.fixture.queue())
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE events SET name='나고야',folder='260903_나고야',start='2026-09-03',zone='Asia/Tokyo' WHERE id='parent'")
+            db.execute("UPDATE events SET name='1일차',folder='1일차' WHERE id='child'")
+            db.execute("UPDATE media SET event_id='parent',original_path='camera/top.MP4' WHERE id='top'")
+            db.execute("UPDATE media SET original_path='camera/clip.MP4' WHERE id='one'")
+        result = self.query()
+        rows = {row['record_key']: row for row in result['rows']}
+        self.assertEqual(rows['managed:top']['event_name'], '260903_나고야')
+        self.assertEqual(rows['managed:one']['event_name'], '260903_나고야 / 1일차')
+        self.assertEqual(rows['xmp:one']['event_name'], rows['managed:one']['event_name'])
+        folders = {row['id']: row for row in result['folders']}
+        self.assertEqual((folders['parent']['name'], folders['parent']['folder'], folders['parent']['zone']), ('나고야', '260903_나고야', 'Asia/Tokyo'))
+        for query in ('260903', '260903_나고야', '나고야', '1일차'):
+            with self.subTest(query=query):
+                self.assertGreater(self.query(q=query)['total'], 0)
+                archive_row = self.query('archives', q=query)['rows'][0]
+                self.assertEqual(archive_row['event_name'], '260903_나고야 / 1일차')
+                self.assertEqual(archive_row['original_path'], 'camera/clip.MP4')
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE events SET folder='' WHERE id='parent'")
+        self.assertEqual(self.query(q='나고야')['rows'][0]['event_name'], '나고야 / 1일차')
+
+    def test_captured_at_precedence_sidecar_inheritance_and_incoming_nulls(self):
+        job = self.fixture.queue()
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE events SET zone='Asia/Tokyo' WHERE id='parent'")
+            db.execute("UPDATE events SET zone='UTC' WHERE id='child'")
+            db.execute("INSERT INTO scan_files(scan_id,id,path,sha,size,status) VALUES (?,?,?,?,?,?)", (job['id'], 'new', 'new.MP4', 'a'*64, 10, 'ready'))
+        for user, capture, metadata, expected in [
+            ('2026-09-03T01:00:00Z', '2026-09-02T01:00:00Z', '{"date":{"time":"2026-09-01T01:00:00Z"}}', '2026-09-03T01:00:00Z'),
+            (None, '2026-09-02T01:00:00Z', '{"date":{"time":"2026-09-01T01:00:00Z"}}', '2026-09-02T01:00:00Z'),
+            (None, None, '{"date":{"time":"2026-09-01T01:00:00Z"}}', '2026-09-01T01:00:00Z'),
+            (None, None, '{broken', None), (None, None, None, None),
+        ]:
+            with self.subTest(user=user, capture=capture, metadata=metadata):
+                with catalog.database(write=True) as db:
+                    db.execute('UPDATE media SET user_time=?,capture_time=?,xmp_metadata=?', (user, capture, metadata))
+                rows = self.query()['rows']
+                self.assertEqual(len(rows), 3)
+                for row in rows:
+                    self.assertEqual(row['captured_at'], expected if row['location'] == 'managed' else None)
+                    self.assertEqual(row['event_zone'], 'Asia/Tokyo' if row['location'] == 'managed' else None)
+
+    def test_remote_batch_event_links_primary_sidecar_mixed_and_excluded_statuses(self):
+        for file_id in ('two', 'unassigned', 'missing', 'offloading'):
+            self.fixture.add_file(file_id, file_id + '.MP4', b'first video')
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE events SET folder='260903_Trip',start='2026-09-03' WHERE id='parent'")
+            db.execute("INSERT INTO events(id,name,folder,folder_key,start) VALUES ('other','Other','261001_Other','other','2026-10-01')")
+            db.execute("UPDATE media SET event_id='other' WHERE id='two'")
+            db.execute("UPDATE media SET status='archived' WHERE id='one'")
+            db.execute("UPDATE media SET event_id=NULL WHERE id='unassigned'")
+            for status in ('missing', 'offloading'):
+                db.execute('UPDATE media SET status=?,sha=? WHERE id=?', (status, status, status))
+            media = db.execute("SELECT sha,xmp_sha FROM media WHERE id='one'").fetchone()
+            db.execute("INSERT INTO storages(id,created_at,last_seen_at) VALUES ('storage','2026-11-01','2026-11-01')")
+            for name, sha in [('a.MP4', media['sha']), ('b.MP4', media['sha']), ('side.xmp', media['xmp_sha']), ('null.MP4', None), ('missing.MP4', 'missing'), ('offloading.MP4', 'offloading'), ('only.MP4', 'only')]:
+                db.execute("INSERT INTO remote_files(storage_id,path,archive_root,sha,size,mtime_ns,status,first_seen_at,last_seen_at) VALUES ('storage',?,'/NAS',?,10,0,'present','2026-11-01','2026-11-01')", (name, sha))
+        from contextlib import contextmanager
+        statements = []
+        original_database = records.database
+        @contextmanager
+        def traced_database():
+            with original_database() as db:
+                db.set_trace_callback(statements.append)
+                yield db
+        with patch.object(records, 'database', traced_database):
+            result = self.query('remote')
+        rows = {row['name']: row for row in result['rows']}
+        linked = rows['a.MP4']
+        self.assertEqual(linked['catalog_events'], ['261001_Other', '260903_Trip / Day'])
+        self.assertEqual(linked['catalog_event_name'], '261001_Other')
+        self.assertEqual(linked['catalog_match_count'], 3)
+        self.assertTrue(linked['catalog_has_unassigned'])
+        self.assertEqual(set(linked['catalog_file_ids']), {'one', 'two', 'unassigned'})
+        self.assertEqual(rows['b.MP4']['catalog_file_ids'], linked['catalog_file_ids'])
+        self.assertEqual(rows['side.xmp']['catalog_events'], ['260903_Trip / Day'])
+        self.assertEqual(rows['side.xmp']['catalog_file_ids'], ['one'])
+        for name in ('null.MP4', 'missing.MP4', 'offloading.MP4', 'only.MP4'):
+            self.assertFalse(rows[name]['in_catalog'])
+            self.assertEqual(rows[name]['catalog_events'], [])
+            self.assertEqual(rows[name]['catalog_file_ids'], [])
+            self.assertEqual(rows[name]['catalog_match_count'], 0)
+            self.assertFalse(rows[name]['catalog_has_unassigned'])
+            self.assertIsNone(rows[name]['catalog_event_name'])
+        self.assertEqual(result['summary']['remoteOnly'], 4)
+        self.assertEqual(self.query('remote', scope='remote_only')['total'], 4)
+        self.assertEqual(len([sql for sql in statements if 'SELECT m.id,m.sha,m.xmp_sha,m.event_id,' in sql]), 1)
+        self.assertFalse(any(sql.lstrip().upper().startswith(('UPDATE', 'INSERT', 'DELETE')) for sql in statements))
+        self.assertEqual(self.query('remote', page_size=1)['rows'][0]['catalog_events'], linked['catalog_events'])
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE media SET xmp_sha=sha WHERE id='one'")
+            db.execute("UPDATE media SET event_id='child' WHERE id='two'")
+        same_event = self.query('remote', q='a.MP4')['rows'][0]
+        self.assertEqual(same_event['catalog_events'], ['260903_Trip / Day'])
+        self.assertEqual(same_event['catalog_match_count'], 3)
+        with catalog.database(write=True) as db:
+            db.execute('UPDATE media SET event_id=NULL')
+        unassigned = self.query('remote', q='a.MP4')['rows'][0]
+        self.assertTrue(unassigned['in_catalog'])
+        self.assertEqual(unassigned['catalog_events'], [])
+        self.assertIsNone(unassigned['catalog_event_name'])
+        self.assertTrue(unassigned['catalog_has_unassigned'])
+
+    def test_active_archive_root_is_nullable_and_preserves_response_contract(self):
+        required = {'view', 'rows', 'total', 'page', 'pages', 'pageSize', 'summary', 'folders', 'unassigned', 'remoteFolders', 'remoteRootCount'}
+        for view in ('files', 'archives', 'remote'):
+            for active_root in (None, '/NAS/archive'):
+                with self.subTest(view=view, root=active_root), patch.object(records, 'active_storage_scope', return_value=('storage', active_root)):
+                    result = self.query(view)
+                    self.assertTrue(required.issubset(result))
+                    self.assertEqual(result['activeArchiveRoot'], active_root)
+
 
 if __name__ == '__main__':
     unittest.main()

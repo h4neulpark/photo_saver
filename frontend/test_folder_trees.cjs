@@ -325,3 +325,39 @@ test('Events sidebar keeps parent and child eventLink classes and existing inden
   assert.equal(paddingLeft(rule('.event-link.child')), 28);
   assert.ok(paddingLeft(rule('.event-link.child')) > paddingLeft(rule('.event-link')));
 });
+
+test('catalog event folders show dated labels, child names and escaped accessible toggles', () => {
+  for (const tab of ['files', 'archives']) {
+    const data = catalogData();
+    Object.assign(data.folders[0], { name: '나고야', folder: '260903_나고야', start: '2026-09-03' });
+    Object.assign(data.folders[1], { name: '1일차', folder: '1일차', start: '2026-09-03' });
+    Object.assign(data.folders[2], { name: '리프 <&>', start: '2026-08-01' });
+    const h = ready(tab, data);
+    assert.ok(folderButton(h, '260903_나고야'));
+    assert.ok(folderButton(h, '1일차'));
+    assert.ok(folderButton(h, '260801_리프 <&>'));
+    assert.equal(h.page.querySelector('[data-action="toggle-catalog-folder"][data-value="event"]').getAttribute('aria-label'), '260903_나고야 하위 폴더 접기');
+    h.view.catalogEvent = 'sub'; h.view.catalogDevice = '소분류 장비'; h.render();
+    assert.equal(h.page.querySelector('.catalog-location strong').textContent, '260903_나고야 / 1일차 / 소분류 장비');
+    assert.equal(folderButton(h, '260801_리프 <&>').querySelector('리프'), null);
+  }
+});
+
+test('catalog node kinds and distinct icons preserve the original folder geometry', () => {
+  const h = ready('files');
+  const expected = [['전체 파일', 'all'], ['미배정', 'unassigned'], ['상위 이벤트', 'event'], ['소분류', 'sub'], ['직속 장비', 'device']];
+  for (const [label, kind] of expected) {
+    const button = folderButton(h, label);
+    assert.equal(button.dataset.nodeKind, kind);
+    assert.equal(button.getAttribute('style'), null);
+    assert.ok(button.querySelector('svg'));
+    coordinates(button);
+  }
+  assert.ok(folderButton(h, '상위 이벤트').querySelector('svg rect'));
+  assert.ok(folderButton(h, '직속 장비').querySelector('svg circle'));
+  const remote = ready('remote');
+  for (const [label, kind] of [['전체 원격 파일', 'all'], ['루트 직속 파일', 'root-files'], ['260903_나고야', 'event'], ['고프로', 'sub']]) {
+    assert.equal(folderButton(remote, label).dataset.nodeKind, kind);
+    coordinates(folderButton(remote, label));
+  }
+});

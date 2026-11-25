@@ -227,7 +227,21 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 | `device` | 빈 문자열 | 장비 표시 이름. 미확인은 `장비 미확인` (`files`·`archives` 뷰 전용) |
 | `folder` | 빈 문자열 | 원격 아카이브 하위 경로 접두 또는 루트 직속 파일용 `__root__` (`remote` 뷰 전용) |
 
-로컬 파일 뷰는 `managed`, `incoming`, `xmp`, `verified` 범위를, 아카이브 뷰는 `xmp`, `verified`, `failed`, `unknown`을, 원격 인덱스 뷰(`view=remote`)는 `present`, `missing`, `remote_only`(현재 로컬/오프로드 `media`에 없는 원격 전용 파일), `xmp`를 적용한다. 그 밖의 조합은 추가 범위 조건 없이 조회한다. 반환값은 `view`, `rows`, `total`, `page`, `pages`, `pageSize`, `summary`(`remoteTotal`, `remotePresent`, `remoteMissing`, `remoteOnly`, `lastIndexedAt` 포함), `folders`, `unassigned`, `remoteFolders`, `remoteRootCount`다. 요약과 폴더 집계는 현재 검색·페이지 조건과 독립된 전체 집계다. `view=remote`의 각 행은 현재 활성 `archive_root`와 일치하는 `present` 파일에 대해 `can_download: true`를 제공한다.
+보유 파일 뷰는 `managed`, `incoming`, `xmp`, `verified` 범위를, 아카이브 뷰는 `xmp`, `verified`, `failed`, `unknown`을, 원격 인덱스 뷰(`view=remote`)는 `present`, `missing`, `remote_only`(현재 사용 가능·오프로드 `media`에 없는 원격 전용 파일), `xmp`를 적용한다. 그 밖의 조합은 추가 범위 조건 없이 조회한다. 반환값은 기존 `view`, `rows`, `total`, `page`, `pages`, `pageSize`, `summary`(`files`, `hashes`, `attempts`, `verified`, `failed`, `remoteTotal`, `remotePresent`, `remoteMissing`, `remoteOnly`, `lastIndexedAt` 포함), `folders`, `unassigned`, `remoteFolders`, `remoteRootCount`와 추가된 `activeArchiveRoot: str | null`이다. `activeArchiveRoot`는 현재 설정된 NAS 절대 루트이며 스토리지 미설정 시 `null`이다. 요약과 폴더 집계는 현재 검색·페이지 조건과 독립된 전체 집계다. 조회는 읽기 전용 SQL을 사용하며 원격 연결·스키마 변경을 수행하지 않는다.
+
+`files`·`archives`의 `event_name`은 상위 이벤트의 저장 폴더명(`260903_나고야`) 또는 `상위 폴더명 / 소분류명`(`260903_나고야 / 1일차`)이다. 폴더명이 비어 있으면 이벤트 이름을 사용하며 미배정은 `null`이다. `260903`, `260903_나고야`, `나고야`, `1일차` 모두 검색할 수 있다. `folders[]`는 기존 `id`, `name`, `parent_id`, `start`, `count`, `devices`와 함께 `folder`, `zone`을 제공한다. `name`은 날짜 접두 없는 기존 이벤트 이름을 유지한다.
+
+`files.rows[]`의 `captured_at: str | null`은 사용자 지정 시각 → 원본 촬영 시각 → 유효한 XMP JSON의 `date.time` 순서로 선택한다. `event_zone: str | null`은 상위 이벤트의 시간대(없으면 해당 이벤트 시간대)이며 XMP 행도 부모 미디어의 시각·시간대를 상속한다. Incoming 행의 두 값은 `null`이다. 기존 `has_archive`는 현재 해시의 검증 이력 또는 인덱스의 동일 해시 `present` 사본 존재를 뜻하며, 활성 루트에서 내려받을 수 있다는 뜻은 아니다. `download_path`·`can_download`는 활성 루트의 `present` 사본으로 결정한다. `archives.rows[]`는 기존 필드와 현재 미디어의 `original_path`를 제공하며, `can_download`는 활성 루트와 일치하고 목적지가 있는 `uploaded`·`skipped` 기록에만 참이다.
+
+`remote.rows[]`는 기존 `in_catalog`·`can_download`를 유지하고 아래 필드를 추가한다. 현재 페이지의 중복 제거한 non-null SHA 목록에 대해 같은 읽기 트랜잭션에서 단일 배치 쿼리를 실행하며, `media.status IN ('available', 'archived')`인 원본 SHA 또는 XMP SHA와 연결한다. XMP는 부모 미디어의 이벤트를 따른다. SHA가 없거나 `missing`·`offloading` 미디어만 매칭되면 미연동이며, `scope=remote_only`와 `summary.remoteOnly`의 기존 의미는 유지된다. `can_download`는 현재 활성 루트와 일치하는 `present` 원격 파일에만 참이다.
+
+| 원격 연동 필드 | 의미 |
+| --- | --- |
+| `catalog_events: list[str]` | 고유 이벤트 표시명. 상위 시작일 내림차순 → 표시명 → 미디어 ID 순으로 연결한 뒤 중복을 제거한다. |
+| `catalog_event_name: str \| null` | 첫 이벤트 표시명. 이벤트가 없으면 `null`. |
+| `catalog_match_count: int` | 연결된 고유 `media.id` 수. 미연동은 `0`. |
+| `catalog_has_unassigned: bool` | 연결 미디어 중 `event_id IS NULL`인 항목 존재 여부. |
+| `catalog_file_ids: list[str]` | 연결된 고유 미디어 ID 목록. 미연동은 `[]`. |
 
 ## 촬영도구 이름
 

@@ -168,20 +168,24 @@ test('10 Archive page preserves single upload CTA, touch guidance copy, and chec
   change(checkbox, true); assert.equal(action(h, 'upload-archive'), button); assert.equal(h.page.querySelector('.check-hit input'), checkbox); assert.equal(button.disabled, false); assert.equal(checkbox.closest('.tree-row').classList.contains('source-selected'), true);
 });
 
-test('11 Catalog hash abbreviates to 12 chars with full title and data-value across all 3 tabs', () => {
+test('11 Catalog details show the full hash and copy value across all 3 tabs', () => {
   const h = createHarness(); assert.equal(h.shortHash('short'), 'short'); assert.equal(h.shortHash(null), '해시 미기록');
   for (const tab of ['files', 'archives', 'remote']) {
-    catalog(h, tab); const code = h.page.querySelector('.catalog-hash-code');
-    assert.equal(code.textContent, `${sha.slice(0, 12)}…`); assert.equal(code.getAttribute('title'), sha); assert.equal(action(h, 'copy-record-hash').dataset.value, sha);
-    catalog(h, tab, { sha: null }); assert.match(h.page.querySelector('.catalog-hash').textContent, /해시 미기록/); assert.equal(action(h, 'copy-record-hash'), null);
+    h.view.catalogExpandedRows.clear(); catalog(h, tab);
+    assert.equal(h.page.querySelector('.catalog-detail-row'), null);
+    h.actions['toggle-catalog-detail'](action(h, 'toggle-catalog-detail').dataset.value); h.render();
+    const code = h.page.querySelector('.catalog-hash-full');
+    assert.equal(code.textContent, sha); assert.equal(action(h, 'copy-record-hash').dataset.value, sha);
+    catalog(h, tab, { sha: null }); assert.match(h.page.querySelector('.catalog-detail-row').textContent, /해시 미기록/); assert.equal(action(h, 'copy-record-hash'), null);
   }
 });
 
 test('12 Catalog rows include responsive data-label and cell classes across files, archives, and remote tabs', () => {
   const h = createHarness();
-  for (const [tab, labels] of [['files', ['파일 / 경로', 'SHA-256', '분류 / 크기', '파일 상태']], ['archives', ['파일 / 경로', 'SHA-256', '아카이브 목적지', '검증 결과 / 시각']], ['remote', ['원격 파일 / 경로', 'SHA-256', '분류 / 크기', '인덱스 상태 / 검증 시각']]]) {
+  for (const [tab, labels] of [['files', ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태']], ['archives', ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각']], ['remote', ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각']]]) {
     catalog(h, tab); const cells = h.page.querySelectorAll('.catalog-table tbody td');
-    assert.deepEqual(plain(cells.map(cell => cell.dataset.label)), labels); assert.deepEqual(plain(cells.map(cell => cell.getAttribute('class'))), ['catalog-cell-file', 'catalog-cell-hash', 'catalog-cell-meta', 'catalog-cell-status']);
+    assert.deepEqual(plain(cells.map(cell => cell.dataset.label)), labels); assert.deepEqual(plain(cells.map(cell => cell.getAttribute('class'))), ['catalog-cell-file', 'catalog-cell-meta', 'catalog-cell-status']);
+    assert.deepEqual(plain(h.page.querySelectorAll('.catalog-table th').map(th => th.textContent)), labels);
     const wrap = h.page.querySelector('.catalog-table-wrap'); wrap.scrollTop = 120; wrap.scrollLeft = 90; h.render(); assert.equal(h.page.querySelectorAll('.catalog-table-wrap').length, 1); assert.equal(h.page.querySelector('.catalog-table-wrap').scrollTop, 120); assert.equal(h.page.querySelector('.catalog-table-wrap').scrollLeft, 90);
   }
 });
@@ -189,7 +193,8 @@ test('12 Catalog rows include responsive data-label and cell classes across file
 test('13 copyTextToClipboard uses navigator.clipboard first and falls back to execCommand on HTTP LAN', async () => {
   const h = createHarness(); const writes = []; h.context.navigator = { clipboard: { writeText: async value => writes.push(value) } };
   await h.actions['copy-record-hash'](sha); assert.deepEqual(writes, [sha]); assert.equal(h.notice.textContent, 'SHA-256을 복사했습니다.');
-  catalog(h, 'files'); const focus = action(h, 'copy-record-hash'); focus.focus(); const calls = fallback(h);
+  catalog(h, 'files'); h.actions['toggle-catalog-detail'](action(h, 'toggle-catalog-detail').dataset.value); h.render();
+  const focus = action(h, 'copy-record-hash'); focus.focus(); const calls = fallback(h);
   await h.actions['copy-record-hash'](sha); assert.equal(calls[0].command, 'copy'); assert.equal(calls[0].value, sha); assert.equal(calls[0].readonly, ''); assert.match(calls[0].style, /position:fixed/);
   assert.equal(h.doc.body.querySelector('textarea'), null); assert.equal(h.doc.activeElement, focus); assert.equal(focus.focusCalls.at(-1).preventScroll, true);
   h.context.navigator.clipboard = { writeText: async () => { throw Error('denied'); } }; await h.copyTextToClipboard(sha); assert.equal(calls.length, 2);
