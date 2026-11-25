@@ -26,7 +26,7 @@ Mac·iPad·iPhone의 사진·영상 및 XMP·THM·LRV를 Incoming의 **기기에
 | 부문 | 구현된 기능 |
 | --- | --- |
 | 로컬 수집 | 수동 검사 진행 표시, `managed` 및 원격 `remote_files` SHA-256 중복 판정, 승인한 신규 파일 이동, 사본 재검증 후 중복 사진·영상 정리, Incoming 사진 삭제와 최근 처리 결과 |
-| 미디어 분석 | 사진 EXIF, 영상 ffprobe, GoPro ExifTool 보완, HEIC·HEIF, 썸네일과 Incoming 원본 미리보기 |
+| 미디어 분석 | 사진 EXIF, 영상 ffprobe, DJI 영상 메타데이터·원본 모델명 인식, GoPro ExifTool 보완, HEIC·HEIF, 썸네일과 Incoming 원본 미리보기 |
 | 부가 파일 | XMP 연결·보관·메타데이터 활용, 연결이 명확한 THM·LRV 정리 |
 | 이벤트 | 최상위 이벤트와 한 단계 소분류, 기간 수집, 수동 배정, 촬영 장비·시각 보정, 배치 확정, 보관 위치 필터와 아카이브 보관 상태 유지 |
 | 아카이브 | SSH 공개키·호스트 키 설정 및 호스트 키 초기화, SFTP 폴더 탐색, 선택·드래그 업로드, 원격 타 경로 중복 차단·선택 업로드, `remote_files` 고속 스킵, SSH 서버 측 SHA-256 검증(미지원 시 `prefetch` SFTP 자동 폴백), 원격 아카이브 전체·폴더별 증분 인덱싱(`remote-index`) 및 누락 감지, 취소와 재시작 시 작업 재실행, 단일 파일 SFTP 스트리밍 다운로드, 실시간 SFTP 검증 기반 로컬 원본 비우기(Safe Offload) |

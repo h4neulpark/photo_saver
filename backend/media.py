@@ -19,7 +19,7 @@ from catalog import DEFAULT_ZONE, PHOTOS, THUMBNAILS
 register_heif_opener()
 VIDEOS = {".mp4", ".mov"}
 SUPPORTED = PHOTOS | VIDEOS
-VIDEO_METADATA_VERSION = 2
+VIDEO_METADATA_VERSION = 3
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 RENAME_NOREPLACE = 1
@@ -212,11 +212,84 @@ def save_image_preview(image, destination, bounds):
     upright.convert("RGB").save(destination, format="JPEG", quality=84)
 
 
-def gopro_metadata(info, input_path, options):
-    streams = info.get("streams", [])
+_DJI_TAG_KEYS = {"make", "com.apple.quicktime.make", "encoder", "handler_name"}
+_DJI_MAKE_KEYS = {"make", "com.apple.quicktime.make"}
+_DJI_TRACK_TAGS = ("djmd", "dbgi")
+_DJI_WORD_RE = re.compile(r"(?<![A-Za-z0-9])dji(?![A-Za-z0-9])", re.IGNORECASE)
+_DJI_PREFIX_RE = re.compile(r"^dji(?=$|[\s._/-])", re.IGNORECASE)
+_DJI_MODEL_PREFIX_RE = re.compile(r"^dji[\s._/-]+(.+)$", re.IGNORECASE)
+_DJI_NON_MODEL_TOKENS = frozenset({
+    "avc", "hevc", "h264", "h265", "mpeg4", "mp4", "mp4v", "mjpeg", "aac", "pcm", "prores",
+    "encoder", "video", "audio", "sound", "meta", "metadata", "dbgi", "data",
+    "handler", "videohandler", "soundhandler", "timecode", "subtitle", "stream",
+    "camera", "media", "muxer", "recorder", "transcoder", "software", "firmware",
+})
+_DJI_VERSION_TOKEN_RE = re.compile(r"^v?\d+(?:\.\d+)*$", re.IGNORECASE)
+
+
+def _clean_tag(value):
+    if value is None:
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    return " ".join(text.split())
+
+
+def _is_dji_make(value):
+    cleaned = _clean_tag(value)
+    return bool(cleaned and _DJI_WORD_RE.search(cleaned))
+
+
+def _extract_dji_model(cleaned_encoder):
+    match = _DJI_MODEL_PREFIX_RE.match(cleaned_encoder)
+    if not match:
+        return ""
+    candidate = match.group(1).strip(" ._-/")
+    if not candidate:
+        return ""
+    normalized = re.sub(r"\bh\.26([45])\b", r"h26\1", candidate, flags=re.IGNORECASE)
+    tokens = [token.casefold() for token in re.split(r"[\s._/-]+", normalized) if token]
+    if not tokens:
+        return ""
+    if all(token in _DJI_NON_MODEL_TOKENS or _DJI_VERSION_TOKEN_RE.match(token) for token in tokens):
+        return ""
+    return candidate
+
+
+def dji_metadata(info):
+    streams = info.get("streams") or []
     evidence = []
-    for item in [info.get("format", {}), *streams]:
-        for key, value in item.get("tags", {}).items():
+    model = ""
+    for item in [info.get("format") or {}, *streams]:
+        for key, value in (item.get("tags") or {}).items():
+            lowered = key.lower()
+            if lowered not in _DJI_TAG_KEYS:
+                continue
+            cleaned = _clean_tag(value)
+            if not cleaned:
+                continue
+            matched = _DJI_WORD_RE.search(cleaned) if lowered in _DJI_MAKE_KEYS else _DJI_PREFIX_RE.match(cleaned)
+            if not matched:
+                continue
+            evidence.append(f"{key}: {cleaned}")
+            if lowered == "encoder" and not model:
+                model = _extract_dji_model(cleaned)
+    for tag in _DJI_TRACK_TAGS:
+        if any(_clean_tag(item.get("codec_tag_string")).lower() == tag for item in streams):
+            evidence.append(f"DJI metadata track ({tag})")
+    evidence = list(dict.fromkeys(evidence))
+    if not evidence:
+        return {}
+    result = {"make": "DJI", "device_evidence": evidence}
+    if model:
+        result["model"] = model
+    return result
+
+
+def gopro_metadata(info, input_path, options):
+    streams = info.get("streams") or []
+    evidence = []
+    for item in [info.get("format") or {}, *streams]:
+        for key, value in (item.get("tags") or {}).items():
             if key.lower() in {"make", "com.apple.quicktime.make", "encoder", "handler_name"} and re.search(r"\bgopro\b", str(value), re.IGNORECASE):
                 evidence.append(f"{key}: {value}".strip())
     if any(item.get("codec_tag_string") == "gpmd" for item in streams):
@@ -249,10 +322,10 @@ def video_metadata(stream, thumbnail):
         timeout=45, **options,
     )
     info = json.loads(probe.stdout)
-    video = next((item for item in info.get("streams", [])
+    video = next((item for item in (info.get("streams") or [])
                   if item.get("codec_type") == "video" and not item.get("disposition", {}).get("attached_pic")), {})
-    container = info.get("format", {})
-    tags = {key.lower(): value for key, value in {**video.get("tags", {}), **container.get("tags", {})}.items()}
+    container = info.get("format") or {}
+    tags = {key.lower(): value for key, value in {**(video.get("tags") or {}), **(container.get("tags") or {})}.items()}
     raw_time = tags.get("com.apple.quicktime.creationdate") or tags.get("creation_time")
     captured, verified = capture_time(raw_time)
     details = {
@@ -263,13 +336,21 @@ def video_metadata(stream, thumbnail):
         "raw_time": raw_time or "",
         "video_metadata_version": VIDEO_METADATA_VERSION,
     }
-    gopro = gopro_metadata(info, input_path, options)
-    if gopro and (not details["make"] or details["make"].strip().casefold() == "gopro"):
-        details["make"] = gopro["make"]
-        details["model"] = details["model"] or gopro.get("model", "")
-        details["device_evidence"] = gopro["device_evidence"]
-        if gopro.get("firmware"):
-            details["firmware"] = gopro["firmware"]
+    make_key = _clean_tag(details["make"]).casefold()
+    if not make_key or make_key == "gopro":
+        gopro = gopro_metadata(info, input_path, options)
+        if gopro:
+            details["make"] = gopro["make"]
+            details["model"] = _clean_tag(details["model"]) or gopro.get("model", "")
+            details["device_evidence"] = gopro["device_evidence"]
+            if gopro.get("firmware"):
+                details["firmware"] = gopro["firmware"]
+    if not _clean_tag(details["make"]) or _is_dji_make(details["make"]):
+        dji = dji_metadata(info)
+        if dji:
+            details["make"] = dji["make"]
+            details["model"] = _clean_tag(details["model"]) or dji.get("model", "")
+            details["device_evidence"] = dji["device_evidence"]
     if video and thumbnail:
         try:
             subprocess.run(

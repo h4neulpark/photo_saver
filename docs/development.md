@@ -129,6 +129,8 @@ Phase 2 자동 연결은 `loadRoute()`에서만 실행하며 `render()`는 요�
 
 2026-11-24 기준 위의 네트워크 차단·읽기 전용 테스트 컨테이너 명령으로 백엔드 unittest **153개**(업로드 12개 포함, `test_concurrency.py` 23개, `test_incoming_cleanup.py` 11개, `test_incoming_workflow.py` 6개, `test_media_preview.py` 10개 포함)와 프론트엔드 `node --test` **46개**(업로드 17개 포함)가 모두 통과했다. 이전 검증에서는 별도 임시 디렉터리와 격리 Compose 프로젝트에서 `api` `/managed-preview` 읽기 전용 마운트, 워커 스캔 지문 일관성, Nginx 프록시 경유 `HEAD`·단일 `Range`(`206`)·`If-Range`·`416`(`bytes */N`)·다중 `Range`(`400`)·`405`와 `MEDIA_HEADERS`를 확인했고, 메모리 fixture 기반 헤드리스 Chrome에서 390×320·320×320·320×240(200% 확대) 오류 버튼 비클리핑/클릭 가능 여부와 폴링 자동 닫힘 후 `#event-search` 포커스 복귀도 검증했다. 실제 OMV 연결과 실기기/브라우저 실제 코덱(HEVC 등) 재생 검증은 수동 확인 항목으로 남긴다.
 
+2026-11-25 DJI 영상 인식 추가 후 네트워크 차단·읽기 전용 테스트 컨테이너에서 DJI·GoPro 집중 테스트 **18개**, 전체 백엔드 unittest **179개**가 통과했다. 운영 DB를 마운트하지 않고 DJI 실샘플 MP4만 읽기 전용으로 연결한 `media.analyze()` 스모크에서도 장비 `DJI OsmoPocket3`, 제조사 `DJI`, 모델 `OsmoPocket3`, 영상 분석 버전 `3`과 `/tmp` 썸네일 생성을 확인했다.
+
 ## 테스트 범위
 
 썸네일 재로딩 회귀 테스트는 Incoming 표·카드와 이벤트 목록의 폴링·체크박스·검색·상태 변경에서 `<img>` 노드 동일성, 파일 추가·순서 변경·삭제 후 남은 행 보존, 썸네일 URL·보기 모드·필터 포함 여부 변경 시 필요한 DOM 교체를 확인한다. WeakMap 슬롯 캐시와 키 기반 행 조정, 세 페이지의 제자리 선택 갱신에서 선택 클래스·전체 선택의 indeterminate·작업 레인별 버튼 잠금·검색 포커스·스크롤도 검증한다. Nginx 문법 검사·리로드 후 실제 썸네일 200 및 조건부 304의 불변 캐시·nosniff, 없는 썸네일 404의 장기 캐시 부재·nosniff를 확인했다.
@@ -146,6 +148,7 @@ Incoming 회귀 테스트는 실제 FastAPI HTTP 경로의 중복 정리 계획�
 | [test_archive.py](../backend/test_archive.py) | 루트 이탈 거부, 링크 경계, 특수 파일명, 빈 폴더·조회 제한, 접속 오류 매핑, 저장된 키만 사용하는 연결, 단일 파일 SFTP 다운로드·UTF-8 헤더·루트 불일치 거부, 호스트 키 초기화 |
 | [test_events.py](../backend/test_events.py) | 날짜 접두사, 이벤트·장비 폴더 충돌, 수정 롤백, 수정 후 경로 갱신, 기존 전송 기록·예약 경로 유지 |
 | [test_gopro.py](../backend/test_gopro.py) | GoPro 인코더·메타데이터 트랙·모델 판정, 추측 방지, 재분석 시 사용자 분류 보존 |
+| [test_dji.py](../backend/test_dji.py) | DJI ffprobe 인코더·제조사·핸들러·`djmd`/`dbgi` 트랙 판정, 원본 모델명·명시 모델 보존, 일반 인코더·파일명 추측 방지, ExifTool 미호출·타사 장비·GoPro 우선, 버전 3 재분석 1회·사용자 분류·`archived` 보존, 촬영도구 이름 규칙 |
 | [test_transfers.py](../backend/test_transfers.py) | 폴더·XMP 전송, 동일 파일 재전송 생략 및 `remote_files` 고속 스킵, 타 경로 원격 중복 차단·선택 허용, `remote_files` 동기화, SSH 원격 해시(`sha256sum`/`shasum`) 및 SFTP `prefetch` 자동 폴백, 임시 파일 정리, 충돌·심볼릭 링크·원본 변경·검증 오류·취소·연결 단절 조기 중단·설정 변경·잘못된 입력 |
 | [test_remote_index.py](../backend/test_remote_index.py) | 원격 증분 인덱싱 지원 확장자 필터·숨김/심볼릭 링크 제외, 크기·수정시각 증분 스킵 및 `full_rehash`, 범위 제한 `missing` 판정, 취소·연결 단절 시 부분 해시 보존 및 오판 방지, 해시 중 파일 변경(TOCTOU) 감지, 기존 원격 전용 파일의 Incoming/업로드 중복 차단·`원격 인덱스` 조회·다운로드 연동, 구버전 `storages` 백업 복원 |
 | [test_offload.py](../backend/test_offload.py) | 안정적 스토리지 ID 유지, 구버전 백업 `remote_files` 백필 및 `offloading` 복원, 실시간 SFTP 검증 후 원본·XMP 로컬 비우기·썸네일 보존·`archived` 전환, 미업로드 XMP·원격 누락/크기 불일치/링크/로컬 변경 거부, 중단 재개와 연결 단절 중단, 원격 아카이브 기준 Incoming 스캔·이동·삭제 중복 판정 |
