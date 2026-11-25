@@ -70,6 +70,14 @@ function savedIncomingLayout() {
   }
 }
 
+function savedEventView() {
+  try {
+    return localStorage.getItem('photo-saver-event-view') === 'cards' ? 'cards' : 'table';
+  } catch {
+    return 'table';
+  }
+}
+
 const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
   dismissedResults: loadDismissedResults(), resultDetailsOpen: new Map(), deviceUploadHistory: loadDeviceUploadHistory(),
@@ -79,7 +87,7 @@ const view = {
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), incomingTab: 'files', preview: null, cleanupPlanning: false,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
-  eventTarget: '', eventQuery: '', sourcePath: [], xmpChoices: new Map(),
+  eventTarget: '', eventQuery: '', eventView: savedEventView(), sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   catalogOpBusy: false, sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '', archiveAutoAttempted: false, archiveAutoConnecting: false,
@@ -421,7 +429,7 @@ function announce(message) {
 }
 
 function button(action, label, { glyph, primary, danger, disabled, extra = '' } = {}) {
-  if (['new-event', 'new-child', 'edit-event', 'delete-event', 'collect', 'move-event', 'edit-media', 'confirm-event', 'resolve-time'].includes(action)) disabled ||= exclusiveActive();
+  if (['new-event', 'new-child', 'edit-event', 'delete-event', 'collect', 'move-event', 'edit-media', 'edit-media-time', 'confirm-event', 'resolve-time'].includes(action)) disabled ||= exclusiveActive();
   return `<button type="button" class="button${primary ? ' primary' : ''}${danger ? ' danger' : ''}" data-action="${action}" ${disabled ? 'disabled' : ''} ${extra}>${glyph ? icon(glyph) : ''}${label}</button>`;
 }
 
@@ -460,11 +468,11 @@ function fileThumbnail(file, interactive = false, card = false, source = 'incomi
   const canPreview = source === 'managed' ? file.status === 'available' && Boolean(file.preview) : Boolean(file.preview);
   if (interactive && canPreview) {
     const action = source === 'managed' ? 'preview-managed' : 'preview-incoming';
-    const cardAttr = source === 'incoming' && card ? ' data-card-preview' : '';
+    const cardAttr = card ? ' data-card-preview' : '';
     return `<button type="button" class="thumb" data-action="${action}" data-value="${escapeHtml(file.id)}"
       aria-label="${escapeHtml(file.name)} 미리보기"${cardAttr}>${contents}</button>`;
   }
-  return `<span class="thumb">${contents}</span>`;
+  return `<span class="thumb"${source === 'managed' && file.status === 'archived' ? ' title="로컬 원본 없음 (아카이브 보관)"' : ''}>${contents}</span>`;
 }
 
 const filterLabels = { all: '전체', ready: '이동 가능', duplicate: '중복', review: '확인 필요' };
@@ -530,6 +538,10 @@ function checkbox(kind, id, label, selection) {
   return `<input type="checkbox" data-select="${kind}" value="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" ${selection.has(id) ? 'checked' : ''}>`;
 }
 
+function checkHit(inputHtml) {
+  return inputHtml ? `<label class="check-hit">${inputHtml}</label>` : '';
+}
+
 function incomingCardCaption(file) {
   const path = incomingPath(file);
   const reason = incomingReason(file);
@@ -565,10 +577,10 @@ function patchIncomingRow(node, file) {
   // Checked state belongs to selection synchronization, not the HTML slot cache.
   const select = canSelectIncoming(file) ? checkbox('incoming', file.id, `${path} 선택`, new Set()) : '';
   if (card) {
-    setSlotHtml(node.querySelector('.card-check-slot'), select ? `<label class="card-check">${select}</label>` : '');
+    setSlotHtml(node.querySelector('.card-check-slot'), select ? `<label class="card-check"><span class="card-check-box">${select}</span></label>` : '');
     setSlotHtml(node.querySelector('.card-caption'), incomingCardCaption(file));
   } else {
-    setSlotHtml(node.querySelector('[data-col="select"]'), select);
+    setSlotHtml(node.querySelector('[data-col="select"]'), checkHit(select));
     const detail = [path !== file.name ? path : '', companionSummary(file)].filter(Boolean).join(' · ');
     setSlotHtml(node.querySelector('[data-col="file-text"]'), `<strong>${escapeHtml(file.name)}</strong>${detail ? `<span class="small muted">${escapeHtml(detail)}</span>` : ''}`);
     setSlotHtml(node.querySelector('[data-col="modified"]'), file.modifiedAt ? dateTimeFormatter(state.timezone).format(new Date(file.modifiedAt)) : '—');
@@ -594,7 +606,7 @@ function patchIncomingRows() {
   }
   const selectAll = files.some(canSelectIncoming) ? checkbox('incoming-all', 'all', '표시된 파일 모두 선택', new Set()) : '';
   setSlotHtml(container.querySelector('[data-col="select-all"]'), mode === 'cards' && selectAll
-    ? `<label class="card-select-all">${selectAll} 표시된 파일 모두 선택</label>` : selectAll);
+    ? `<label class="card-select-all">${selectAll} 표시된 파일 모두 선택</label>` : checkHit(selectAll));
   reconcileKeyedChildren(container.querySelector(mode === 'cards' ? 'ul' : 'tbody'), mode === 'cards' ? 'ul' : 'tbody',
     files, file => file.id, createIncomingRow, patchIncomingRow);
 }
@@ -634,7 +646,31 @@ function renderIncomingActions() {
   const bar = page.querySelector('#incoming-actions');
   setClass(bar, 'has-selection', selectedIncoming().length > 0);
   setSlotHtml(bar, incomingActions());
+  syncStickyActionBar();
 }
+
+let observedStickyBar = null;
+const stickyActionObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(syncStickyActionBar) : null;
+
+function syncStickyActionBar() {
+  const incomingActive = view.page === 'incoming' && view.incomingTab === 'files' && selectedIncoming().length > 0;
+  const eventActive = view.page === 'events' && view.eventSelection.size > 0;
+  const active = incomingActive || eventActive;
+  setClass(page, 'has-sticky-actions', active);
+  setClass(document.body, 'has-sticky-actions', active);
+  // Wrapped actions can exceed 140px on phones; keep notices above the actual bar.
+  const bar = active ? page.querySelector(incomingActive ? '#incoming-actions' : '#event-actions') : null;
+  if (observedStickyBar !== bar) {
+    stickyActionObserver?.disconnect();
+    if (bar) stickyActionObserver?.observe(bar);
+    observedStickyBar = bar;
+  }
+  const height = typeof bar?.getBoundingClientRect === 'function' ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+  notice.setAttribute('style', `--selection-bar-height: ${height}px`);
+  page.setAttribute('style', `--selection-bar-height: ${height}px`);
+}
+
+window.addEventListener('resize', syncStickyActionBar);
 
 function pendingXmpLinks() {
   return state.pendingXmp.filter(file => file.status === 'pending').map(file => ({
@@ -1087,6 +1123,7 @@ function patchPageStatus() {
 }
 
 function patchIncomingPage() {
+  syncStickyActionBar();
   patchPageStatus();
   setSlotHtml(page.querySelector('#incoming-tabs'), incomingTabsMarkup());
   for (const key of ['files', 'xmp', 'companions']) {
@@ -1191,8 +1228,50 @@ function eventFileStatus(file) {
     return `${badge('archived', '아카이브 보관')}<div class="file-reason small muted">로컬 원본 없음</div>${file.reviewReason ? `<div class="file-reason small muted">${escapeHtml(file.reviewReason)}</div>` : ''}`;
   }
   const primary = file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
-    badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '확정' : file.eventId ? '초안' : '미배정');
+    badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '분류 확정' : file.eventId ? '초안' : '미배정');
   return `${primary}${file.archived ? '<div class="file-reason small muted">아카이브 사본 있음</div>' : ''}`;
+}
+
+function eventCardCaption(file, footageDate) {
+  const timeText = file.time ? footageDate.format(new Date(file.time)) : '촬영 시각 없음';
+  const timeControl = file.status !== 'archived'
+    ? `<button type="button" class="card-time-btn numbers" data-action="edit-media-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 수정" ${exclusiveActive() ? 'disabled' : ''}>${escapeHtml(timeText)}${!file.timeVerified ? ' · 확인 필요' : ''}</button>`
+    : `<span class="small muted numbers card-time-static">${escapeHtml(timeText)}</span>`;
+  const primaryBadge = file.status === 'archived' ? badge('archived', '아카이브 보관')
+    : file.reviewReason ? badge('review', escapeHtml(file.reviewReason))
+      : badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '분류 확정' : file.eventId ? '초안' : '미배정');
+  const notes = [file.status === 'archived' ? '로컬 원본 없음' : '', file.status !== 'archived' && file.archived ? '아카이브 사본 있음' : '', file.analysisError || ''].filter(Boolean);
+  return `<strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+    <div class="card-time-row">${timeControl}</div>
+    <div class="small muted card-device" title="${escapeHtml(file.device || '장비 확인 필요')}">${escapeHtml(file.device || '장비 확인 필요')}</div>
+    <div class="card-info">${primaryBadge}${file.xmp ? `<button type="button" class="xmp-badge" data-action="view-xmp" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} XMP 정보 보기">XMP</button>` : ''}</div>
+    ${notes.map(text => `<p class="small muted card-reason">${escapeHtml(text)}</p>`).join('')}
+    ${file.canDownload ? `<div class="file-links card-links"><a class="time-edit-link" href="/api/archive/download?media_id=${encodeURIComponent(file.id)}" target="_blank" rel="noopener">다운로드</a></div>` : ''}`;
+}
+
+function eventLifecycleSummary(files) {
+  let draft = 0, confirmed = 0, archived = 0, localArchivedCopy = 0;
+  for (const file of files) {
+    if (file.status === 'archived') archived++;
+    else {
+      if (file.confirmed) confirmed++;
+      else draft++;
+      if (file.archived) localArchivedCopy++;
+    }
+  }
+  return { total: files.length, draft, confirmed, archived, localArchivedCopy };
+}
+
+function eventLifecycleMarkup(files) {
+  const summary = eventLifecycleSummary(files);
+  if (!summary.total) return '';
+  return `<div class="event-lifecycle" id="event-lifecycle" aria-label="파일 생애주기 요약">
+    <div class="event-lifecycle-counts small numbers"><span><strong>총 ${summary.total}개</strong></span>
+      <span class="lifecycle-item lifecycle-draft"><i aria-hidden="true"></i>초안 ${summary.draft}</span>
+      <span class="lifecycle-item lifecycle-confirmed"><i aria-hidden="true"></i>분류 확정 ${summary.confirmed}</span>
+      <span class="lifecycle-item lifecycle-archived"><i aria-hidden="true"></i>아카이브 보관 ${summary.archived}</span>
+      ${summary.localArchivedCopy ? `<span class="muted">· NAS 사본 보유 ${summary.localArchivedCopy}</span>` : ''}</div>
+    <div class="event-lifecycle-bar" aria-hidden="true">${['archived', 'confirmed', 'draft'].map(key => summary[key] ? `<span class="bar-${key}" style="flex:${summary[key]}"></span>` : '').join('')}</div></div>`;
 }
 
 function mountEventsPage() {
@@ -1210,7 +1289,11 @@ function mountEventsPage() {
           <select id="event-storage" aria-label="보관 위치 필터"><option value="">모든 위치</option><option value="available">로컬 보유</option><option value="archived">아카이브 보관</option></select>
           <select id="event-device" aria-label="촬영 장비 필터"></select>
           <select id="event-date" aria-label="촬영일 필터"></select>
-          <div class="event-tools-actions" id="event-tools-actions"></div>
+          <div class="event-tools-end"><div class="event-tools-actions" id="event-tools-actions"></div>
+            <div class="view-switch" id="event-view-switch" role="group" aria-label="이벤트 파일 보기 방식">
+              <button class="filter" type="button" data-action="event-view" data-value="table" aria-pressed="${view.eventView === 'table'}">${icon('table')} 표 보기</button>
+              <button class="filter" type="button" data-action="event-view" data-value="cards" aria-pressed="${view.eventView === 'cards'}">${icon('grid')} 카드 보기</button>
+            </div></div>
         </div>
         <div class="table-wrap" id="event-rows"></div>
         <div class="action-bar" id="event-actions"></div>
@@ -1219,12 +1302,20 @@ function mountEventsPage() {
 }
 
 function createEventRow(_file, parentTag) {
+  if (view.eventView === 'cards') return parseSingleElement(parentTag, '<li class="incoming-card event-card"><div class="card-image"><span class="thumb-slot"></span><span class="card-check-slot"></span></div><div class="card-caption"></div></li>');
   return parseSingleElement(parentTag, '<tr><td data-col="select"></td><td data-col="file"><div class="file-cell"><span class="thumb-slot"></span><div data-col="file-text"></div></div><div data-col="file-links"></div></td><td class="numbers muted" data-col="time"></td><td data-col="status"></td></tr>');
 }
 
 function patchEventRow(node, file, footageDate) {
-  setSlotHtml(node.querySelector('[data-col="select"]'), checkbox('event', file.id, `${file.name} 선택`, new Set()));
-  setSlotHtml(node.querySelector('.thumb-slot'), fileThumbnail(file, true, false, 'managed'));
+  const card = view.eventView === 'cards';
+  setSlotHtml(node.querySelector('.thumb-slot'), fileThumbnail(file, true, card, 'managed'));
+  const select = checkbox('event', file.id, `${file.name} 선택`, new Set());
+  if (card) {
+    setSlotHtml(node.querySelector('.card-check-slot'), `<label class="card-check"><span class="card-check-box">${select}</span></label>`);
+    setSlotHtml(node.querySelector('.card-caption'), eventCardCaption(file, footageDate));
+    return;
+  }
+  setSlotHtml(node.querySelector('[data-col="select"]'), checkHit(select));
   setSlotHtml(node.querySelector('[data-col="file-text"]'), `<strong>${escapeHtml(file.name)}</strong><span class="small muted">${escapeHtml(file.device || '장비 확인 필요')}</span>`);
   const links = node.querySelector('[data-col="file-links"]');
   setClass(links, 'file-links', Boolean(file.xmp || file.canDownload));
@@ -1232,27 +1323,32 @@ function patchEventRow(node, file, footageDate) {
   setSlotHtml(node.querySelector('[data-col="time"]'), `${file.time ? footageDate.format(new Date(file.time)) : '—'}
     ${file.timeSource ? `<div class="file-reason small">${escapeHtml(file.timeSource)}${file.timeVerified ? '' : ' · 확인 필요'}</div>` : ''}
     ${file.analysisError ? `<div class="file-reason small">${escapeHtml(file.analysisError)}</div>` : ''}
-    ${!file.timeVerified ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정" ${exclusiveActive() ? 'disabled' : ''}>촬영 시각 지정</button>` : ''}`);
+    ${!file.timeVerified && file.status !== 'archived' ? `<button type="button" class="time-edit-link" data-action="resolve-time" data-value="${escapeHtml(file.id)}" aria-label="${escapeHtml(file.name)} 촬영 시각 지정" ${exclusiveActive() ? 'disabled' : ''}>촬영 시각 지정</button>` : ''}`);
   setSlotHtml(node.querySelector('[data-col="status"]'), eventFileStatus(file));
 }
 
 function patchEventRows(event, filtered) {
   const container = page.querySelector('#event-rows');
-  const mode = filtered.length ? 'table' : 'empty';
+  const mode = filtered.length ? view.eventView : 'empty';
   if (container.dataset.mode !== mode) {
     container.dataset.mode = mode;
     slotHtmlCache.delete(container);
-    container.innerHTML = mode === 'empty' ? '' : '<table aria-label="이벤트별 파일"><thead><tr><th scope="col" data-col="select-all"></th><th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">분류 상태</th></tr></thead><tbody></tbody></table>';
+    container.innerHTML = mode === 'empty' ? '' : mode === 'cards'
+      ? '<div data-col="select-all"></div><ul class="incoming-cards event-cards" id="event-cards" aria-label="이벤트 파일 카드 목록"></ul>'
+      : '<table aria-label="이벤트별 파일"><thead><tr><th scope="col" data-col="select-all"></th><th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">분류 상태</th></tr></thead><tbody></tbody></table>';
   }
   if (mode === 'empty') {
     const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
     setSlotHtml(container, emptyState('video', '표시할 사진·영상이 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : ''));
     return;
   }
-  setSlotHtml(container.querySelector('[data-col="select-all"]'), checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set()));
+  const selectAll = checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set());
+  setSlotHtml(container.querySelector('[data-col="select-all"]'), mode === 'cards'
+    ? `<label class="card-select-all">${selectAll} 표시된 이벤트 파일 모두 선택</label>` : checkHit(selectAll));
   const parent = event?.parent ? eventById(event.parent) : event;
   const footageDate = dateTimeFormatter(parent?.zone || state.timezone);
-  reconcileKeyedChildren(container.querySelector('tbody'), 'tbody', filtered, file => file.id, createEventRow,
+  const listTag = mode === 'cards' ? 'ul' : 'tbody';
+  reconcileKeyedChildren(container.querySelector(listTag), listTag, filtered, file => file.id, createEventRow,
     (node, file) => patchEventRow(node, file, footageDate));
 }
 
@@ -1286,6 +1382,7 @@ function syncEventSelection(event = eventById(view.eventId), filtered = filtered
     ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || remoteBusy(), extra: offloadable.length ? '' : 'hidden' })}
     </div><div class="action-bar-buttons action-bar-primary" ${selected ? '' : 'hidden'}>${confirmButton}</div>`);
   updateEventActions();
+  syncStickyActionBar();
 }
 
 function patchEventsPage() {
@@ -1304,7 +1401,7 @@ function patchEventsPage() {
   const filtered = filteredEventFiles(files);
   const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
   setSlotHtml(page.querySelector('#event-heading'), `<div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 파일')}</h2>
-    <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div></div>
+    <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div>${eventLifecycleMarkup(files)}</div>
     ${event ? `<div class="event-header-actions">${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}${button('edit-event', event.parent ? '소분류 수정' : '이벤트 수정', { glyph: 'edit' })}${button('delete-event', event.parent ? '소분류 삭제' : '이벤트 삭제', { glyph: 'trash', danger: true })}</div>` : ''}`);
   const search = page.querySelector('#event-search');
   if (search.value !== view.eventQuery) search.value = view.eventQuery;
@@ -1318,6 +1415,9 @@ function patchEventsPage() {
   const date = page.querySelector('#event-date');
   setSlotHtml(date, `<option value="">모든 촬영일</option>${dates.map(day => `<option value="${day}">${day}</option>`).join('')}`);
   if (date.value !== view.eventDate) date.value = view.eventDate;
+  for (const control of page.querySelectorAll('#event-view-switch button')) {
+    control.setAttribute('aria-pressed', String(control.dataset.value === view.eventView));
+  }
   patchEventRows(event, filtered);
   syncEventSelection(event, filtered);
 }
@@ -1416,7 +1516,7 @@ function archivePage() {
   const entries = sourceEntries();
   const allAssets = entries.flatMap(entry => entry.assets);
   const busy = remoteBusy() || view.uploadStarting;
-  return `${header('아카이브 전송', '보낼 항목 (로컬)을 선택해 업로드하거나 원격 아카이브 (NAS)로 드래그하세요.', '')}
+  return `${header('아카이브 전송', '보낼 항목 (로컬)을 선택하고 원격 아카이브 (NAS) 대상 폴더로 이동한 뒤 업로드를 누르세요. 데스크톱에서는 드래그로도 전송할 수 있습니다.', '')}
     ${uploadStatus()}${remoteIndexStatus()}
     <div class="split">
       <section class="surface browser" aria-labelledby="source-title">
@@ -1433,17 +1533,17 @@ function archivePage() {
           const selected = entry.assets.every(key => view.sourceSelection.has(key));
           const selection = checkbox('source', String(index), `${entry.name} 업로드 선택`, new Set(selected ? [String(index)] : []));
           const attributes = `draggable="${!busy}" data-source-index="${index}" class="tree-row${selected ? ' source-selected' : ''}"`;
-          if (entry.file) return `<li ${attributes}>${selection}
+          if (entry.file) return `<li ${attributes}>${checkHit(selection)}
             <span class="tree-file">${icon(entry.file.kind === 'xmp' ? 'file' : entry.file.kind)}${name}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
           </li>`;
-          return `<li ${attributes}>${selection}
+          return `<li ${attributes}>${checkHit(selection)}
             <button type="button" class="tree-button" data-action="open-source" data-value="${index}">${icon('folder')}<span>${name}</span>${icon('right')}</button>
             <span class="meta">${entry.members.length}개</span>
           </li>`;
         }).join('')}</ul>` : emptyState('folder', '표시할 파일이 없습니다.', '이벤트 분류에서 분류를 확정하세요.')}
       </section>
       <section class="surface browser archive-destination" aria-labelledby="destination-title" ${view.archive && !view.archiveBusy && !busy ? `data-archive-drop="${escapeHtml(view.archivePath)}"` : ''}>
-        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} 원격 아카이브 (NAS)</h2><p class="small muted">${view.archive ? '현재 폴더에 업로드 · 하위 폴더에 놓으면 해당 폴더로 전송' : 'NAS 원격 폴더 연결'}</p></div>
+        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} 원격 아카이브 (NAS)</h2><p class="small muted">${view.archive ? '대상 폴더로 이동한 뒤 보낼 항목의 업로드를 누르거나 여기로 드래그하세요' : 'NAS 원격 폴더 연결'}</p></div>
           <div class="archive-actions">
             ${view.archive ? button('open-remote-index', '원격 인덱싱', { glyph: 'search', disabled: busy || view.archiveBusy }) : ''}
             ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
@@ -1677,8 +1777,44 @@ function catalogTime(value) {
 }
 
 function catalogHash(row) {
-  return `<div class="catalog-hash"><code>${escapeHtml(row.sha || '해시 미기록')}</code>
+  return `<div class="catalog-hash">${row.sha ? `<code class="catalog-hash-code" title="${escapeHtml(row.sha)}">${escapeHtml(shortHash(row.sha))}</code>` : '<code>해시 미기록</code>'}
     ${row.sha ? button('copy-record-hash', '복사', { glyph: 'copy', extra: `data-value="${escapeHtml(row.sha)}" aria-label="${escapeHtml(row.name)} SHA-256 복사"` }) : ''}</div>`;
+}
+
+function shortHash(sha) {
+  if (!sha) return '해시 미기록';
+  return sha.length > 12 ? `${sha.slice(0, 12)}…` : sha;
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text ?? '');
+  if (!value) throw new Error('복사할 내용이 없습니다.');
+  if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // HTTP LAN or denied clipboard access: try the browser's copy command.
+    }
+  }
+  if (typeof document.execCommand === 'function') {
+    const previousFocus = document.activeElement;
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.setAttribute('style', 'position:fixed;top:0;left:-9999px;opacity:0');
+    document.body.appendChild(textarea);
+    try {
+      if (typeof textarea.focus === 'function') textarea.focus();
+      if (typeof textarea.select === 'function') textarea.select();
+      if (typeof textarea.setSelectionRange === 'function') textarea.setSelectionRange(0, value.length);
+      if (document.execCommand('copy')) return;
+    } finally {
+      textarea.remove();
+      if (previousFocus?.isConnected && typeof previousFocus.focus === 'function') previousFocus.focus({ preventScroll: true });
+    }
+  }
+  throw new Error('클립보드에 복사할 수 없습니다. 브라우저의 클립보드 권한 또는 연결 환경을 확인하세요.');
 }
 
 function catalogFolderLabel() {
@@ -1823,19 +1959,19 @@ function catalogPage() {
       ${view.catalogBusy && !view.catalogSoftLoading ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
         <thead><tr><th scope="col">${remote ? '원격 파일 / 경로' : '파일 / 경로'}</th><th scope="col">SHA-256</th><th scope="col">${remote ? '분류 / 크기' : archives ? '아카이브 목적지' : '분류 / 크기'}</th><th scope="col">${remote ? '인덱스 상태 / 검증 시각' : archives ? '검증 결과 / 시각' : '파일 상태'}</th></tr></thead>
         <tbody>${data.rows.map(row => remote ? `<tr>
-          <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path mono">${escapeHtml(row.remote_path)}</div>
+          <td class="catalog-cell-file" data-label="${remote ? '원격 파일 / 경로' : '파일 / 경로'}"><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path mono">${escapeHtml(row.remote_path)}</div>
             ${row.archive_root ? `<div class="small muted catalog-path mono">${escapeHtml(row.archive_root)}</div>` : ''}</td>
-          <td>${catalogHash(row)}</td>
-          <td><div>${row.in_catalog ? '카탈로그 연동됨' : '원격 전용'}</div><div class="small muted">${row.kind === 'xmp' ? 'XMP' : row.kind === 'video' ? '영상' : '사진'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div></td>
-          <td><span class="status ${row.status === 'present' ? 'archived' : 'review'}">${row.status === 'present' ? '보관 중' : '누락됨'}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.last_seen_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.remote_path)}" target="_blank" rel="noopener">다운로드</a>` : ''}</td>
+          <td class="catalog-cell-hash" data-label="SHA-256">${catalogHash(row)}</td>
+          <td class="catalog-cell-meta" data-label="분류 / 크기"><div>${row.in_catalog ? '카탈로그 연동됨' : '원격 전용'}</div><div class="small muted">${row.kind === 'xmp' ? 'XMP' : row.kind === 'video' ? '영상' : '사진'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div></td>
+          <td class="catalog-cell-status" data-label="인덱스 상태 / 검증 시각"><span class="status ${row.status === 'present' ? 'archived' : 'review'}">${row.status === 'present' ? '보관 중' : '누락됨'}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.last_seen_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.remote_path)}" target="_blank" rel="noopener">다운로드</a>` : ''}</td>
         </tr>` : `<tr>
-          <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path">${escapeHtml((archives || row.location === 'managed' ? 'managed/' : 'incoming/') + row.local_path)}</div>
+          <td class="catalog-cell-file" data-label="${remote ? '원격 파일 / 경로' : '파일 / 경로'}"><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path">${escapeHtml((archives || row.location === 'managed' ? 'managed/' : 'incoming/') + row.local_path)}</div>
             ${row.original_path ? `<div class="small muted catalog-path">원본: incoming/${escapeHtml(row.original_path)}</div>` : ''}
             ${archives ? `<div class="small muted">작업 #${row.job_id} · ${row.kind === 'xmp' ? 'XMP' : '원본'} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>` : ''}</td>
-          <td>${catalogHash(row)}</td>
-          <td>${archives ? `<div class="catalog-path mono">${escapeHtml(row.archive_root ? [row.archive_root.replace(/\/$/, ''), row.target].join('/') : row.target || '목적지 미기록')}</div>${!row.archive_root ? '<div class="small muted">아카이브 루트 미기록</div>' : ''}` :
+          <td class="catalog-cell-hash" data-label="SHA-256">${catalogHash(row)}</td>
+          <td class="catalog-cell-meta" data-label="${archives ? '아카이브 목적지' : '분류 / 크기'}">${archives ? `<div class="catalog-path mono">${escapeHtml(row.archive_root ? [row.archive_root.replace(/\/$/, ''), row.target].join('/') : row.target || '목적지 미기록')}</div>${!row.archive_root ? '<div class="small muted">아카이브 루트 미기록</div>' : ''}` :
             `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted">${escapeHtml(row.kind === 'xmp' ? 'XMP' : row.device || '장비 미확인')} · ${sizeLabel(row.size === null ? null : row.size / 1_000_000)}</div>`}</td>
-          <td>${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.target)}" target="_blank" rel="noopener">다운로드</a>` : ''}${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
+          <td class="catalog-cell-status" data-label="${archives ? '검증 결과 / 시각' : '파일 상태'}">${archives ? `<span class="status ${['uploaded', 'skipped', 'legacy_verified'].includes(row.outcome) ? 'ready' : row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(outcomes[row.outcome] || row.outcome)}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.target)}" target="_blank" rel="noopener">다운로드</a>` : ''}${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}` :
             `<span class="status ${row.status === 'available' ? 'ready' : row.status === 'archived' ? 'archived' : 'draft'}">${escapeHtml(statuses[row.status] || row.status)}</span>${row.location === 'managed' && row.status !== 'archived' ? `<div class="small muted">${row.confirmed ? '분류 확정' : '분류 미확정'}</div>` : ''}${row.has_archive ? '<div class="small muted">아카이브 검증 기록 있음</div>' : ''}${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(row.download_path)}" target="_blank" rel="noopener">아카이브 다운로드</a>` : ''}`}</td>
         </tr>`).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : hasFilter ? '조건에 맞는 기록이 없습니다.' : remote ? '인덱싱된 원격 파일이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', remote ? '아카이브 전송 페이지에서 원격 스토리지에 연결한 뒤 원격 인덱싱을 실행하세요.' : archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : '가져오기에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
       </div>
@@ -2182,11 +2318,7 @@ function regenerateStorageKey() {
 
 async function copyStorageKey() {
   if (!view.publicKeyToCopy || view.keyCopiedLocally) return;
-  try {
-    await navigator.clipboard.writeText(view.publicKeyToCopy);
-  } catch {
-    throw new Error('클립보드에 복사할 수 없습니다. 브라우저의 클립보드 권한을 확인하세요.');
-  }
+  await copyTextToClipboard(view.publicKeyToCopy);
   view.keyCopiedLocally = true;
   view.publicKeyToCopy = null;
   view.settings = await api('settings/ssh-key/copied', 'POST');
@@ -2298,6 +2430,8 @@ function clearCatalogViews() {
   Object.assign(view.jobs, { items: [], summary: null, nextBeforeId: null, hasMore: false, busy: false, loadingMore: false, loadedOnce: false, error: '' });
   view.jobsExpanded.clear();
   view.incomingLayout = 'table';
+  view.eventView = 'table';
+  try { localStorage.removeItem('photo-saver-event-view'); } catch { /* Storage may be unavailable. */ }
   view.incomingTab = 'files';
   try { localStorage.removeItem('photo-saver-incoming-layout'); } catch { /* Storage may be unavailable. */ }
   resetArchiveConnection(); view.catalogTab = 'files';
@@ -2624,6 +2758,7 @@ function render() {
   }
   document.title = `${current.title} · Photo Saver`;
   if (view.page === 'archive') syncSourceSelection();
+  syncStickyActionBar();
   if (pageChanged) {
     pendingPreviewFocus = null;
     window.scrollTo(0, 0);
@@ -3317,6 +3452,12 @@ const actions = {
     }
   },
   'preview-incoming': openIncomingPreview,
+  'event-view'(value) {
+    if (!['table', 'cards'].includes(value) || view.eventView === value) return;
+    view.eventView = value;
+    page.querySelector('#event-rows')?.scrollTo(0, 0);
+    try { localStorage.setItem('photo-saver-event-view', value); } catch { /* Keep the in-memory preference. */ }
+  },
   'preview-managed': openManagedPreview,
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
@@ -3349,7 +3490,16 @@ const actions = {
   'move-event': moveEvent,
   'edit-media'() { editMedia(); },
   'offload-media': confirmOffload,
-  'resolve-time'(id) { editMedia([id], true); },
+  'edit-media-time'(id) {
+    const file = state.managed.find(item => item.id === id);
+    if (!file || file.status === 'archived') return;
+    editMedia([id], !file.timeVerified);
+  },
+  'resolve-time'(id) {
+    const file = state.managed.find(item => item.id === id);
+    if (!file || file.status === 'archived') return;
+    editMedia([id], true);
+  },
   'confirm-event': confirmEvent,
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); view.sourceSelection.clear(); },
   'source-up'() { view.sourcePath.pop(); view.sourceSelection.clear(); },
@@ -3388,7 +3538,7 @@ const actions = {
   'refresh-catalog': loadCatalog,
   'catalog-tab'(tab) { view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; return loadCatalog(); },
   'catalog-page'(value) { view.catalogPage = Math.max(1, Number(value)); return loadCatalog(); },
-  async 'copy-record-hash'(value) { await navigator.clipboard.writeText(value); announce('SHA-256을 복사했습니다.'); },
+  async 'copy-record-hash'(value) { await copyTextToClipboard(value); announce('SHA-256을 복사했습니다.'); },
   'connect-archive'() { return browseArchive(); },
   'open-archive'(value) {
     const entry = view.archive?.entries[Number(value)];
@@ -3411,13 +3561,15 @@ page.addEventListener('click', async event => {
     return;
   }
   if (control.dataset.action === 'cancel-incoming-upload') { await cancelIncomingUpload(); return; }
+  const wasDisabled = control.disabled;
   try {
     control.disabled = true;
     await actions[control.dataset.action](control.dataset.value);
   } catch (error) {
     announce(error.message);
   } finally {
-    control.disabled = control.getAttribute('disabled') !== null;
+    // In browsers, assigning .disabled also adds the disabled attribute.
+    control.disabled = wasDisabled;
     if (!dialog.open && !mediaPreview.open) render();
   }
 });
@@ -3609,6 +3761,7 @@ page.addEventListener('keydown', event => {
   const card = event.target.closest('[data-card-preview]');
   if (!card) return;
   if (event.key === 'Delete' || event.key === 'Backspace') {
+    if (card.dataset.action !== 'preview-incoming') return;
     const file = state.incoming.find(item => item.id === card.dataset.value);
     if (!file || !canDeleteIncoming(file) || localBusy()) return;
     event.preventDefault();
@@ -3619,6 +3772,7 @@ page.addEventListener('keydown', event => {
     return;
   }
   const grid = card.closest('.incoming-cards');
+  if (!grid) return;
   const columns = getComputedStyle(grid).gridTemplateColumns.split(' ').length;
   const directions = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -columns, ArrowDown: columns };
   const direction = directions[event.key];

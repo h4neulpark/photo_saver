@@ -47,7 +47,8 @@ photo_saver/
 │   ├── test_incoming_upload.cjs # 기기 업로드·진행률·결과 상태·취소 테스트
 │   ├── test_folder_trees.cjs # 폴더 트리·CSS·스크롤 계약
 │   ├── test_phase1_ui.cjs # 결과 배너·작업 내역·기록 탭
-│   └── test_phase2_ui.cjs # 14개 Phase 2 UI·자동 연결·경로 회귀
+│   ├── test_phase2_ui.cjs # 14개 Phase 2 UI·자동 연결·경로 회귀
+│   └── test_phase3_ui.cjs # 16개 이벤트 카드·터치·기록 카드·복사 폴백 회귀
 └── docs/                   # 현재 구현 문서
 ```
 
@@ -91,7 +92,8 @@ node --check frontend/test_incoming_upload.cjs
 node --check frontend/test_folder_trees.cjs
 node --check frontend/test_phase1_ui.cjs
 node --check frontend/test_phase2_ui.cjs
-node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs frontend/test_folder_trees.cjs frontend/test_phase1_ui.cjs frontend/test_phase2_ui.cjs
+node --check frontend/test_phase3_ui.cjs
+node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs frontend/test_folder_trees.cjs frontend/test_phase1_ui.cjs frontend/test_phase2_ui.cjs frontend/test_phase3_ui.cjs
 git diff --check
 ```
 
@@ -110,6 +112,12 @@ curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/state | python3 -c "imp
 Phase 1 검증(2026-11-25): 프론트엔드 **80개**(기존 59개 + Phase 1 21개), 백엔드 **162개**(jobs API 9개 포함)가 통과했다. 기존 폴더 트리 함수·액션·9개 CSS 규칙과 `test_folder_trees.cjs`는 작업 시작 상태와 동일함을 별도로 비교했다. 운영 API는 healthy, worker/frontend는 Up, jobs는 HTTP 200과 no-store 및 전체 집계를 반환했다. 배포된 Incoming·작업 내역·이벤트 관리·파일 기록을 Chrome 320·390·768·1280px에서 확인했고, 긴 경로 실패 배너와 실시간 작업은 브라우저 메모리 fixture로 추가 확인했다. 24개 레이아웃 검사에서 가로 넘침·컨트롤 클리핑·앱 콘솔 오류가 없었다(기존 favicon 404는 별도 제외).
 
 Phase 1 리뷰 수정 Round 1(2026-11-25): 프론트엔드 **87개**(Phase 1 28개 포함), 백엔드 **163개**(jobs API 10개 포함)가 통과했다. 첫 페이지 갱신 시 필터 이탈 작업 제거와 커서 갱신·과거 페이지 보존, 활성 상태의 hasAttention 제외, Incoming 후속 액션 순서·재사용 ID의 상세 펼침 독립성, 혼합 ISO 시각·동률 ID 정렬 회귀를 추가했다. 운영 API·worker 재빌드 후 API healthy와 `/api/health`, `/api/jobs?limit=5`의 HTTP 200·no-store를 재확인했다.
+
+Phase 3 검증(2026-11-25): 프론트엔드 **117개**(기존 101개 + `test_phase3_ui.cjs` 16개), 네트워크 차단·읽기 전용 임시 컨테이너의 백엔드 **163개**가 통과했다. 8개 JavaScript/CJS 파일의 `node --check`와 `git diff --check`를 확인했다. 기준 `88ba68f` 대비 기존 프론트엔드 테스트 6개, `backend/*`, `frontend/index.html`, `compose.yaml`은 0줄 변경이다. 운영 `/api/health`의 `{"status":"ok"}` 및 HTTP 응답 `app.js`·`styles.css`와 로컬 파일의 SHA-256 일치를 확인했다.
+
+이벤트 카드는 단일 `#event-rows`의 모드를 전환하고 키 기반 목록 조정·WeakMap 슬롯 캐시로 폴링·선택·검색·확정·재정렬 시 변경 없는 썸네일 노드를 보존한다. 기본 보기 방식은 표이며 `photo-saver-event-view`에 저장한다. 생애주기 집계는 `status === 'archived'`를 먼저 분기하여 분류 확정 수와 중복되지 않는다. 관리 카드의 Delete/Backspace는 Incoming 삭제를 시작하지 않고, 로컬 원본을 비운 파일은 개별 시각 수정을 차단한다. 파일 기록은 단일 표 DOM에 `data-label`을 추가하여 760px 이하에서 카드로 전환하며, 전체 해시는 `title`·복사 값에 유지한다. 공개키·SHA 복사는 Clipboard API가 없거나 거부되면 임시 readonly textarea와 `execCommand`로 폴백하고 포커스를 복원한다.
+
+Chrome 320×844·390×844·768×1024·1280×800에서 운영 6개 페이지 24개, 메모리 fixture 24개 및 카드·선택·아카이브·기록 3탭·200% 브랜드/상태 글꼴을 포함해 **73개 레이아웃**을 측정했다. 문서 가로 넘침·브랜드/상태 겹침·카드 클리핑·앱 콘솔 오류는 0건(favicon 404 제외)이며, 이벤트 카드 열 수는 각각 **2 / 2 / 2 / 4**다. 모바일 내비게이션과 카드 체크 영역의 44px 크기, 체크 선택과 미리보기 클릭 분리, 방향키·삭제 키 가드, 모달 Top Layer, 생애주기 12 = 2 + 9 + 1, 기록 3탭의 표/카드 전환·해시·44px 복사/다운로드, HTTP LAN Clipboard 미지원 모의 폴백 성공을 확인했다. 모바일 선택 바는 0건에서 static, 선택 후 fixed·bottom 0이며 마지막 카드와 알림이 가려지지 않는다. 320px 이벤트 선택 바는 이동/비우기 도구가 있을 때 226px까지 커지므로 ResizeObserver로 실제 높이를 측정해 기본 168px 목록 여백과 140px 알림 간격을 보강한다. 클릭 후 임시 `.disabled` 속성도 원래 상태로 복원하여 실제 브라우저에서 버튼이 잠긴 채 남는 문제를 방지한다. 디자인 탐지기의 4개 경고는 기존 결과 배너 3개와 위험 구역 4px 경계선 1개이며, Phase 3 변경에서 새 경고는 없다. 운영 데이터나 NAS 파일을 쓰는 동작은 실행하지 않았다.
 
 Phase 2 검증(2026-11-25): 프론트엔드 **101개**(기존 87개 + `test_phase2_ui.cjs` 14개), 네트워크 차단·읽기 전용 임시 컨테이너의 백엔드 **163개**가 통과했다. 7개 JavaScript 파일의 `node --check`와 `git diff --check`를 확인했다. 기존 테스트 수정은 미리보기 2줄과 Phase 1 1줄의 승인된 문자열 갱신에 한정했으며, `backend/*`, `index.html`의 5개 루트 ID, Compose, 나머지 테스트 및 폴더 트리 CSS 규칙은 보존했다.
 
