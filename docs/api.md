@@ -50,6 +50,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | --- | --- | --- | --- |
 | GET | `/api/health` | 없음 | `{"status":"ok"}` |
 | GET | `/api/state` | 없음 | 기본 시간대, 최근 완료 검사, Incoming, 마지막 작업, 이벤트, 보관 파일, 대기 XMP |
+| GET | `/api/jobs` | `limit`, `before_id`, `lane`, `status`, `kind` | 최신 작업 내역·커서·전체 집계, `Cache-Control: no-store` |
 | POST | `/api/jobs/scan` | 없음 | `202 {"id":작업ID,"lane":"local"}`. `scan` 등록 |
 | POST | `/api/jobs/move` | `{"ids":["파일ID"]}` | `202`. 최근 완료 검사에서 `ready`인 원본만 이동 등록 |
 | POST | `/api/jobs/delete` | `{"ids":["파일ID"]}` | `202`. 최근 검사에서 `ready`·`duplicate`인 사진만 삭제 등록 |
@@ -79,7 +80,41 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 
 `scan`·`move`·`delete`·`duplicate-cleanup`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 활성 중복 정리에서 남길 managed 사본도 offload 대상으로 등록할 수 없다. 취소 API는 명시한 작업 ID에만 적용한다.
 
-작업 표현은 `id`, `kind`, `lane`, `status`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
+작업 표현은 `id`, `kind`, `lane`, `status`, `createdAt`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
+
+### 작업 내역: `GET /api/jobs`
+
+`view_job`은 `/api/state`와 작업 응답에 `createdAt`(DB `created_at`)을 제공한다. 손상된 JSON, NULL, 배열 등 객체가 아닌 `result`는 `{}`로 응답한다.
+
+| 쿼리 | 기본값 | 허용값 |
+| --- | --- | --- |
+| `limit` | `30` | 정수 1–100 |
+| `before_id` | 없음 | 1 이상 ID. `id < before_id` 조회 |
+| `lane` | `all` | `all`, `local`, `remote`, `exclusive` |
+| `status` | `all` | `all`, `active`, `attention`, `done`, `failed`, `cancelled` |
+| `kind` | `all` | `all`, `scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
+
+잘못된 쿼리는 HTTP 422다. ID 내림차순으로 최대 `limit`건을 반환하고, 다음 페이지가 있을 때 `hasMore: true`, `nextBeforeId: 마지막 반환 ID`를 제공한다. 마지막 페이지의 `nextBeforeId`는 `null`이다. 커서는 새 작업이 추가되어도 앞 페이지와 중복되지 않는다.
+
+```json
+{
+  "jobs": [{
+    "id": 12, "kind": "move", "lane": "local", "status": "done",
+    "createdAt": "2026-11-25T00:00:00+00:00", "finishedAt": "2026-11-25T00:01:00+00:00",
+    "result": {"moved": 1, "items": [{"path": "photo.jpg", "status": "moved"}]},
+    "hasAttention": false,
+    "resultMeta": {"itemsTotal": 1, "itemsShown": 1, "itemsTruncated": false,
+      "errorsTotal": 0, "errorsShown": 0, "errorsTruncated": false,
+      "unmatchedCompanionsTotal": 0, "unmatchedCompanionsShown": 0, "unmatchedCompanionsTruncated": false}
+  }],
+  "nextBeforeId": null, "hasMore": false,
+  "summary": {"total": 1, "active": 0, "attention": 0, "done": 1}
+}
+```
+
+`active`는 queued/running이다. `attention`은 종료한 작업 중 failed/cancelled이거나 `result.error`가 있거나 `failed`·`review`·`companionReview`가 0보다 큰 경우다. `done` 필터는 상태가 done인 모든 작업을 포함하므로 확인 필요 작업도 포함될 수 있다. `hasAttention`은 같은 판정을 각 항목에 제공한다. `summary`는 현재 필터·커서와 무관한 전체 서버 작업 집계이며 빈 DB에서는 모두 0이다. 기기 업로드는 서버 작업을 생성하지 않으므로 이 API에 포함되지 않는다.
+
+응답은 `payload`를 조회하거나 반환하지 않는다. `result.items`, `result.errors`, `result.unmatchedCompanions`는 각각 최대 100건이며 DB 원본은 변경하지 않는다. `items`가 100건을 넘으면 moved/deleted/cleaned/linked 이외 항목과 객체가 아닌 항목을 우선 표시한다. `resultMeta`는 전체·표시 건수·절단 여부를 제공하며 items/errors의 6개 키는 항상 포함한다. 이력 응답에는 `Cache-Control: no-store`를 적용한다.
 
 중복 정리 계획은 `groups`를 돌려준다. 그룹에는 `sha`, 선택한 `files` (`id`·`path`·`sizeBytes`), 남길 수 있는 `keepers` (`kind`·`id`·`path`, 원격 검증 시각 `verifiedAt`)가 있다. 사본 종류는 `managed`·`remote`·`incoming`이며, 정리 등록 시 그룹별로 같은 사본을 지정한다. `incoming` 사본 ID는 정리 대상에서 제외해야 한다. 계획은 DB 조회 결과이며 실제 파일 검증은 작업 실행 시 수행한다. 중복 정리 결과는 `cleaned`·`review`·`freedBytes` 집계와 파일별 `items`의 경로·상태·사유를 포함한다.
 

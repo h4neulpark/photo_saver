@@ -69,7 +69,7 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
   -v "$PWD/backend:/app:ro" \
   -w /app \
   photo-saver-backend-tests \
-  python -m unittest test_concurrency -v
+  python -m unittest test_jobs_api -v
 
 docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
   -v "$PWD/backend:/app:ro" \
@@ -84,9 +84,26 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
 node --check frontend/app.js
 node --check frontend/test_media_preview.cjs
 node --check frontend/test_job_concurrency.cjs
-node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs
+node --check frontend/test_incoming_upload.cjs
+node --check frontend/test_folder_trees.cjs
+node --check frontend/test_phase1_ui.cjs
+node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs frontend/test_folder_trees.cjs frontend/test_phase1_ui.cjs
 git diff --check
 ```
+
+운영 반영과 읽기 전용 스모크는 다음과 같이 실행한다.
+
+```sh
+docker compose up -d --build api worker
+docker compose ps
+curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/health
+curl -fsS -D - "http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/jobs?limit=5" | head -n 30
+curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/state | python3 -c "import sys,json; d=json.load(sys.stdin); print('state ok, keys:', sorted(d.keys()))"
+```
+
+Phase 1 검증(2026-11-25): 프론트엔드 **80개**(기존 59개 + Phase 1 21개), 백엔드 **162개**(jobs API 9개 포함)가 통과했다. 기존 폴더 트리 함수·액션·9개 CSS 규칙과 `test_folder_trees.cjs`는 작업 시작 상태와 동일함을 별도로 비교했다. 운영 API는 healthy, worker/frontend는 Up, jobs는 HTTP 200과 no-store 및 전체 집계를 반환했다. 배포된 Incoming·작업 내역·이벤트 관리·파일 기록을 Chrome 320·390·768·1280px에서 확인했고, 긴 경로 실패 배너와 실시간 작업은 브라우저 메모리 fixture로 추가 확인했다. 24개 레이아웃 검사에서 가로 넘침·컨트롤 클리핑·앱 콘솔 오류가 없었다(기존 favicon 404는 별도 제외).
+
+Phase 1 리뷰 수정 Round 1(2026-11-25): 프론트엔드 **87개**(Phase 1 28개 포함), 백엔드 **163개**(jobs API 10개 포함)가 통과했다. 첫 페이지 갱신 시 필터 이탈 작업 제거와 커서 갱신·과거 페이지 보존, 활성 상태의 hasAttention 제외, Incoming 후속 액션 순서·재사용 ID의 상세 펼침 독립성, 혼합 ISO 시각·동률 ID 정렬 회귀를 추가했다. 운영 API·worker 재빌드 후 API healthy와 `/api/health`, `/api/jobs?limit=5`의 HTTP 200·no-store를 재확인했다.
 
 한 부문만 실행할 때는 마지막 백엔드 명령을 `python -m unittest test_transfers -v`처럼 지정한다. 테스트는 외부 SSH·OMV 연결을 모의 객체 또는 로컬 SFTP 대역으로 대체한다.
 
@@ -100,6 +117,8 @@ Incoming 회귀 테스트는 실제 FastAPI HTTP 경로의 중복 정리 계획�
 
 | 파일 | 주요 검증 |
 | --- | --- |
+| [test_jobs_api.py](../backend/test_jobs_api.py) | 작업 내역 HTTP 검증, 전체 집계·빈 DB, keyset 커서, 필터, 손상 JSON, payload 비노출, 상세 100건 절단·우선순위 |
+| [test_phase1_ui.cjs](../frontend/test_phase1_ui.cjs) | 결과 닫기·저장소 오류·재사용 ID, 기기 이력 상한, 작업 내역 영속 셸·상세 DOM·요청 순서·페이지 보존·실시간 전환, 이벤트 단일 확정, 탭 키보드·IME·검색 debounce |
 | [test_incoming_cleanup.py](../backend/test_incoming_cleanup.py) | 로컬·같은 검사·원격 사본 선택, 원격 범위와 SHA-256, 변경·누락·연결 실패, 배치 중 SFTP 단절 후 채널 재사용 방지·로컬 정리 지속, 연결 종료 예외에도 완료 결과·그룹 갱신 보존, 삭제 직전 원격 404→409 변환, 중단 후 재실행, 동반 파일 보존 |
 | [test_incoming_workflow.py](../backend/test_incoming_workflow.py) | 검사 단계와 파일 수, 2단계 파일 변경 시 낡은 SHA·지문·썸네일 제거, 중복→이동 가능 승격 시 XMP·보조 파일 계획과 scan_xmp 정합성, 모호한 보조 파일 보존, 이동·삭제·XMP 파일별 결과, 이미 보관된 XMP |
 | [test_concurrency.py](../backend/test_concurrency.py) | 구버전 jobs 레인 마이그레이션·인덱스·직접 SQL 트리거, 전체 충돌 매트릭스, 실제 1+1 스레드 병렬 처리·배리어·중단 대기·재시작 복구, offload 중 scan/move/delete·XMP 경합과 원복, 신규·변경 XMP 연결 거부 및 조회 후 상태 전이에도 scan 완료·기존 XMP 보존, 썸네일 보존, SQLite 동시 쓰기, 백업·복원 배타 잠금·구버전 복원, 다중 레인 state |

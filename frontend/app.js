@@ -1,6 +1,7 @@
 'use strict';
 
 const icons = {
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   aperture: '<circle cx="12" cy="12" r="9"/><path d="M14.3 3.3 9.4 12m11.4-2.3H10.9m7.5 8.9-4.9-8.6M9.7 20.7l4.9-8.7M3.2 14.3h9.9M5.6 5.4l4.9 8.6"/>',
   inbox: '<path d="M4 4h16l2 11v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-4L4 4Z"/><path d="M2 15h6l2 2h4l2-2h6"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18m-13 5h2m4 0h2"/>',
@@ -45,6 +46,7 @@ const navigation = [
   { id: 'events', title: '이벤트 관리', icon: 'calendar' },
   { id: 'archive', title: '아카이브 전송', icon: 'transfer' },
   { id: 'catalog', title: '파일 기록', icon: 'file' },
+  { id: 'jobs', title: '작업 내역', icon: 'clock' },
   { id: 'settings', title: '설정', icon: 'settings' },
 ];
 
@@ -66,7 +68,10 @@ function savedIncomingLayout() {
 
 const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
-  deviceUpload: { open: false, folder: '', autoScan: true, running: false, cancelling: false, activeUploadId: null, abortController: null, totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, batchId: 0, results: [], scanNote: '' },
+  dismissedResults: loadDismissedResults(), resultDetailsOpen: new Map(), deviceUploadHistory: loadDeviceUploadHistory(),
+  jobs: { items: [], summary: null, nextBeforeId: null, hasMore: false, statusFilter: 'all', laneFilter: 'all', busy: false, loadingMore: false, error: '', loadedOnce: false },
+  jobsExpanded: new Set(),
+  deviceUpload: { open: false, folder: '', autoScan: true, running: false, cancelling: false, activeUploadId: null, abortController: null, totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, batchId: 0, dismissedBatchId: 0, startedAt: null, results: [], scanNote: '' },
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), preview: null, cleanupPlanning: false,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
@@ -82,6 +87,9 @@ const view = {
 let refreshTimer;
 let stateRequest = 0;
 let catalogRequest = 0;
+let jobsRequest = 0;
+let catalogSearchTimer;
+let catalogComposing = false;
 let devicesRequest = 0;
 let previewMediaGeneration = 0;
 let pendingPreviewFocus = null;
@@ -195,6 +203,86 @@ async function api(path, method = 'GET', data) {
 const jobLanes = { scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
+const MAX_DISMISSED_RESULTS = 100;
+function jobDismissKey(job) {
+  if (!job || job.id == null) return '';
+  if (job.createdAt) return `${job.id}:${job.createdAt}`;
+  if (job.finishedAt) return `${job.id}:${job.finishedAt}`;
+  return `${job.id}:${job.kind || ''}:${job.status || ''}`;
+}
+function loadDismissedResults() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('photo-saver-dismissed-results-v1'));
+    return new Set(saved?.version === 1 && Array.isArray(saved.keys) ? saved.keys.filter(key => typeof key === 'string').slice(-100) : []);
+  } catch { return new Set(); }
+}
+function saveDismissedResults(set) {
+  try { localStorage.setItem('photo-saver-dismissed-results-v1', JSON.stringify({ version: 1, keys: [...set].slice(-100) })); } catch { /* Keep the memory copy. */ }
+}
+function isResultDismissed(job) {
+  if (!job || isJobActive(job)) return false;
+  return view.dismissedResults.has(jobDismissKey(job));
+}
+function dismissResult(key) {
+  if (!key) return;
+  view.dismissedResults.add(key);
+  while (view.dismissedResults.size > MAX_DISMISSED_RESULTS) view.dismissedResults.delete(view.dismissedResults.values().next().value);
+  saveDismissedResults(view.dismissedResults);
+}
+function clearDismissedResults() {
+  view.dismissedResults.clear(); view.resultDetailsOpen.clear();
+  try { localStorage.removeItem('photo-saver-dismissed-results-v1'); } catch { /* Keep the memory copy. */ }
+}
+function jobHasAttention(job) {
+  const result = job?.result || {};
+  return job?.status === 'failed' || job?.status === 'cancelled' || Boolean(result.error) ||
+    (result.failed || 0) > 0 || (result.review || 0) > 0 || (result.companionReview || 0) > 0;
+}
+function resultTone(job) { return job.status === 'failed' ? 'danger' : jobHasAttention(job) ? 'warn' : 'ok'; }
+function resultBannerActions(job, title, followup = '') {
+  return `${followup}<a class="button" href="#jobs">작업 내역</a>${button('dismiss-result', '닫기', { glyph: 'close', extra: `data-value="${escapeHtml(jobDismissKey(job))}" aria-label="${escapeHtml(title)} 닫기"` })}`;
+}
+function resultDetailsAttributes(job) {
+  const key = jobDismissKey(job);
+  const previous = [...page.querySelectorAll('[data-result-details]')].find(el => el.dataset.resultDetails === key);
+  const open = previous ? previous.open : view.resultDetailsOpen.has(key) ? view.resultDetailsOpen.get(key) : jobHasAttention(job);
+  return `data-result-details="${escapeHtml(key)}"${open ? ' open' : ''}`;
+}
+function loadDeviceUploadHistory() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('photo-saver-upload-history-v1'));
+    return saved?.version === 1 && Array.isArray(saved.entries)
+      ? saved.entries.filter(entry => entry && entry.source === 'device' && entry.createdAt && entry.result && Array.isArray(entry.result.items)).slice(-20).map(trimDeviceUploadEntry) : [];
+  } catch { return []; }
+}
+function trimDeviceUploadEntry(entry) {
+  const items = entry.result.items || [];
+  const attention = item => item.status !== 'done' || deviceUploadRenamed(item);
+  const shown = [...items.filter(attention), ...items.filter(item => !attention(item))].slice(0, 100);
+  const total = Math.max(entry.itemsTotal || 0, items.length);
+  return { ...entry, itemsTotal: total, itemsTruncated: total > shown.length,
+    result: { ...entry.result, items: shown }, resultMeta: { itemsTotal: total, itemsShown: shown.length, itemsTruncated: total > shown.length, errorsTotal: 0, errorsShown: 0, errorsTruncated: false } };
+}
+function recordDeviceUploadHistory(entry) {
+  view.deviceUploadHistory.push(trimDeviceUploadEntry(entry));
+  view.deviceUploadHistory = view.deviceUploadHistory.slice(-20);
+  try { localStorage.setItem('photo-saver-upload-history-v1', JSON.stringify({ version: 1, entries: view.deviceUploadHistory })); } catch { /* Keep the memory copy. */ }
+}
+function clearDeviceUploadHistory() {
+  view.deviceUploadHistory = [];
+  try { localStorage.removeItem('photo-saver-upload-history-v1'); } catch { /* Keep the memory copy. */ }
+}
+function deviceUploadEntry(active = false) {
+  const upload = view.deviceUpload;
+  return { id: `device-${upload.startedAt}-${upload.batchId}`, source: 'device', lane: 'device', kind: 'device-upload',
+    createdAt: upload.startedAt, finishedAt: active ? null : new Date().toISOString(),
+    status: active ? 'running' : upload.cancelling ? 'cancelled' : upload.results.some(item => item.status === 'failed') ? 'failed' : 'done',
+    result: { items: [...upload.results], failed: upload.results.filter(item => item.status === 'failed').length,
+      review: upload.results.filter(item => item.status === 'skipped' || deviceUploadRenamed(item)).length,
+      uploaded: upload.results.filter(item => item.status === 'done').length, phase: upload.cancelling ? '중지 중…' : upload.scanNote,
+      totalFiles: upload.totalFiles, completedFiles: upload.completedFiles, totalBytes: upload.totalBytes,
+      transferredBytes: upload.uploadedBytes, current: upload.currentName } };
+}
 function jobActive(job = state.job) { return isJobActive(job); }
 function normalizeJobs(snapshot) {
   const jobs = { local: null, remote: null, exclusive: null, ...snapshot.jobs };
@@ -226,13 +314,13 @@ function setOptimisticJob(job) {
   state.activeJobs[lane] = isJobActive(job) ? job : null;
 }
 function activeJobsBar() {
-  const existing = laneJobsBar();
+  let existing = laneJobsBar();
   if (view.deviceUpload.running) {
     const upload = view.deviceUpload;
-    const pill = '<div class="active-job-pill"><span role="status">기기 업로드 · ' + upload.completedFiles + '/' + upload.totalFiles + ' · ' + deviceUploadPercent() + '%</span>' + button('cancel-incoming-upload', upload.cancelling ? '중지 중…' : '중지', { disabled: upload.cancelling }) + '</div>';
-    return existing ? existing.slice(0, -6) + pill + '</div>' : '<div class="active-jobs-bar" aria-label="진행 중인 작업">' + pill + '</div>';
+    const pill = '<div class="active-device-job"><span role="status">기기 업로드 · ' + upload.completedFiles + '/' + upload.totalFiles + ' · ' + deviceUploadPercent() + '%</span>' + button('cancel-incoming-upload', upload.cancelling ? '중지 중…' : '중지', { disabled: upload.cancelling }) + '</div>';
+    existing = existing ? existing.slice(0, -6) + pill + '</div>' : '<div class="active-jobs-bar" aria-label="진행 중인 작업">' + pill + '</div>';
   }
-  return existing;
+  return existing ? existing.slice(0, -6) + '<a class="button active-jobs-link" href="#jobs">작업 내역</a></div>' : '';
 }
 
 function laneJobsBar() {
@@ -286,6 +374,10 @@ async function syncState() {
     }
     if (messages.length) announce(messages.filter(Boolean).join(' · '));
     if (completed && view.page === 'catalog') await loadCatalog();
+    if (view.page === 'jobs' && (completed || lanes.some(lane => {
+      const job = activeLaneJob(lane);
+      return job && !view.jobs.items.some(item => item.id === job.id);
+    }))) await loadJobs({ silent: true, preserveLoaded: true });
     const sourceKeys = new Set(sourceFiles().flatMap(sourceAssetKeys));
     for (const key of view.sourceSelection) if (!sourceKeys.has(key)) view.sourceSelection.delete(key);
     pruneIncomingSelection();
@@ -572,21 +664,22 @@ function unmatchedCompanionsSection() {
 function incomingResultSection() {
   const titles = { move: '파일 이동 결과', delete: '사진 삭제 결과', 'duplicate-cleanup': '중복 정리 결과', 'xmp-link': 'XMP 연결 결과' };
   const job = state.latestIncomingResult || laneJob('local');
-  if (!titles[job?.kind] || isJobActive(job)) return '';
+  if (!titles[job?.kind] || isJobActive(job) || isResultDismissed(job)) return '';
   const result = job.result || {};
   const items = result.items || [];
   const itemLabels = { moved: '이동 완료', duplicate: '이미 보관됨', cleaned: '정리 완료', deleted: '삭제 완료', review: '확인 필요', linked: '연결 완료', 'already-stored': '이미 보관됨' };
   const previous = page.querySelector('#incoming-result-items');
-  const expanded = previous?.dataset.jobId === String(job.id) ? previous.open : Boolean(result.review || result.companionReview);
-  return `<section class="surface incoming-result" aria-labelledby="incoming-result-title">
+  const key = jobDismissKey(job);
+  const expanded = previous && previous.dataset.jobKey === key ? previous.open : (view.resultDetailsOpen.has(key) ? view.resultDetailsOpen.get(key) : jobHasAttention(job));
+  const followup = `${result.moved ? button('open-unassigned', '이벤트 관리의 미배정 열기', { glyph: 'arrow' }) : ''}${result.review || result.companionReview || job.status === 'failed' ? button('rescan-incoming', '다시 검사', { glyph: 'refresh', disabled: localBusy() }) : ''}`;
+  return `<section class="surface incoming-result result-banner result-banner-${resultTone(job)}" ${job.status === 'failed' ? 'role="alert"' : ''} aria-labelledby="incoming-result-title">
     <div class="incoming-result-summary">
       <div><h2 id="incoming-result-title">${titles[job.kind]}</h2><p class="small muted">${escapeHtml(jobMessage(job) || '작업을 완료하지 못했습니다.')}</p></div>
       <div class="incoming-next-actions">
-        ${result.moved ? button('open-unassigned', '이벤트 관리의 미배정 열기', { glyph: 'arrow' }) : ''}
-        ${result.review || result.companionReview || job.status === 'failed' ? button('rescan-incoming', '다시 검사', { glyph: 'refresh', disabled: localBusy() }) : ''}
+        ${resultBannerActions(job, titles[job.kind], followup)}
       </div>
     </div>
-    ${items.length ? `<details id="incoming-result-items" data-job-id="${job.id}" ${expanded ? 'open' : ''}>
+    ${items.length ? `<details id="incoming-result-items" data-job-id="${job.id}" data-job-key="${escapeHtml(key)}" data-result-details="${escapeHtml(key)}" ${expanded ? 'open' : ''}>
       <summary>파일별 결과 ${items.length}개</summary>
       <ul>${items.map(item => `<li>
         <strong>${escapeHtml(item.path || item.id || '경로 정보 없음')}</strong> <span class="small muted">${escapeHtml(itemLabels[item.status] || item.status)}</span>
@@ -701,7 +794,8 @@ function patchIncomingUpload() {
     ['실패', upload.results.filter(item => item.status === 'failed').length],
     ['취소', upload.results.filter(item => item.status === 'cancelled').length],
   ].filter(([, count]) => count > 0).map(([label, count]) => label + ' ' + count + '개').join(' · ');
-  const resultsChanged = setSlotHtml(panel.querySelector('#incoming-upload-results'), (upload.scanNote ? '<p role="status">' + escapeHtml(upload.scanNote) + '</p>' : '') + (upload.results.length ?
+  const resultBar = !upload.running && (upload.results.length || upload.scanNote) ? `<div class="upload-result-bar ${needsAttention || upload.cancelling ? 'result-tone-warn' : ''}">${badge(needsAttention || upload.cancelling ? 'review' : 'ready', upload.cancelling ? '중지됨' : needsAttention ? '확인 필요' : '업로드 완료')}<a class="button" href="#jobs">작업 내역</a>${button('dismiss-upload-result', '닫기', { glyph: 'close', extra: 'aria-label="기기 업로드 결과 닫기"' })}</div>` : '';
+  const resultsChanged = setSlotHtml(panel.querySelector('#incoming-upload-results'), resultBar + (upload.scanNote ? '<p role="status">' + escapeHtml(upload.scanNote) + '</p>' : '') + (upload.results.length ?
     '<details id="incoming-upload-result-items"><summary>업로드 결과 · ' + counts + '</summary><ul>' +
     upload.results.map(item => '<li>' + escapeHtml(item.name) + ' · ' + escapeHtml(item.message) +
       (item.result?.path ? '<div class="small muted">' + (deviceUploadRenamed(item) ? '이름 변경: ' + escapeHtml(item.name) + ' → ' : '저장 경로: ') + escapeHtml(item.result.path) + '</div>' : '') + '</li>').join('') + '</ul></details>' : ''));
@@ -726,7 +820,9 @@ function patchIncomingUpload() {
 
 function refreshDeviceUpload() {
   if (view.page === 'incoming') { patchIncomingUpload(); patchPageStatus(); }
+  else if (view.page === 'jobs') patchJobsPage();
   else render();
+  renderNavigation();
 }
 
 async function deviceUploadRequest(path, method = 'GET', body, signal) {
@@ -825,6 +921,7 @@ async function startIncomingUpload(entries) {
   const upload = view.deviceUpload;
   if (upload.running || exclusiveActive() || view.connecting || !entries.length) return;
   Object.assign(upload, { open: true, running: true, cancelling: false, totalFiles: Math.min(entries.length, 2000), completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, results: [], scanNote: '', activeUploadId: null, batchId: upload.batchId + 1, abortController: typeof AbortController === 'function' ? new AbortController() : null });
+  upload.startedAt = new Date().toISOString(); upload.dismissedBatchId = 0;
   const queue = entries.slice(0, 2000).map(entry => entry.file ? entry : { file: entry, folder: '' });
   if (entries.length > 2000) upload.scanNote = '한 번에 2,000개까지 업로드합니다. 나머지 파일은 다시 선택하세요.';
   const rank = file => devicePhotoExtensions.has(deviceExtension(file.name)) ? 0 : deviceVideoExtensions.has(deviceExtension(file.name)) ? 1 : 2;
@@ -885,6 +982,7 @@ async function startIncomingUpload(entries) {
         catch (error) { upload.scanNote = '파일 검사를 시작하지 못했습니다. ' + error.message; }
       } else upload.scanNote = '진행 중인 로컬 작업이 끝난 뒤 파일 검사를 누르세요.';
     }
+    if (upload.completedFiles > 0) recordDeviceUploadHistory(deviceUploadEntry());
     refreshDeviceUpload();
   }
 }
@@ -931,7 +1029,7 @@ window.addEventListener('pagehide', () => {
 function mountIncomingPage() {
   page.innerHTML = `<main aria-labelledby="page-title" data-page="incoming">
     <div id="page-active-jobs"></div><div id="page-load-error"></div>
-    <div id="incoming-header"></div><div id="incoming-scan-strip"></div>
+    <div id="incoming-header"></div><div id="incoming-scan-strip"></div><div id="incoming-result-slot"></div>
     ${incomingUploadShell()}
     <section class="surface" aria-labelledby="incoming-title">
       <div class="surface-head"><h2 id="incoming-title">검사 결과</h2>
@@ -953,7 +1051,7 @@ function mountIncomingPage() {
       </div>
       <div class="table-wrap" id="incoming-rows"></div>
       <div class="action-bar" id="incoming-actions"></div>
-    </section><div id="incoming-result-slot"></div><div id="incoming-xmp-slot"></div><div id="incoming-unmatched-slot"></div>
+    </section><div id="incoming-xmp-slot"></div><div id="incoming-unmatched-slot"></div>
   </main>`;
 }
 
@@ -1046,6 +1144,7 @@ function offloadStatus() {
   if (job?.kind !== 'offload') return '';
   const result = job.result || {};
   const active = jobActive(job);
+  if (!active) return resultBanner(job, '로컬 원본 비우기 결과');
   const percent = Math.min(100, Math.round((result.completedFiles || 0) / (result.totalFiles || 1) * 100));
   return `<section class="surface upload-status" aria-label="로컬 원본 비우기 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '로컬 원본 비우기 대기 중' : result.phase || '로컬 원본 비우기 중' : job.status === 'done' ? '로컬 원본 비우기 완료' : '로컬 원본 비우기 실패'}</strong>
@@ -1138,15 +1237,17 @@ function syncEventSelection(event = eventById(view.eventId), filtered = filtered
   const all = container.querySelector('[data-select="event-all"]');
   setChecked(all, filtered.length > 0 && count === filtered.length);
   if (all) all.indeterminate = count > 0 && count < filtered.length;
-  const confirmButton = event ? button('confirm-event', '선택 배치 확정', {
-    glyph: 'check', primary: true, disabled: !filtered.some(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed),
+  const confirmable = filtered.filter(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed).length;
+  const confirmButton = event ? button('confirm-event', confirmable ? `선택 ${confirmable}개 배치 확정` : '선택 배치 확정', {
+    glyph: 'check', primary: true, disabled: !confirmable,
   }) : '';
-  setSlotHtml(page.querySelector('#event-tools-actions'), `${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}${confirmButton}`);
+  setSlotHtml(page.querySelector('#event-tools-actions'), `${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}`);
   const selected = view.eventSelection.size;
   const offloadable = filtered.filter(file => view.eventSelection.has(file.id) && file.canOffload);
   const offloadLabel = offloadable.length && offloadable.length !== selected ? `아카이브 검증 ${offloadable.length}개 로컬 비우기` : '로컬 원본 비우기';
   const destinations = eventDestinations(event);
   setSlotHtml(page.querySelector('#event-actions'), `<div>
+    <span class="small muted">${selected}개 선택</span>
     ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트" ${exclusiveActive() ? 'disabled' : ''}><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>${button('move-event', '이동', { disabled: true })}` : ''}
     ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
     ${button('offload-media', offloadLabel, { glyph: 'trash', danger: true, disabled: !offloadable.length || remoteBusy() })}
@@ -1157,7 +1258,7 @@ function syncEventSelection(event = eventById(view.eventId), filtered = filtered
 function patchEventsPage() {
   patchPageStatus();
   setSlotHtml(page.querySelector('#events-header'), header('이벤트 관리', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
-    button('new-event', '이벤트 생성', { glyph: 'plus', primary: true })));
+    button('new-event', '이벤트 생성', { glyph: 'plus', primary: state.events.length === 0 })));
   setSlotHtml(page.querySelector('#events-offload-slot'), offloadStatus());
   setSlotHtml(page.querySelector('#event-list'), `${eventLink('all', '전체 파일', state.managed.length)}${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}${state.events.filter(item => !item.parent).map(item => {
     const children = childEvents(item.id);
@@ -1292,6 +1393,7 @@ function uploadStatus() {
   if (job?.kind !== 'upload') return '';
   const result = job.result || {};
   const active = jobActive(job);
+  if (!active) return resultBanner(job, '아카이브 업로드 결과', job.status === 'done' ? button('open-catalog-tab', '아카이브 기록 보기', { extra: 'data-value="archives"' }) : '');
   const percent = Math.min(100, Math.round((result.transferredBytes || 0) / (result.totalBytes || 1) * 100));
   return `<section class="surface upload-status" aria-label="아카이브 업로드 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '업로드 대기 중' : result.phase || '업로드 중' : job.status === 'done' ? '업로드 완료' : job.status === 'cancelled' ? '업로드 중지됨' : '업로드 실패'}</strong>
@@ -1308,6 +1410,7 @@ function remoteIndexStatus() {
   if (job?.kind !== 'remote-index') return '';
   const result = job.result || {};
   const active = jobActive(job);
+  if (!active) return resultBanner(job, '원격 인덱싱 결과', job.status === 'done' ? button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' }) : '');
   const total = result.totalFiles || 0;
   const percent = total ? Math.min(100, Math.round((result.processedFiles || 0) / total * 100)) : 0;
   const scopeLabel = result.scope ? `범위: ${result.scope}` : '전체 아카이브 루트';
@@ -1462,28 +1565,50 @@ function catalogFolderLabel() {
   return [parent?.name, folder.name, view.catalogDevice].filter(Boolean).join(' / ');
 }
 
+function catalogFolderButton({ action, value, label, count, selected }) {
+  return `<button type="button" class="catalog-folder${selected ? ' active' : ''}" data-action="${action}" data-value="${escapeHtml(value)}"
+    ${selected ? 'aria-current="location"' : ''} title="${escapeHtml(label)}">${icon('folder')}<span class="catalog-folder-label">${escapeHtml(label)}</span><span class="catalog-folder-count">${count}</span></button>`;
+}
+
+function catalogFolderRow({ depth = 0, expandable = false, expanded = false, toggleAction = '', toggleValue = '', label = '', buttonHtml }) {
+  const lead = expandable
+    ? `<button type="button" class="catalog-folder-toggle" data-action="${toggleAction}" data-value="${escapeHtml(toggleValue)}" aria-expanded="${expanded}" aria-label="${escapeHtml(label)} 하위 폴더 ${expanded ? '접기' : '펼치기'}">${icon('right')}</button>`
+    : '<span class="catalog-folder-spacer" aria-hidden="true"></span>';
+  return `<div class="catalog-folder-row" style="--folder-depth:${depth}">${lead}${buttonHtml}</div>`;
+}
+
 function remoteFolderTree() {
   const data = view.catalog;
   const folders = data?.remoteFolders || [];
-  const folderButton = (folderPath, label, count, depth = 0) => {
-    const selected = view.catalogRemoteFolder === folderPath;
-    return `<button type="button" class="catalog-folder${selected ? ' active' : ''}" data-action="catalog-remote-folder" data-value="${escapeHtml(folderPath)}"
-      ${selected ? 'aria-current="location"' : ''} title="${escapeHtml(label)}" style="--folder-depth:${depth}">${icon('folder')}<span>${escapeHtml(label)}</span><span class="catalog-folder-count">${count}</span></button>`;
-  };
-  const branch = folder => {
+  const folderButton = (folderPath, label, count) => catalogFolderButton({
+    action: 'catalog-remote-folder',
+    value: folderPath,
+    label,
+    count,
+    selected: view.catalogRemoteFolder === folderPath,
+  });
+  const branch = (folder, depth = 0) => {
     const children = folder.children || [];
     const expandable = children.length > 0;
-    const expanded = view.catalogRemoteExpanded.has(folder.path);
-    return `<li><div class="catalog-folder-row" style="--folder-depth:0">
-      ${expandable ? `<button type="button" class="catalog-folder-toggle" data-action="toggle-remote-folder" data-value="${escapeHtml(folder.path)}" aria-expanded="${expanded}" aria-label="${escapeHtml(folder.name)} 하위 폴더 ${expanded ? '접기' : '펼치기'}">${icon('right')}</button>` : '<span class="catalog-folder-spacer"></span>'}
-      ${folderButton(folder.path, folder.name, folder.count, 0)}</div>
-      ${expanded ? `<ul>${children.map(child => `<li>${folderButton(child.path, child.name, child.count, 1)}</li>`).join('')}</ul>` : ''}
+    const expanded = expandable && view.catalogRemoteExpanded.has(folder.path);
+    return `<li>${catalogFolderRow({
+      depth,
+      expandable,
+      expanded,
+      toggleAction: 'toggle-remote-folder',
+      toggleValue: folder.path,
+      label: folder.name,
+      buttonHtml: folderButton(folder.path, folder.name, folder.count),
+    })}
+      ${expanded ? `<ul>${children.map(child => branch(child, depth + 1)).join('')}</ul>` : ''}
     </li>`;
   };
+  const rootFilesItem = data?.remoteRootCount
+    ? `<li>${catalogFolderRow({ depth: 0, buttonHtml: folderButton('__root__', '루트 직속 파일', data.remoteRootCount) })}</li>`
+    : '';
   return `<nav class="catalog-folders" aria-label="원격 아카이브 폴더"><div class="catalog-folders-heading"><h2>원격 폴더</h2><p class="small muted">아카이브 경로 기준</p></div>
     <div class="catalog-folder-list">${folderButton('', '전체 원격 파일', data?.summary.remoteTotal || 0)}
-      ${data?.remoteRootCount ? folderButton('__root__', '루트 직속 파일', data.remoteRootCount) : ''}
-      <ul>${folders.map(branch).join('')}</ul>
+      ${rootFilesItem || folders.length ? `<ul>${rootFilesItem}${folders.map(folder => branch(folder, 0)).join('')}</ul>` : ''}
       ${!folders.length && !data?.remoteRootCount ? '<p class="small muted catalog-folders-empty">인덱싱된 원격 파일이 없습니다.</p>' : ''}
     </div></nav>`;
 }
@@ -1492,26 +1617,39 @@ function catalogFolderTree() {
   if (view.catalogTab === 'remote') return remoteFolderTree();
   const data = view.catalog;
   const folders = data?.folders || [];
-  const folderButton = (event, device, label, count, depth = 0) => {
-    const selected = view.catalogEvent === event && view.catalogDevice === device;
-    return `<button type="button" class="catalog-folder${selected ? ' active' : ''}" data-action="catalog-folder" data-value="${escapeHtml(JSON.stringify({ event, device }))}"
-      ${selected ? 'aria-current="location"' : ''} title="${escapeHtml(label)}" style="--folder-depth:${depth}">${icon('folder')}<span>${escapeHtml(label)}</span><span class="catalog-folder-count">${count}</span></button>`;
-  };
+  const folderButton = (event, device, label, count) => catalogFolderButton({
+    action: 'catalog-folder',
+    value: JSON.stringify({ event, device }),
+    label,
+    count,
+    selected: view.catalogEvent === event && view.catalogDevice === device,
+  });
   const branch = (folder, depth = 0) => {
     const children = folders.filter(item => item.parent_id === folder.id);
+    const devices = folder.devices || [];
     const count = folder.count + children.reduce((sum, item) => sum + item.count, 0);
-    const expandable = children.length || folder.devices.length;
-    const expanded = view.catalogExpanded.has(folder.id);
-    return `<li><div class="catalog-folder-row" style="--folder-depth:${depth}">
-      ${expandable ? `<button type="button" class="catalog-folder-toggle" data-action="toggle-catalog-folder" data-value="${escapeHtml(folder.id)}" aria-expanded="${expanded}" aria-label="${escapeHtml(folder.name)} 하위 폴더 ${expanded ? '접기' : '펼치기'}">${icon('right')}</button>` : '<span class="catalog-folder-spacer"></span>'}
-      ${folderButton(folder.id, '', folder.name, count, depth)}</div>
-      ${expanded ? `<ul>${children.map(child => branch(child, depth + 1)).join('')}${folder.devices.map(device => `<li>${folderButton(folder.id, device.name, device.name, device.count, depth + 1)}</li>`).join('')}</ul>` : ''}
+    const expandable = children.length > 0 || devices.length > 0;
+    const expanded = expandable && view.catalogExpanded.has(folder.id);
+    return `<li>${catalogFolderRow({
+      depth,
+      expandable,
+      expanded,
+      toggleAction: 'toggle-catalog-folder',
+      toggleValue: folder.id,
+      label: folder.name,
+      buttonHtml: folderButton(folder.id, '', folder.name, count),
+    })}
+      ${expanded ? `<ul>${children.map(child => branch(child, depth + 1)).join('')}${devices.map(device => `<li>${catalogFolderRow({
+        depth: depth + 1,
+        buttonHtml: folderButton(folder.id, device.name, device.name, device.count),
+      })}</li>`).join('')}</ul>` : ''}
     </li>`;
   };
   const count = view.catalogTab === 'archives' ? data?.summary.attempts : data?.summary.files;
+  const unassignedItem = `<li>${catalogFolderRow({ depth: 0, buttonHtml: folderButton('unassigned', '', '미배정', data?.unassigned || 0) })}</li>`;
   return `<nav class="catalog-folders" aria-label="이벤트 폴더"><div class="catalog-folders-heading"><h2>이벤트</h2><p class="small muted">이벤트 · 소분류 · 장비</p></div>
-    <div class="catalog-folder-list">${folderButton('all', '', '전체 파일', count || 0)}${folderButton('unassigned', '', '미배정', data?.unassigned || 0)}
-      <ul>${folders.filter(folder => !folder.parent_id).map(folder => branch(folder)).join('')}</ul>
+    <div class="catalog-folder-list">${folderButton('all', '', '전체 파일', count || 0)}
+      <ul>${unassignedItem}${folders.filter(folder => !folder.parent_id).map(folder => branch(folder, 0)).join('')}</ul>
       ${!folders.length ? '<p class="small muted catalog-folders-empty">등록된 이벤트가 없습니다.</p>' : ''}
     </div></nav>`;
 }
@@ -1535,11 +1673,10 @@ function catalogPage() {
     : (view.catalogEvent !== 'all' || view.catalogQuery || view.catalogScope !== 'all');
   return `${header('파일 기록', '카탈로그에 저장된 파일 해시, 아카이브 전송 이력과 원격 인덱스를 조회하세요.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
     <section class="surface" aria-label="파일 카탈로그">
-      <div class="catalog-tabs" role="group" aria-label="기록 종류">
-        ${button('catalog-tab', '보유 파일', { extra: `data-value="files" aria-pressed="${!archives && !remote}"`, primary: !archives && !remote })}
-        ${button('catalog-tab', '아카이브 기록', { extra: `data-value="archives" aria-pressed="${archives}"`, primary: archives })}
-        ${button('catalog-tab', '원격 인덱스', { extra: `data-value="remote" aria-pressed="${remote}"`, primary: remote })}
+      <div class="catalog-tabs" role="tablist" aria-label="기록 종류">
+        ${[['files', '보유 파일', summary?.files], ['archives', '아카이브 기록', summary?.attempts], ['remote', '원격 인덱스', summary?.remoteTotal]].map(([key, title, count]) => `<button type="button" role="tab" id="catalog-tab-${key}" class="catalog-tab" data-action="catalog-tab" data-value="${key}" aria-selected="${view.catalogTab === key}" aria-controls="catalog-tabpanel" tabindex="${view.catalogTab === key ? '0' : '-1'}">${title} <span class="catalog-tab-count">${count ?? '—'}</span></button>`).join('')}
       </div>
+      <div id="catalog-tabpanel" role="tabpanel" aria-labelledby="catalog-tab-${view.catalogTab}">
       <p class="catalog-summary small muted">${summaryText}</p>
       <div class="catalog-layout">${catalogFolderTree()}<div class="catalog-content">
       <div class="catalog-location" aria-label="${remote ? '현재 원격 폴더' : '현재 이벤트 폴더'}">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>
@@ -1547,11 +1684,12 @@ function catalogPage() {
         <label class="search">${icon('search')}<span class="sr-only">파일 기록 검색</span><input id="catalog-query" name="query" type="search" maxlength="300" placeholder="파일명·경로·SHA-256 검색" value="${escapeHtml(view.catalogQuery)}"></label>
         <select id="catalog-scope" name="scope" aria-label="파일 기록 필터">${options.map(([value, label]) => `<option value="${value}" ${view.catalogScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
         <button type="submit" class="button" ${view.catalogBusy ? 'disabled' : ''}>검색</button>
+        ${hasFilter ? button('reset-catalog-filters', '필터 초기화') : ''}
       </form>
       <p class="catalog-note small muted">${remote ? '원격 스토리지에 인덱싱된 파일 스냅샷입니다. Photo Saver 밖에서 미리 올려둔 기존 영상도 중복 차단과 다운로드에 사용됩니다.' : archives ? '전송 시점의 SHA-256 검증 기록입니다. 과거 작업에 목적지 루트나 파일별 결과가 없으면 미기록으로 표시합니다.' : '보관 파일·XMP와 Incoming의 해시 기록을 표시합니다. 같은 해시의 파일도 경로별로 구분합니다.'}</p>
       ${view.catalogError ? `<p class="archive-error form-error" role="alert">${escapeHtml(view.catalogError)}</p>` : ''}
-      <div aria-busy="${view.catalogBusy}">
-      ${view.catalogBusy ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
+      <div class="catalog-results${view.catalogBusy ? ' is-loading' : ''}" aria-busy="${view.catalogBusy}">
+      ${view.catalogBusy && !view.catalogSoftLoading ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
         <thead><tr><th scope="col">${remote ? '원격 파일 / 경로' : '파일 / 경로'}</th><th scope="col">SHA-256</th><th scope="col">${remote ? '분류 / 크기' : archives ? '아카이브 목적지' : '분류 / 크기'}</th><th scope="col">${remote ? '인덱스 상태 / 검증 시각' : archives ? '검증 결과 / 시각' : '파일 상태'}</th></tr></thead>
         <tbody>${data.rows.map(row => remote ? `<tr>
           <td><strong>${escapeHtml(row.name)}</strong><div class="small muted catalog-path mono">${escapeHtml(row.remote_path)}</div>
@@ -1573,12 +1711,24 @@ function catalogPage() {
       ${data && !view.catalogBusy && !view.catalogError ? `<div class="catalog-pagination"><span class="small muted" role="status">${data.total}개 기록 · ${data.page} / ${data.pages}페이지</span><div>
         ${button('catalog-page', '이전', { extra: `data-value="${data.page - 1}"`, disabled: data.page <= 1 })}
         ${button('catalog-page', '다음', { extra: `data-value="${data.page + 1}"`, disabled: data.page >= data.pages })}</div></div>` : ''}
-      </div></div>
+      </div></div></div>
     </section>`;
 }
 
-async function loadCatalog() {
+function cancelCatalogSearchDebounce() { window.clearTimeout(catalogSearchTimer); catalogSearchTimer = null; }
+function scheduleCatalogSearch() {
+  cancelCatalogSearchDebounce();
+  if (catalogComposing) return;
+  catalogSearchTimer = window.setTimeout(() => {
+    catalogSearchTimer = null;
+    if (view.page !== 'catalog') return;
+    view.catalogPage = 1; loadCatalog({ soft: true });
+  }, view.catalogQuery ? 280 : 0);
+}
+async function loadCatalog({ soft = false } = {}) {
+  cancelCatalogSearchDebounce();
   const request = ++catalogRequest;
+  view.catalogSoftLoading = soft && Boolean(view.catalog);
   view.catalogBusy = true;
   view.catalogError = '';
   if (view.page === 'catalog') render();
@@ -1599,6 +1749,136 @@ async function loadCatalog() {
       if (view.page === 'catalog') render();
     }
   }
+}
+
+function historyResultDetails(job) {
+  const result = job.result || {}, meta = job.resultMeta || {};
+  const list = (name, title) => {
+    const values = result[name];
+    if (!Array.isArray(values) || !values.length) return '';
+    const truncated = meta[`${name}Truncated`] ? `<p class="small muted">총 ${meta[`${name}Total`]}건 중 ${values.length}건 표시 (확인 필요 항목 우선)</p>` : '';
+    return `${truncated}<h3>${title}</h3><ul>${values.map(item => `<li>${escapeHtml(typeof item === 'object' && item !== null ? [item.path || item.name || item.id || '', item.status || '', item.reason || item.message || '', item.result?.path || ''].filter(Boolean).join(' · ') || JSON.stringify(item) : item)}</li>`).join('')}</ul>`;
+  };
+  return `${result.error ? `<p class="form-error">${escapeHtml(result.error)}</p>` : ''}${list('items', '파일별 결과')}${list('errors', '오류')}${list('unmatchedCompanions', '연결하지 못한 동반 파일')}`;
+}
+function resultBanner(job, title, followup = '') {
+  if (isResultDismissed(job)) return '';
+  const details = historyResultDetails(job);
+  return `<section class="surface upload-status result-banner result-banner-${resultTone(job)}" ${job.status === 'failed' ? 'role="alert"' : ''} aria-label="${escapeHtml(title)}">
+    <div class="result-banner-head"><div><strong>${escapeHtml(title)}</strong><p class="small muted">${escapeHtml(jobMessage(job) || '작업을 종료했습니다.')}</p></div>
+    <div class="result-banner-actions">${resultBannerActions(job, title, followup)}</div></div>
+    ${details ? `<details ${resultDetailsAttributes(job)}><summary>상세 결과</summary>${details}</details>` : ''}</section>`;
+}
+function jobHistoryKey(job) { return `${job.source === 'device' ? 'device' : 'server'}:${jobDismissKey(job)}`; }
+function mergedJobEntries() {
+  const entries = new Map(view.jobs.items.map(job => [job.id, job]));
+  for (const lane of lanes) {
+    const latest = laneJob(lane);
+    if (latest && entries.has(latest.id)) entries.set(latest.id, { ...entries.get(latest.id), ...latest });
+    const active = activeLaneJob(lane);
+    if (active) entries.set(active.id, { ...entries.get(active.id), ...active });
+  }
+  const device = [...view.deviceUploadHistory];
+  if (view.deviceUpload.running) device.push(deviceUploadEntry(true));
+  return [...entries.values(), ...device].filter(job => {
+    if (view.jobs.laneFilter !== 'all' && job.lane !== view.jobs.laneFilter) return false;
+    const filter = view.jobs.statusFilter;
+    return filter === 'all' || (filter === 'active' ? isJobActive(job) : filter === 'attention' ? !isJobActive(job) && jobHasAttention(job) : job.status === filter);
+  }).sort((a, b) => {
+    const activeDeviceDiff = Number(b.source === 'device' && isJobActive(b)) - Number(a.source === 'device' && isJobActive(a));
+    const timeDiff = (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0);
+    if (activeDeviceDiff || timeDiff) return activeDeviceDiff || timeDiff;
+    const idDiff = Number(b.id) - Number(a.id);
+    return Number.isFinite(idDiff) && idDiff !== 0 ? idDiff : String(b.id).localeCompare(String(a.id));
+  });
+}
+async function loadJobs({ reset = false, silent = false, preserveLoaded = false, more = false } = {}) {
+  const jobs = view.jobs, request = ++jobsRequest;
+  if (reset) Object.assign(jobs, { items: [], nextBeforeId: null, hasMore: false, loadedOnce: false });
+  jobs.busy = !silent && !more; jobs.loadingMore = more; jobs.error = '';
+  if (view.page === 'jobs') patchJobsPage();
+  const query = new URLSearchParams({ limit: '30', status: jobs.statusFilter, lane: jobs.laneFilter === 'device' ? 'all' : jobs.laneFilter });
+  if (more && jobs.nextBeforeId) query.set('before_id', jobs.nextBeforeId);
+  try {
+    const result = await api(`jobs?${query}`);
+    if (request !== jobsRequest) return;
+    if (more) {
+      const merged = new Map(jobs.items.map(item => [item.id, item]));
+      for (const item of result.jobs) merged.set(item.id, item);
+      jobs.items = [...merged.values()].sort((a, b) => b.id - a.id);
+      jobs.nextBeforeId = result.nextBeforeId; jobs.hasMore = result.hasMore;
+    } else if (preserveLoaded) {
+      const older = result.hasMore && result.nextBeforeId != null
+        ? jobs.items.filter(item => item.id < result.nextBeforeId)
+        : [];
+      jobs.items = [...result.jobs, ...older];
+      if (!older.length) { jobs.nextBeforeId = result.nextBeforeId; jobs.hasMore = result.hasMore; }
+    } else {
+      jobs.items = result.jobs;
+      jobs.nextBeforeId = result.nextBeforeId; jobs.hasMore = result.hasMore;
+    }
+    jobs.summary = result.summary; jobs.loadedOnce = true;
+  } catch (error) { if (request === jobsRequest) jobs.error = error.message; }
+  finally {
+    if (request === jobsRequest) {
+      jobs.busy = false; jobs.loadingMore = false;
+      if (view.page === 'jobs') patchJobsPage();
+    }
+  }
+}
+function mountJobsPage() {
+  page.innerHTML = `<main aria-labelledby="page-title" data-page="jobs"><div id="page-active-jobs"></div><div id="page-load-error"></div><div id="jobs-header"></div>
+    <section class="surface" aria-label="작업 내역 목록"><div class="jobs-toolbar"><div id="jobs-status-filters" class="filters" aria-label="작업 상태 필터"></div>
+      <label>작업 영역 <select id="jobs-lane-filter"><option value="all">모든 영역</option><option value="local">로컬 파일</option><option value="remote">원격 아카이브</option><option value="device">기기 업로드 (이 브라우저)</option><option value="exclusive">시스템</option></select></label></div>
+    <div id="jobs-error"></div><div id="jobs-list" class="jobs-list"></div><div id="jobs-footer" class="jobs-footer"></div></section></main>`;
+}
+function jobHistoryActions(job) {
+  const result = job.result || {};
+  if (isJobActive(job)) {
+    const cancel = { upload: 'cancel-archive-upload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
+    return cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : '';
+  }
+  if (job.kind === 'upload') return button('open-catalog-tab', '아카이브 기록 보기', { extra: 'data-value="archives"' });
+  if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
+  if (job.kind === 'offload') return button('open-events', '이벤트 관리 열기');
+  if (job.kind === 'device-upload') return button('open-incoming', 'Incoming 열기');
+  if (['scan', 'move', 'delete', 'duplicate-cleanup', 'xmp-link'].includes(job.kind)) return `${job.kind === 'move' && result.moved > 0 ? button('open-unassigned', '미배정 열기') : ''}${button('open-incoming', 'Incoming 열기')}${jobHasAttention(job) ? button('rescan-incoming', '다시 검사', { disabled: localBusy() }) : ''}`;
+  return '';
+}
+function patchJobCard(node, job) {
+  const kinds = { scan: '파일 검사', move: '파일 이동', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: '로컬 원본 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
+  const statuses = { queued: '대기 중', running: '진행 중', done: '완료', failed: '실패', cancelled: '중지됨' };
+  const result = job.result || {}, active = isJobActive(job), key = jobHistoryKey(job);
+  setSlotHtml(node.querySelector('[data-slot="head"]'), `<div><strong>${escapeHtml(kinds[job.kind] || job.kind)}</strong> ${badge(active ? 'draft' : jobHasAttention(job) ? 'review' : 'ready', statuses[job.status] || job.status)}${job.source === 'device' ? '<span class="job-source-tag">이 브라우저 기록</span>' : `<span class="small muted">#${job.id}</span>`}</div><time class="small muted">${catalogTime(job.createdAt)}</time>`);
+  const completed = result.completedFiles ?? result.processedFiles ?? 0;
+  const percent = result.totalBytes ? Math.min(100, Math.round((result.transferredBytes || 0) / result.totalBytes * 100)) : Math.min(100, Math.round(completed / (result.totalFiles || 1) * 100));
+  const message = active ? result.phase || '작업 진행 중' : job.kind === 'device-upload' ? `업로드 ${result.uploaded || 0}개 · 실패 ${result.failed || 0}개 · 확인 필요 ${result.review || 0}개` : jobMessage(job) || '작업 종료';
+  setSlotHtml(node.querySelector('[data-slot="body"]'), `<p>${escapeHtml(message)}</p>${active ? `<p class="small muted">${completed} / ${result.totalFiles || 0}개${result.totalBytes ? ` · ${deviceUploadBytes(result.transferredBytes || 0)} / ${deviceUploadBytes(result.totalBytes)}` : ''}</p><progress max="100" value="${percent}" aria-label="${escapeHtml(kinds[job.kind] || job.kind)} 진행률"></progress>${result.current ? `<p class="small job-current">${escapeHtml(result.current)}</p>` : ''}` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`);
+  const detailSlot = node.querySelector('[data-slot="details"]'), previous = detailSlot.querySelector('details');
+  if (previous) { if (previous.open) view.jobsExpanded.add(key); else view.jobsExpanded.delete(key); }
+  const details = historyResultDetails(job);
+  // Keep the HTML cache independent of native details.open changes.
+  if (setSlotHtml(detailSlot, details ? `<details data-job-history-key="${escapeHtml(key)}"><summary>상세 결과</summary>${details}</details>` : '')) {
+    const el = detailSlot.querySelector('details');
+    if (el) el.open = view.jobsExpanded.has(key);
+  }
+}
+function patchJobsPage() {
+  if (!page.querySelector('#jobs-list')) return;
+  patchPageStatus();
+  setSlotHtml(page.querySelector('#jobs-header'), header('작업 내역', '서버 작업과 이 브라우저에서 업로드한 기록을 확인하세요.', button('refresh-jobs', '새로 고침', { glyph: 'refresh', disabled: view.jobs.busy })));
+  const summary = { total: 0, active: 0, attention: 0, done: 0, ...view.jobs.summary };
+  for (const job of [...view.deviceUploadHistory, ...(view.deviceUpload.running ? [deviceUploadEntry(true)] : [])]) {
+    summary.total++; if (isJobActive(job)) summary.active++; else if (jobHasAttention(job)) summary.attention++;
+    if (job.status === 'done') summary.done++;
+  }
+  setSlotHtml(page.querySelector('#jobs-status-filters'), [['all', '전체', 'total'], ['active', '진행 중', 'active'], ['attention', '실패·확인 필요', 'attention'], ['done', '완료', 'done']].map(([filter, title, count]) => `<button type="button" class="filter ${view.jobs.statusFilter === filter ? 'active' : ''}" data-action="jobs-status-filter" data-value="${filter}" aria-pressed="${view.jobs.statusFilter === filter}">${title} <span>${summary[count]}</span></button>`).join(''));
+  const lane = page.querySelector('#jobs-lane-filter'); if (lane.value !== view.jobs.laneFilter) lane.value = view.jobs.laneFilter;
+  setSlotHtml(page.querySelector('#jobs-error'), view.jobs.error ? `<p class="form-error" role="alert">${escapeHtml(view.jobs.error)} ${button('refresh-jobs', '다시 시도')}</p>` : '');
+  const entries = mergedJobEntries();
+  reconcileKeyedChildren(page.querySelector('#jobs-list'), 'div', entries, jobHistoryKey,
+    () => parseSingleElement('div', '<article class="job-card"><div data-slot="head" class="job-card-head"></div><div data-slot="body"></div><div data-slot="details"></div></article>'), patchJobCard);
+  setSlotHtml(page.querySelector('#jobs-footer'), `${!entries.length ? `<p class="muted" role="status">${view.jobs.busy ? '작업 내역을 불러오고 있습니다.' : view.jobs.error ? '작업 내역을 불러오지 못했습니다.' : '조건에 맞는 작업 내역이 없습니다.'}</p>` : ''}${view.jobs.hasMore && view.jobs.laneFilter !== 'device' ? button('load-more-jobs', view.jobs.loadingMore ? '불러오는 중…' : '이전 기록 더 보기', { disabled: view.jobs.loadingMore || view.jobs.busy }) : ''}`);
 }
 
 function settingRow(label, description, controls) {
@@ -1855,6 +2135,7 @@ function confirmCatalogRestore() {
     render();
     try {
       await api('settings/catalog/restore', 'POST', file);
+      clearDismissedResults();
       view.restoreFile = null;
       view.incomingSelection.clear();
       view.xmpChoices.clear();
@@ -1869,6 +2150,7 @@ function confirmCatalogRestore() {
 function resetStatus() {
   const job = laneJob('exclusive');
   if (job?.kind !== 'reset-all') return '';
+  if (job.status === 'failed') return resultBanner(job, '초기화 실패');
   const result = job.result || {};
   const detail = job.status === 'failed' ? result.error :
     `${result.phase || '초기화 대기 중'} · 파일 ${result.deletedFiles || 0}개 삭제`;
@@ -1876,6 +2158,10 @@ function resetStatus() {
 }
 
 function clearCatalogViews() {
+  cancelCatalogSearchDebounce(); clearDismissedResults(); clearDeviceUploadHistory();
+  ++jobsRequest;
+  Object.assign(view.jobs, { items: [], summary: null, nextBeforeId: null, hasMore: false, busy: false, loadingMore: false, loadedOnce: false, error: '' });
+  view.jobsExpanded.clear();
   view.incomingLayout = 'table';
   try { localStorage.removeItem('photo-saver-incoming-layout'); } catch { /* Storage may be unavailable. */ }
   view.archive = null; view.archivePath = ''; view.archiveError = ''; view.catalogTab = 'files';
@@ -2158,27 +2444,35 @@ function updateEventActions() {
 
 
 
+function renderNavigation() {
+  const activeCount = lanes.filter(lane => activeLaneJob(lane)).length + (view.deviceUpload.running ? 1 : 0);
+  setSlotHtml(nav, navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === view.page ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}${item.id === 'jobs' && activeCount > 0 ? `<span class="nav-badge" aria-label="진행 중 ${activeCount}건">${activeCount}</span>` : ''}</a>`).join(''));
+}
 function render() {
   const catalogScroll = page.querySelector('.catalog-table-wrap');
   const catalogScrollPosition = catalogScroll ? { top: catalogScroll.scrollTop, left: catalogScroll.scrollLeft } : null;
   const folderScroll = page.querySelector('.catalog-folder-list')?.scrollTop || 0;
   const active = document.activeElement;
+  const selection = active?.tagName === 'INPUT' ? { start: active.selectionStart, end: active.selectionEnd } : null;
   const keepFocus = active && page.contains(active);
   const route = location.hash.slice(1);
   const current = navigation.find(item => item.id === route) || navigation[0];
   const pageChanged = view.page !== current.id;
   const views = { archive: archivePage, catalog: catalogPage, settings: settingsPage };
   view.page = current.id;
-  setSlotHtml(nav, navigation.map(item => `<a class="nav-link" href="#${item.id}"${item.id === current.id ? ' aria-current="page"' : ''}>${icon(item.icon)}${item.title}</a>`).join(''));
+  renderNavigation();
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
   const existingMain = page.querySelector('main');
-  const inPlace = !pageChanged && existingMain?.dataset.page === view.page && (view.page === 'incoming' || view.page === 'events');
+  const inPlace = !pageChanged && existingMain?.dataset.page === view.page && ['incoming', 'events', 'jobs'].includes(view.page);
   if (view.page === 'incoming') {
     if (!inPlace) mountIncomingPage();
     patchIncomingPage();
   } else if (view.page === 'events') {
     if (!inPlace) mountEventsPage();
     patchEventsPage();
+  } else if (view.page === 'jobs') {
+    if (!inPlace) mountJobsPage();
+    patchJobsPage();
   } else {
     page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
   }
@@ -2208,6 +2502,9 @@ function render() {
     });
     if (replacement) {
       replacement.focus({ preventScroll: true });
+      if (selection && selection.start != null && typeof replacement.setSelectionRange === 'function') {
+        try { replacement.setSelectionRange(selection.start, selection.end); } catch { /* Some input types do not support ranges. */ }
+      }
     } else if (active.dataset?.action === 'preview-managed' && view.page === 'events') {
       restorePreviewFocus({ source: 'managed', returnFocus: { source: 'managed', id: active.dataset.value, eventId: view.eventId } });
     } else if (active.dataset?.action === 'preview-incoming' && view.page === 'incoming') {
@@ -2825,6 +3122,23 @@ function confirmOffload() {
 }
 
 const actions = {
+  'dismiss-result': dismissResult,
+  'dismiss-upload-result'() {
+    const upload = view.deviceUpload;
+    if (upload.running) return;
+    Object.assign(upload, { dismissedBatchId: upload.batchId, results: [], scanNote: '', totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0 });
+  },
+  'refresh-jobs'() { return loadJobs({ silent: true, preserveLoaded: true }); },
+  'load-more-jobs'() { if (!view.jobs.loadingMore && view.jobs.hasMore) return loadJobs({ more: true }); },
+  'jobs-status-filter'(filter) { view.jobs.statusFilter = filter; return loadJobs({ reset: true }); },
+  'open-incoming'() { location.hash = 'incoming'; },
+  'open-events'() { location.hash = 'events'; },
+  'open-catalog-tab'(tab) { cancelCatalogSearchDebounce(); view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; location.hash = 'catalog'; },
+  'reset-catalog-filters'() {
+    cancelCatalogSearchDebounce(); view.catalogQuery = ''; view.catalogScope = 'all'; view.catalogPage = 1;
+    view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogRemoteFolder = '';
+    return loadCatalog({ soft: true });
+  },
   scan() { return submitJob('scan'); },
   'rescan-incoming'() { return submitJob('scan'); },
   'incoming-filter'(value) { view.incomingFilter = value; pruneIncomingSelection(); },
@@ -2902,7 +3216,12 @@ const actions = {
   'toggle-catalog-folder'(id) { if (view.catalogExpanded.has(id)) view.catalogExpanded.delete(id); else view.catalogExpanded.add(id); },
   'catalog-remote-folder'(folder) {
     view.catalogRemoteFolder = folder; view.catalogPage = 1;
-    if (folder && folder !== '__root__') view.catalogRemoteExpanded.add(folder.split('/')[0]);
+    if (folder && folder !== '__root__') {
+      const parts = folder.split('/').filter(Boolean);
+      for (let i = 1; i <= parts.length; i += 1) {
+        view.catalogRemoteExpanded.add(parts.slice(0, i).join('/'));
+      }
+    }
     return loadCatalog();
   },
   'toggle-remote-folder'(folder) { if (view.catalogRemoteExpanded.has(folder)) view.catalogRemoteExpanded.delete(folder); else view.catalogRemoteExpanded.add(folder); },
@@ -3024,7 +3343,7 @@ page.addEventListener('submit', event => {
   view.catalogQuery = String(form.get('query') || '');
   view.catalogScope = String(form.get('scope') || 'all');
   view.catalogPage = 1;
-  loadCatalog();
+  cancelCatalogSearchDebounce(); loadCatalog({ soft: true });
 });
 
 page.addEventListener('change', event => {
@@ -3038,7 +3357,11 @@ page.addEventListener('change', event => {
   } else if (control.id === 'incoming-upload-autoscan') {
     view.deviceUpload.autoScan = control.checked;
   } else if (control.id === 'catalog-scope') {
+    cancelCatalogSearchDebounce();
     view.catalogScope = control.value;
+    view.catalogPage = 1; loadCatalog({ soft: true });
+  } else if (control.id === 'jobs-lane-filter') {
+    view.jobs.laneFilter = control.value; loadJobs({ reset: true });
   } else if (control.dataset.select) {
     handleSelection(control);
   } else if (control.id === 'restore-catalog-file') {
@@ -3069,6 +3392,21 @@ page.addEventListener('change', event => {
   }
 });
 
+page.addEventListener('toggle', event => {
+  const el = event.target;
+  if (el.dataset.resultDetails) view.resultDetailsOpen.set(el.dataset.resultDetails, el.open);
+  if (el.dataset.jobHistoryKey) {
+    if (el.open) view.jobsExpanded.add(el.dataset.jobHistoryKey);
+    else view.jobsExpanded.delete(el.dataset.jobHistoryKey);
+  }
+}, true);
+page.addEventListener('compositionstart', event => {
+  if (event.target.id === 'catalog-query') { catalogComposing = true; cancelCatalogSearchDebounce(); }
+});
+page.addEventListener('compositionend', event => {
+  if (event.target.id === 'catalog-query') { catalogComposing = false; view.catalogQuery = event.target.value; scheduleCatalogSearch(); }
+});
+
 page.addEventListener('input', event => {
   if (event.target.id === 'incoming-upload-folder') view.deviceUpload.folder = event.target.value;
 });
@@ -3076,6 +3414,7 @@ page.addEventListener('input', event => {
 page.addEventListener('input', event => {
   if (event.target.id === 'catalog-query') {
     view.catalogQuery = event.target.value;
+    if (!event.isComposing && !catalogComposing) scheduleCatalogSearch();
     return;
   }
   if (event.target.id === 'event-search') {
@@ -3088,6 +3427,16 @@ page.addEventListener('input', event => {
 });
 
 page.addEventListener('keydown', event => {
+  const tab = event.target.closest('[role="tab"][data-action="catalog-tab"]');
+  if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    const tabs = ['files', 'archives', 'remote'], index = tabs.indexOf(tab.dataset.value);
+    const target = event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (index + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+    const loading = actions['catalog-tab'](tabs[target]);
+    page.querySelector(`#catalog-tab-${tabs[target]}`)?.focus();
+    loading.then(() => { if (view.page === 'catalog' && view.catalogTab === tabs[target]) page.querySelector(`#catalog-tab-${tabs[target]}`)?.focus(); });
+    return;
+  }
   const card = event.target.closest('[data-card-preview]');
   if (!card) return;
   if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -3190,9 +3539,12 @@ dialog.addEventListener('click', event => {
 
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon); });
 function loadRoute() {
+  cancelCatalogSearchDebounce(); catalogComposing = false;
+  ++jobsRequest; view.jobs.busy = false; view.jobs.loadingMore = false;
   closeMediaPreview({ restoreFocus: false });
   render();
   if (view.page === 'catalog') loadCatalog();
+  if (view.page === 'jobs') loadJobs({ reset: true });
   if (view.page === 'settings') loadSettings().then(() => {
     if (view.page === 'settings') render();
   });

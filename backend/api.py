@@ -14,7 +14,7 @@ from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
@@ -23,7 +23,7 @@ from starlette.datastructures import Headers, MutableHeaders
 
 from catalog import LANE_LOCAL, active_jobs_by_lane, latest_jobs_by_lane, active_offload_media_ids, DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
 from media import VIDEOS, capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
-from settings import ensure_storage_id, router as settings_router
+from settings import NO_STORE, ensure_storage_id, router as settings_router
 from archive import active_storage_scope, router as archive_router
 from transfers import RemoteDuplicateError, TransferRequest, queue_transfer
 from offload import OffloadRequest, queue_offload
@@ -371,10 +371,97 @@ def view_pending_xmp(row, available):
 def view_job(row):
     if not row:
         return None
+    try:
+        result = json.loads(row["result"])
+    except (TypeError, json.JSONDecodeError):
+        result = {}
+    if not isinstance(result, dict):
+        result = {}
     return {
         "id": row["id"], "kind": row["kind"], "lane": row["lane"], "status": row["status"],
-        "finishedAt": row["finished_at"], "result": json.loads(row["result"]) if row["result"] else {},
+        "createdAt": row["created_at"], "finishedAt": row["finished_at"], "result": result,
     }
+
+
+MAX_JOB_RESULT_LIST = 100
+# CASE also guards aggregate expressions: SQLite need not short-circuit AND.
+JOB_ATTENTION_SQL = """(
+    status IN ('failed', 'cancelled') OR (
+        json_valid(result) AND CASE WHEN json_valid(result) THEN (
+            coalesce(json_extract(result, '$.error'), '') <> ''
+            OR coalesce(CAST(json_extract(result, '$.failed') AS INTEGER), 0) > 0
+            OR coalesce(CAST(json_extract(result, '$.review') AS INTEGER), 0) > 0
+            OR coalesce(CAST(json_extract(result, '$.companionReview') AS INTEGER), 0) > 0
+        ) ELSE 0 END
+    )
+)"""
+
+
+def job_has_attention(status, result):
+    if status in {"queued", "running"}:
+        return False
+    return (status in {"failed", "cancelled"} or bool(result.get("error"))
+            or (result.get("failed") or 0) > 0 or (result.get("review") or 0) > 0
+            or (result.get("companionReview") or 0) > 0)
+
+
+def job_history_entry(row):
+    job = view_job(row)
+    result = job["result"].copy()
+    meta = {}
+    for name in ("items", "errors", "unmatchedCompanions"):
+        values = result.get(name)
+        total = len(values) if isinstance(values, list) else 0
+        if total > MAX_JOB_RESULT_LIST:
+            if name == "items":
+                def attention(item):
+                    return not isinstance(item, dict) or item.get("status") not in {"moved", "deleted", "cleaned", "linked"}
+                values = [item for item in values if attention(item)] + [item for item in values if not attention(item)]
+            result[name] = values[:MAX_JOB_RESULT_LIST]
+        meta.update({f"{name}Total": total, f"{name}Shown": min(total, MAX_JOB_RESULT_LIST),
+                     f"{name}Truncated": total > MAX_JOB_RESULT_LIST})
+    job.update(result=result, resultMeta=meta, hasAttention=job_has_attention(job["status"], result))
+    return job
+
+
+@app.get("/api/jobs")
+def job_history(
+    limit: int = Query(default=30, ge=1, le=100),
+    before_id: int | None = Query(default=None, ge=1),
+    lane: Literal["all", "local", "remote", "exclusive"] = "all",
+    status: Literal["all", "active", "attention", "done", "failed", "cancelled"] = "all",
+    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all"] = "all",
+):
+    clauses, params = [], []
+    if before_id is not None:
+        clauses.append("id < ?")
+        params.append(before_id)
+    for column, value in (("lane", lane), ("kind", kind)):
+        if value != "all":
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    if status == "active":
+        clauses.append("status IN ('queued', 'running')")
+    elif status == "attention":
+        clauses.append(f"status NOT IN ('queued', 'running') AND {JOB_ATTENTION_SQL}")
+    elif status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with database() as db:
+        rows = db.execute(
+            "SELECT id, kind, lane, status, result, created_at, finished_at FROM jobs"
+            + where + " ORDER BY id DESC LIMIT ?", (*params, limit + 1),
+        ).fetchall()
+        summary = dict(db.execute(f"""SELECT count(*) AS total,
+            coalesce(sum(status IN ('queued', 'running')), 0) AS active,
+            coalesce(sum(status NOT IN ('queued', 'running') AND {JOB_ATTENTION_SQL}), 0) AS attention,
+            coalesce(sum(status = 'done'), 0) AS done FROM jobs""").fetchone())
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    return JSONResponse({"jobs": [job_history_entry(row) for row in page_rows],
+                         "nextBeforeId": page_rows[-1]["id"] if has_more else None,
+                         "hasMore": has_more, "summary": summary}, headers=NO_STORE)
 
 
 @app.get("/api/health")
