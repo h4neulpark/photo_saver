@@ -31,6 +31,7 @@ services:
     volumes:
       - catalog:/data
       - settings:/settings
+      - thumbnails:/thumbnails
       - type: bind
         source: ${PHOTO_LIBRARY_ROOT:-.}/${INCOMING_DIR:-incoming}
         target: /incoming-preview

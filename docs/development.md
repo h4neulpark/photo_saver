@@ -178,3 +178,8 @@ Incoming 회귀 테스트는 실제 FastAPI HTTP 경로의 중복 정리 계획�
 입력·응답을 바꾸면 [API](api.md), DB 열·상태·제약을 바꾸면 [데이터 모델](data-model.md), 실행 변수·볼륨을 바꾸면 [실행과 운영](setup-and-operations.md)을 함께 갱신한다.
 
 기기 업로드 운영 검증에서는 Compose 재빌드·API healthy·Nginx 설정 검사/리로드, 두 preview 마운트 쓰기 EROFS와 upload 쓰기 성공, Nginx 경유 DNG 415·2청크 PUT 200·complete 201·미완료 DELETE 200을 확인했다. staging 잔여와 smoke_upload_check 폴더는 제거했고 Chrome fixture는 320·390·430·550·760·1280px에서 가로 넘침 없음과 최소 44px 버튼을 확인했다.
+## 썸네일 회귀 검증
+
+`backend/thumbnails.py`의 신규 회귀는 `backend/test_thumbnails.py`에서 실제 임시 SQLite·이미지·로컬 SFTP 대역으로 검증한다. 디스크 우선 상태, 로컬 우선·원격 사진·SSH 영상·SFTP 폴백, 150 MiB 제한, 경로 이스케이프와 심볼릭 링크 차단, 취소·재실행, 캐시 정리와 구버전 백업 호환을 포함한다. `frontend/test_catalog_thumbnails.cjs`는 상태 슬롯, 표/카드 및 상세, 캐시 미리보기와 열린 모달 교체, 일괄 계획 재조회, 설정 관리를 검증한다. 기존 기록 read-only authorizer와 3컬럼·CSS 특이성 테스트는 유지한다.
+
+실행은 위의 테스트 전용 이미지(`httpx` 포함)와 `-v "$PWD/backend:/app:ro"`를 사용한다. 운영 Dockerfile에는 테스트 파일이 포함되지 않으므로 마운트 없이 unittest를 실행하면 전수 검증이 아니다. Compose 빌드는 `docker compose build api worker`, 전체 UI 검증은 `node --test frontend/test_*.cjs`로 실행한다. 실제 NAS ffmpeg 설치·권한, OMV 네트워크와 브라우저 영상 코덱은 별도 운영 환경에서 확인한다.

@@ -43,6 +43,7 @@ NO_STORE = {"Cache-Control": "no-store"}
 
 # Copy data into the application's existing schema, including older Photo Saver backups.
 RESTORE_COLUMNS = {
+    "thumbnail_cache": set(),
     "jobs": {"lane"},
     "events": set(),
     "device_names": set(),
@@ -399,7 +400,7 @@ def restore_columns(source, target):
               if sql and sql.upper().startswith("CREATE TABLE ")}
     columns = {}
     for table, optional in RESTORE_COLUMNS.items():
-        if table in {"scan_xmp", "archive_entries", "device_names", "storages", "remote_files"} and table not in tables:
+        if table in {"scan_xmp", "archive_entries", "device_names", "storages", "remote_files", "thumbnail_cache"} and table not in tables:
             continue
         available = {row[1] for row in source.execute(f"PRAGMA table_info({table})")}
         expected = [row["name"] for row in target.execute(f"PRAGMA table_info({table})")]

@@ -139,3 +139,18 @@ erDiagram
 `POST /api/settings/catalog/reset`은 `모든 데이터 삭제` 확인 문구로 `reset-all` 작업 하나를 등록한다. 다른 활성 작업이 있으면 거부한다. 워커는 managed·썸네일과 카탈로그 볼륨의 임시 파일을 비운 뒤 `clear_catalog()`로 9개 테이블의 모든 행을 한 트랜잭션에서 삭제한다. 이번 작업의 행도 삭제하므로 성공 후 작업 이력은 0개다. 파일 이동 계획이나 별도 완료 기록은 남기지 않는다.
 
 SQLite 본체·WAL·SHM·카탈로그 및 워커 잠금 파일은 실행을 위해 유지한다. 사용자 레코드는 모두 비워진다. incoming 디렉터리와 그 내용, SSH 설정 볼륨·원격 아카이브는 유지한다. 파일 삭제는 트랜잭션 롤백 대상이 아니며 실패 시 이미 삭제한 파일은 복원되지 않는다. 실패 이력은 재실행을 위해 남고, 다음 성공 시 함께 지워진다. 중단된 running 작업은 재시작 때 다시 실행해 남은 파일을 삭제한다.
+## 썸네일 캐시 기록
+
+```sql
+CREATE TABLE thumbnail_cache (
+  sha TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('ready','failed','skipped_large')),
+  source_kind TEXT NOT NULL DEFAULT '', media_kind TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '', size_bytes INTEGER, updated_at TEXT NOT NULL
+);
+CREATE INDEX thumbnail_cache_by_status ON thumbnail_cache(status, updated_at);
+```
+
+준비 상태는 `/thumbnails/<sha>-v1.jpg` 일반 파일 실존을 기준으로 판정한다. DB는 실패 사유와 추출 출처(local, remote_photo, remote_video_ssh, remote_video_sftp)를 보존한다. 디스크 파일은 과거 failed 기록보다 우선하며 DB 복원만으로 이미지가 복구되지는 않는다.
+
+`JOB_LANES`의 `thumbnails-local`은 local, `thumbnails-remote`는 remote에 고정된다. 재기동·복원 시 기존 backfill 규칙을 그대로 적용한다. `CATALOG_TABLES`와 백업 복원 화이트리스트에 `thumbnail_cache`가 포함되며 테이블이 없는 구버전 백업도 복원할 수 있다. 전체 초기화는 행과 캐시 파일을 함께 삭제한다.

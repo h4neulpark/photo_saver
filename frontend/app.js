@@ -15,6 +15,7 @@ const icons = {
   photo: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m4 17 5-4 3 2 4-4 4 5"/>',
   video: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3V9Z"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   edit: '<path d="m14 5 5 5M4 20l5-1 12-12-4-4L5 15l-1 5Z"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   right: '<path d="m9 6 6 6-6 6"/>',
@@ -62,6 +63,13 @@ function dateTimeFormatter(timeZone) {
   });
 }
 
+function savedPreference(key, fallback) {
+  try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+}
+function storePreference(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* Storage may be disabled. */ }
+}
+
 function savedIncomingLayout() {
   try {
     return localStorage.getItem('photo-saver-incoming-layout') === 'cards' ? 'cards' : 'table';
@@ -80,13 +88,16 @@ function savedEventView() {
 
 const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
+  catalogView: savedPreference('photo-saver-catalog-view', 'table') === 'cards' ? 'cards' : 'table', thumbnailGeneratingShas: new Set(),
+  thumbnailStats: null, thumbnailStatsError: '', thumbnailOpBusy: false,
+  remoteIndexGenerateThumbnails: savedPreference('photo-saver-remote-index-thumbs', '0') === '1',
   dismissedResults: loadDismissedResults(), resultDetailsOpen: new Map(), deviceUploadHistory: loadDeviceUploadHistory(),
   jobs: { items: [], summary: null, nextBeforeId: null, hasMore: false, statusFilter: 'all', laneFilter: 'all', busy: false, loadingMore: false, error: '', loadedOnce: false },
   jobsExpanded: new Set(),
   deviceUpload: { open: false, folder: '', autoScan: true, running: false, cancelling: false, activeUploadId: null, abortController: null, totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, batchId: 0, dismissedBatchId: 0, startedAt: null, results: [], scanNote: '' },
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
   incomingLayout: savedIncomingLayout(), incomingTab: 'files', preview: null, cleanupPlanning: false,
-  incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventStorage: '', eventDevice: '', eventDate: '',
+  incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventLifecycle: 'all', eventMenuOpen: false, eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', eventView: savedEventView(), sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   catalogOpBusy: false, sshTestBusy: false, sshTestResult: null,
@@ -214,7 +225,7 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-const jobLanes = { scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const jobLanes = { "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
 const MAX_DISMISSED_RESULTS = 100;
@@ -340,22 +351,23 @@ function activeJobsBar() {
 function laneJobsBar() {
   if (!anyJobActive()) return '';
   const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
-  const kinds = { scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  const kinds = { "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
   return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
     const job = activeLaneJob(lane);
     if (!job) return '';
     const result = job.result || {};
-    const cancel = job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
-    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
+    const cancel = job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
+    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
   }).join('')}</div>`;
 }
 
 function jobMessage(job) {
   if (job.status === 'cancelled') return job.result.error || '작업을 중지했습니다.';
   if (job.status === 'failed') return job.result.error;
+  if (job.kind.startsWith("thumbnails-")) return thumbnailJobMessage(job.result);
   if (job.kind === 'upload') return `업로드 ${job.result.uploaded}개 완료 · 동일 파일 ${job.result.skipped}개 건너뜀`;
   if (job.kind === 'offload') return `로컬 원본 ${job.result.offloaded || 0}개를 비웠습니다.${job.result.failed ? ` 실패 ${job.result.failed}개.` : ''}`;
-  if (job.kind === 'remote-index') return `원격 인덱싱 완료 · 신규 해시 ${job.result.hashed || 0}개 · 변경 없음 ${job.result.unchanged || 0}개${job.result.missing ? ` · 누락 ${job.result.missing}개` : ''}`;
+  if (job.kind === 'remote-index') return `원격 인덱싱 완료 · 신규 해시 ${job.result.hashed || 0}개 · 변경 없음 ${job.result.unchanged || 0}개${job.result.missing ? ` · 누락 ${job.result.missing}개` : ''}${job.result.thumbnails ? ` · ${thumbnailJobMessage(job.result.thumbnails)}` : ''}`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
   if (job.kind === 'duplicate-cleanup') return `중복 ${job.result.cleaned || 0}개 정리${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
@@ -387,7 +399,9 @@ async function syncState() {
       }
     }
     if (messages.length) announce(messages.filter(Boolean).join(' · '));
-    if (completed && view.page === 'catalog') await loadCatalog();
+    if (completed) view.thumbnailGeneratingShas.clear();
+    if (completed && view.page === 'catalog') await loadCatalog({ soft: true });
+    if (completed && view.page === 'settings') await loadThumbnailStats({ silent: true });
     if (view.page === 'jobs' && (completed || lanes.some(lane => {
       const job = activeLaneJob(lane);
       return job && !view.jobs.items.some(item => item.id === job.id);
@@ -659,6 +673,7 @@ function syncStickyActionBar() {
   const active = incomingActive || eventActive;
   setClass(page, 'has-sticky-actions', active);
   setClass(document.body, 'has-sticky-actions', active);
+  setClass(document.body, 'has-event-sticky-actions', eventActive);
   // Wrapped actions can exceed 140px on phones; keep notices above the actual bar.
   const bar = active ? page.querySelector(incomingActive ? '#incoming-actions' : '#event-actions') : null;
   if (observedStickyBar !== bar) {
@@ -1198,10 +1213,21 @@ function eventDateForFile(file) {
   }).format(new Date(file.time));
 }
 
+function matchesEventLifecycle(file, filter = view.eventLifecycle) {
+  if (filter === 'all') return true;
+  if (filter === 'archived') return file.status === 'archived';
+  if (file.status === 'archived') return false;
+  return filter === 'confirmed' ? Boolean(file.confirmed) : !file.confirmed;
+}
+
+function hasActiveEventFilters() {
+  return view.eventLifecycle !== 'all' || Boolean(view.eventDevice) || Boolean(view.eventDate) || Boolean(view.eventQuery.trim());
+}
+
 function filteredEventFiles(files) {
   const query = view.eventQuery.trim().toLocaleLowerCase();
   return files.filter(file =>
-    (!view.eventStorage || file.status === view.eventStorage) &&
+    matchesEventLifecycle(file) &&
     (!view.eventDevice || (view.eventDevice === 'missing' ? !file.device : `device:${file.device}` === view.eventDevice)) &&
     (!view.eventDate || eventDateForFile(file) === view.eventDate) &&
     (!query || file.name.toLocaleLowerCase().includes(query) || file.device?.toLocaleLowerCase().includes(query) || matchesXmp(file, query))
@@ -1266,13 +1292,11 @@ function eventLifecycleSummary(files) {
 function eventLifecycleMarkup(files) {
   const summary = eventLifecycleSummary(files);
   if (!summary.total) return '';
-  return `<div class="event-lifecycle" id="event-lifecycle" aria-label="파일 생애주기 요약">
-    <div class="event-lifecycle-counts small numbers"><span><strong>총 ${summary.total}개</strong></span>
-      <span class="lifecycle-item lifecycle-draft"><i aria-hidden="true"></i>초안 ${summary.draft}</span>
-      <span class="lifecycle-item lifecycle-confirmed"><i aria-hidden="true"></i>분류 확정 ${summary.confirmed}</span>
-      <span class="lifecycle-item lifecycle-archived"><i aria-hidden="true"></i>아카이브 보관 ${summary.archived}</span>
-      ${summary.localArchivedCopy ? `<span class="muted">· NAS 사본 보유 ${summary.localArchivedCopy}</span>` : ''}</div>
-    <div class="event-lifecycle-bar" aria-hidden="true">${['archived', 'confirmed', 'draft'].map(key => summary[key] ? `<span class="bar-${key}" style="flex:${summary[key]}"></span>` : '').join('')}</div></div>`;
+  return `<div class="event-lifecycle" id="event-lifecycle" aria-label="파일 상태 요약 및 필터">
+    <div class="event-lifecycle-counts small numbers" role="group" aria-label="분류 상태 필터">
+      ${[['all', '전체'], ['draft', '초안'], ['confirmed', '분류 확정'], ['archived', '아카이브 보관']].map(([key, label]) => `<button type="button" class="lifecycle-chip lifecycle-${key}" data-action="event-lifecycle" data-value="${key}" aria-pressed="${view.eventLifecycle === key}">${key !== 'all' ? '<i aria-hidden="true"></i>' : ''}${label} <span>${key === 'all' ? summary.total : summary[key]}</span></button>`).join('')}
+      ${summary.localArchivedCopy ? `<span class="lifecycle-note muted">· NAS 사본 보유 ${summary.localArchivedCopy}</span>` : ''}</div>
+    <div class="event-lifecycle-bar" aria-hidden="true">${['archived', 'confirmed', 'draft'].map(key => summary[key] ? `<span class="bar-${key}${view.eventLifecycle !== 'all' && view.eventLifecycle !== key ? ' is-dimmed' : ''}" style="flex:${summary[key]}"></span>` : '').join('')}</div></div>`;
 }
 
 function mountEventsPage() {
@@ -1280,24 +1304,26 @@ function mountEventsPage() {
     <div id="page-active-jobs"></div><div id="page-load-error"></div>
     <div id="events-header"></div><div id="events-offload-slot"></div>
     <div class="event-split">
-      <section class="surface" aria-label="이벤트 목록">
-        <div class="surface-head"><h2>이벤트</h2></div><div class="event-list" id="event-list"></div>
+      <section class="surface event-sidebar" aria-label="이벤트 목록">
+        <div class="surface-head event-sidebar-head" id="event-sidebar-head"><h2>이벤트</h2><div id="event-create-slot"></div></div><div class="event-list" id="event-list"></div>
       </section>
-      <section class="surface" aria-label="이벤트 파일 목록">
-        <div class="surface-head event-heading" id="event-heading"></div>
+      <section class="surface event-content" aria-label="이벤트 파일 목록">
+        <div class="surface-head event-heading" id="event-heading">
+          <div class="event-heading-main" id="event-heading-main"></div>
+          <div class="event-header-actions" id="event-header-actions"></div>
+        </div>
         <div class="event-tools">
           <label class="search"><span class="sr-only">이벤트 파일 검색</span>${icon('search')}<input type="search" id="event-search" placeholder="파일명·XMP 검색"></label>
-          <select id="event-storage" aria-label="보관 위치 필터"><option value="">모든 위치</option><option value="available">로컬 보유</option><option value="archived">아카이브 보관</option></select>
           <select id="event-device" aria-label="촬영 장비 필터"></select>
           <select id="event-date" aria-label="촬영일 필터"></select>
-          <div class="event-tools-end"><div class="event-tools-actions" id="event-tools-actions"></div>
-            <div class="view-switch" id="event-view-switch" role="group" aria-label="이벤트 파일 보기 방식">
-              <button class="filter" type="button" data-action="event-view" data-value="table" aria-pressed="${view.eventView === 'table'}">${icon('table')} 표 보기</button>
-              <button class="filter" type="button" data-action="event-view" data-value="cards" aria-pressed="${view.eventView === 'cards'}">${icon('grid')} 카드 보기</button>
+          <div class="event-tools-end"><div class="event-card-select-all" id="event-card-select-all" hidden></div>
+            <div class="view-switch view-switch-icon" id="event-view-switch" role="group" aria-label="이벤트 파일 보기 방식">
+              <button class="filter icon-only" type="button" data-action="event-view" data-value="table" aria-pressed="${view.eventView === 'table'}" aria-label="표 보기" title="표 보기">${icon('table')}</button>
+              <button class="filter icon-only" type="button" data-action="event-view" data-value="cards" aria-pressed="${view.eventView === 'cards'}" aria-label="카드 보기" title="카드 보기">${icon('grid')}</button>
             </div></div>
         </div>
         <div class="table-wrap" id="event-rows"></div>
-        <div class="action-bar" id="event-actions"></div>
+        <div class="action-bar" id="event-actions" hidden></div>
       </section>
     </div></main>`;
 }
@@ -1331,21 +1357,24 @@ function patchEventRow(node, file, footageDate) {
 function patchEventRows(event, filtered) {
   const container = page.querySelector('#event-rows');
   const mode = filtered.length ? view.eventView : 'empty';
+  const cardSelectAll = page.querySelector('#event-card-select-all');
+  cardSelectAll.hidden = mode !== 'cards';
+  setSlotHtml(cardSelectAll, mode === 'cards' ? `<label class="toolbar-select-all">${checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set())}<span>전체 선택</span></label>` : '');
   if (container.dataset.mode !== mode) {
     container.dataset.mode = mode;
     slotHtmlCache.delete(container);
     container.innerHTML = mode === 'empty' ? '' : mode === 'cards'
-      ? '<div data-col="select-all"></div><ul class="incoming-cards event-cards" id="event-cards" aria-label="이벤트 파일 카드 목록"></ul>'
+      ? '<ul class="incoming-cards event-cards" id="event-cards" aria-label="이벤트 파일 카드 목록"></ul>'
       : '<table aria-label="이벤트별 파일"><thead><tr><th scope="col" data-col="select-all"></th><th scope="col">파일</th><th scope="col">촬영 일시</th><th scope="col">분류 상태</th></tr></thead><tbody></tbody></table>';
   }
   if (mode === 'empty') {
-    const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
-    setSlotHtml(container, emptyState('video', '표시할 사진·영상이 없습니다.', filtersActive ? '보관 위치·장비·촬영일 필터나 검색어를 변경해 보세요.' : event && !event.parent ? '기간으로 모으기를 눌러 미배정 영상을 찾을 수 있습니다.' : ''));
+    setSlotHtml(container, hasActiveEventFilters()
+      ? emptyState('search', '조건에 맞는 사진·영상이 없습니다.', button('reset-event-filters', '필터 초기화'))
+      : emptyState('video', '표시할 사진·영상이 없습니다.', event && !event.parent ? '상단의 기간으로 모으기를 눌러 미배정 파일을 찾을 수 있습니다.' : ''));
     return;
   }
   const selectAll = checkbox('event-all', 'all', '표시된 이벤트 파일 모두 선택', new Set());
-  setSlotHtml(container.querySelector('[data-col="select-all"]'), mode === 'cards'
-    ? `<label class="card-select-all">${selectAll} 표시된 이벤트 파일 모두 선택</label>` : checkHit(selectAll));
+  if (mode === 'table') setSlotHtml(container.querySelector('thead th[data-col="select-all"]'), checkHit(selectAll));
   const parent = event?.parent ? eventById(event.parent) : event;
   const footageDate = dateTimeFormatter(parent?.zone || state.timezone);
   const listTag = mode === 'cards' ? 'ul' : 'tbody';
@@ -1362,21 +1391,21 @@ function syncEventSelection(event = eventById(view.eventId), filtered = filtered
     setChecked(row.querySelector('[data-select="event"]'), selected);
   }
   const count = filtered.filter(file => view.eventSelection.has(file.id)).length;
-  const all = container.querySelector('[data-select="event-all"]');
+  const all = page.querySelector('[data-select="event-all"]');
   setChecked(all, filtered.length > 0 && count === filtered.length);
   if (all) all.indeterminate = count > 0 && count < filtered.length;
   const confirmable = filtered.filter(file => view.eventSelection.has(file.id) && file.status === 'available' && !file.confirmed).length;
   const confirmButton = event ? button('confirm-event', confirmable ? `선택 ${confirmable}개 분류 확정` : '선택 분류 확정', {
     glyph: 'check', primary: true, disabled: !confirmable,
   }) : '';
-  setSlotHtml(page.querySelector('#event-tools-actions'), `${event && !event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}`);
   const selected = view.eventSelection.size;
   const offloadable = filtered.filter(file => view.eventSelection.has(file.id) && file.canOffload);
   const offloadLabel = offloadable.length && offloadable.length !== selected ? `NAS 보관 후 로컬 비우기 (${offloadable.length})` : 'NAS 보관 후 로컬 비우기';
   const destinations = eventDestinations(event);
   const bar = page.querySelector('#event-actions');
+  bar.hidden = selected === 0;
   setClass(bar, 'has-selection', selected > 0);
-  setSlotHtml(bar, `${!selected ? '<span class="small muted action-bar-idle">파일을 선택하면 이동·정보 수정·분류 확정 작업이 표시됩니다.</span>' : ''}<div class="action-bar-buttons" ${selected ? '' : 'hidden'}>
+  setSlotHtml(bar, `<div class="action-bar-buttons" ${selected ? '' : 'hidden'}>
     <strong>${selected}개 선택</strong>${button('clear-event-selection', '선택 해제')}
     ${destinations.length ? `<select id="move-event-target" aria-label="이동할 이벤트" ${!selected || exclusiveActive() ? 'disabled' : ''}><option value="">이동할 이벤트</option>${destinations.map(item => `<option value="${item.id}">${escapeHtml(eventOptionLabel(item))}</option>`).join('')}</select>${button('move-event', '이동', { disabled: true })}` : ''}
     ${button('edit-media', '장비·촬영 시각 수정', { disabled: !selected })}
@@ -1388,26 +1417,36 @@ function syncEventSelection(event = eventById(view.eventId), filtered = filtered
 
 function patchEventsPage() {
   patchPageStatus();
-  setSlotHtml(page.querySelector('#events-header'), header('이벤트 분류', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.',
-    button('new-event', '이벤트 생성', { glyph: 'plus', primary: state.events.length === 0 })));
+  setSlotHtml(page.querySelector('#events-header'), header('이벤트 분류', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.', ''));
+  setSlotHtml(page.querySelector('#event-create-slot'), button('new-event', '생성', { glyph: 'plus', primary: state.events.length === 0, extra: 'aria-label="이벤트 생성" title="이벤트 생성"' }));
   setSlotHtml(page.querySelector('#events-offload-slot'), offloadStatus());
   setSlotHtml(page.querySelector('#event-list'), `${eventLink('all', '전체 파일', state.managed.length)}${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}${state.events.filter(item => !item.parent).map(item => {
     const children = childEvents(item.id);
     const total = footageForEvent(item.id).length + children.reduce((sum, child) => sum + footageForEvent(child.id).length, 0);
     return eventLink(item.id, eventLabel(item), total) + children.map(child => eventLink(child.id, eventLabel(child), footageForEvent(child.id).length, true)).join('');
-  }).join('')}`);
+  }).join('')}${state.events.length === 0 ? '<p class="event-list-empty small muted">아직 이벤트가 없습니다. <strong>+ 생성</strong>으로 첫 이벤트를 만들어 보세요.</p>' : ''}`);
   const event = eventById(view.eventId);
   const parent = event?.parent ? eventById(event.parent) : event;
   const files = footageForEvent(view.eventId);
   const filtered = filteredEventFiles(files);
-  const filtersActive = view.eventStorage || view.eventDevice || view.eventDate || view.eventQuery.trim();
-  setSlotHtml(page.querySelector('#event-heading'), `<div><h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 파일')}</h2>
-    <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${filtersActive ? `${filtered.length} / ` : ''}${files.length}개 파일</div>${eventLifecycleMarkup(files)}</div>
-    ${event ? `<div class="event-header-actions">${!event.parent ? button('new-child', '소분류 추가', { glyph: 'plus' }) : ''}${button('edit-event', event.parent ? '소분류 수정' : '이벤트 수정', { glyph: 'edit' })}${button('delete-event', event.parent ? '소분류 삭제' : '이벤트 삭제', { glyph: 'trash', danger: true })}</div>` : ''}`);
+  setSlotHtml(page.querySelector('#event-heading-main'), `<h2>${escapeHtml(event ? eventLabel(event) : view.eventId === 'all' ? '전체 파일' : '미배정 파일')}</h2>
+    <div class="event-meta small muted">${parent ? `${parent.start} ~ ${parent.end} · ` : ''}${hasActiveEventFilters() ? `${filtered.length} / ` : ''}${files.length}개 파일</div>${eventLifecycleMarkup(files)}`);
+  const headerActions = page.querySelector('#event-header-actions');
+  headerActions.hidden = !event;
+  if (!event) view.eventMenuOpen = false;
+  // Keep menu state out of this cached template so polls preserve menu DOM and focus.
+  setSlotHtml(headerActions, event ? `${!event.parent ? button('collect', '기간으로 모으기', { glyph: 'refresh' }) : ''}
+    <div class="event-menu" id="event-menu">
+      <button type="button" class="button icon event-menu-trigger" id="event-menu-toggle" data-action="toggle-event-menu" aria-haspopup="menu" aria-expanded="false" aria-controls="event-menu-panel" aria-label="${event.parent ? '소분류 작업 더 보기' : '이벤트 작업 더 보기'}" title="더 보기">${icon('more')}</button>
+      <div class="event-menu-panel" id="event-menu-panel" role="menu" aria-labelledby="event-menu-toggle" hidden>
+        ${!event.parent ? `<button type="button" class="event-menu-item" role="menuitem" data-action="new-child"${exclusiveActive() ? ' disabled' : ''}>${icon('plus')}<span>소분류 추가</span></button>` : ''}
+        <button type="button" class="event-menu-item" role="menuitem" data-action="edit-event"${exclusiveActive() ? ' disabled' : ''}>${icon('edit')}<span>${event.parent ? '소분류 수정' : '이벤트 수정'}</span></button>
+        <hr class="event-menu-sep" role="separator">
+        <button type="button" class="event-menu-item danger" role="menuitem" data-action="delete-event"${exclusiveActive() ? ' disabled' : ''}>${icon('trash')}<span>${event.parent ? '소분류 삭제' : '이벤트 삭제'}</span></button>
+      </div>
+    </div>` : '');
   const search = page.querySelector('#event-search');
   if (search.value !== view.eventQuery) search.value = view.eventQuery;
-  const storage = page.querySelector('#event-storage');
-  if (storage.value !== view.eventStorage) storage.value = view.eventStorage;
   const devices = [...new Set(files.map(file => file.device).filter(Boolean))];
   const device = page.querySelector('#event-device');
   setSlotHtml(device, `<option value="">모든 장비</option><option value="missing">장비 확인 필요</option>${devices.map(name => `<option value="device:${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}`);
@@ -1421,6 +1460,20 @@ function patchEventsPage() {
   }
   patchEventRows(event, filtered);
   syncEventSelection(event, filtered);
+  syncEventMenu();
+}
+
+function syncEventMenu() {
+  const trigger = page.querySelector('#event-menu-toggle');
+  const panel = page.querySelector('#event-menu-panel');
+  if (trigger) trigger.setAttribute('aria-expanded', String(view.eventMenuOpen));
+  if (panel) panel.hidden = !view.eventMenuOpen;
+}
+
+function closeEventMenu({ restoreFocus = false } = {}) {
+  view.eventMenuOpen = false;
+  syncEventMenu();
+  if (restoreFocus) page.querySelector('#event-menu-toggle')?.focus({ preventScroll: true });
 }
 
 function sourceFolders(file) {
@@ -1623,16 +1676,25 @@ function openRemoteIndexDialog() {
       <option value="">전체 아카이브 루트 (${escapeHtml(view.archive.root)})</option>
       ${currentScope ? `<option value="${escapeHtml(currentScope)}">현재 폴더만 (${escapeHtml(currentScope)})</option>` : ''}
     </select></label>
-    <label class="checkbox-row"><input type="checkbox" name="full_rehash" value="1"><span>크기·수정 시각이 같은 파일도 전체 해시 다시 검증</span></label>`,
+    <label class="checkbox-row"><input type="checkbox" name="full_rehash" value="1"><span>크기·수정 시각이 같은 파일도 전체 해시 다시 검증</span></label>
+    <label class="checkbox-row"><input type="checkbox" name="generate_thumbnails" value="1" ${view.remoteIndexGenerateThumbnails ? 'checked' : ''}><span>인덱싱 시 누락된 사진·영상 썸네일도 함께 생성</span></label>
+    <p class="small muted">기존 캐시는 재사용합니다. 원격 영상은 NAS ffmpeg를 우선 사용하고, 미설치 시 150 MiB 이하만 내려받습니다.</p>`,
   '인덱싱 시작', async form => {
     const scope = String(form.get('scope') || '');
     const fullRehash = form.get('full_rehash') === '1';
+    view.remoteIndexGenerateThumbnails = form.get('generate_thumbnails') === '1';
+    storePreference('photo-saver-remote-index-thumbs', view.remoteIndexGenerateThumbnails ? '1' : '0');
     const result = await api('archive/index', 'POST', {
       connection: view.archive.connectionVersion, path: scope, full_rehash: fullRehash,
+      generate_thumbnails: view.remoteIndexGenerateThumbnails,
     });
     setOptimisticJob({ id: result.id, kind: 'remote-index', status: 'queued', result: { scope } });
     await syncState();
     announce('원격 아카이브 인덱싱을 시작합니다.');
+  });
+  dialog.querySelector('[name="generate_thumbnails"]')?.addEventListener('change', event => {
+    view.remoteIndexGenerateThumbnails = event.target.checked;
+    storePreference('photo-saver-remote-index-thumbs', event.target.checked ? '1' : '0');
   });
 }
 
@@ -2017,13 +2079,62 @@ function catalogRowDetail(row, index) {
   return `<tr class="catalog-detail-row" id="catalog-detail-${index}"><td colspan="3" class="catalog-cell-detail"><dl class="catalog-detail-grid">${details}</dl></td></tr>`;
 }
 
+function catalogThumbnailStatus(row) {
+  return view.thumbnailGeneratingShas.has(row.sha) && row.thumbnail_status !== 'ready' ? 'generating' : row.thumbnail_status || 'unavailable';
+}
+
+function catalogThumbSlot(row, index, card = false) {
+  const kind = row.media_kind || row.kind;
+  const status = kind === 'xmp' ? 'non_media' : catalogThumbnailStatus(row);
+  const labels = { missing: '썸네일 미생성', generating: '생성 중', unavailable: '생성 불가', failed: '생성 실패', skipped_large: '대용량 건너뜀', non_media: 'XMP' };
+  const content = status === 'ready' ? `<img src="${escapeHtml(row.thumbnail)}" alt="" loading="lazy" decoding="async">${kind === 'video' ? '<span class="catalog-video-badge" aria-label="영상">▶</span>' : ''}`
+    : `<span class="catalog-thumb-placeholder${status === 'generating' ? ' is-generating' : ''}">${icon(kind === 'xmp' ? 'file' : kind === 'video' ? 'video' : 'photo')}<span class="${card || kind === 'xmp' ? 'small' : 'sr-only'}">${labels[status]}</span></span>`;
+  const attrs = `class="catalog-thumb ${card ? 'catalog-card-media' : 'thumb'} is-${status}" title="${escapeHtml(row.thumbnail_error || labels[status] || row.name)}"`;
+  if (kind === 'xmp' || status === 'unavailable') return `<div ${attrs}>${content}</div>`;
+  if (status === 'generating') return `<button type="button" ${attrs} disabled aria-busy="true" aria-label="${escapeHtml(row.name)} 썸네일 생성 중">${content}</button>`;
+  if (status === 'missing' && row.can_generate_thumbnail) {
+    if (card) return `<div ${attrs}>${content}${button('generate-catalog-thumb', '썸네일 생성', { extra: `data-value="${escapeHtml(row.sha)}"`, disabled: exclusiveActive() })}</div>`;
+    return `<button type="button" ${attrs} data-action="generate-catalog-thumb" data-value="${escapeHtml(row.sha)}" aria-label="${escapeHtml(row.name)} 썸네일 생성" ${exclusiveActive() ? 'disabled' : ''}>${content}</button>`;
+  }
+  return `<button type="button" ${attrs} data-action="preview-catalog" data-value="${escapeHtml(catalogRowKey(row, index))}" aria-label="${escapeHtml(row.name)} 미리보기">${content}</button>`;
+}
+
+function catalogGenerateButton(row) {
+  if (!row.can_generate_thumbnail || !['missing', 'failed', 'skipped_large'].includes(catalogThumbnailStatus(row))) return '';
+  return button('generate-catalog-thumb', ['failed', 'skipped_large'].includes(row.thumbnail_status) ? '다시 시도' : '썸네일 생성', { extra: `data-value="${escapeHtml(row.sha)}"`, disabled: exclusiveActive() });
+}
+
+function catalogThumbnailAlert() {
+  const job = lanes.map(activeLaneJob).find(job => job?.kind.startsWith('thumbnails-'));
+  if (job) return `<div class="catalog-thumb-alert" role="status"><span>${escapeHtml(job.result?.phase || '썸네일 생성 대기 중')}</span>${button('cancel-thumbnail-job', '생성 중지', { extra: `data-value="${job.id}"`, disabled: job.result?.cancelRequested })}</div>`;
+  const missing = view.catalog?.missingThumbnails;
+  return missing?.total > 0 ? `<div class="catalog-thumb-alert" role="status"><span class="small">썸네일 미생성 <strong>${missing.total}개</strong> (사진 ${missing.photos} · 영상 ${missing.videos})</span>${button('open-thumbnail-batch', '누락 썸네일 생성', { extra: 'data-value="folder"' })}</div>` : '';
+}
+
+function catalogCardItem(row, index) {
+  const key = catalogRowKey(row, index);
+  const name = (row.media_kind || row.kind) === 'xmp' ? `<strong>${escapeHtml(row.name)}</strong>` : `<button type="button" class="catalog-file-preview" data-action="preview-catalog" data-value="${escapeHtml(key)}"><strong>${escapeHtml(row.name)}</strong></button>`;
+  const path = row.remote_path || row.target || row.download_path;
+  const status = view.catalogTab === 'remote' ? `<span class="status ${row.status === 'present' ? 'archived' : 'review'}">${row.status === 'present' ? 'NAS 보관' : 'NAS 누락'}</span>`
+    : view.catalogTab === 'archives' ? `<span class="status ${row.outcome === 'failed' ? 'review' : 'draft'}">${escapeHtml(({ uploaded: '업로드 검증', skipped: '동일 파일 확인', legacy_verified: '과거 전송 완료', failed: '전송 실패', pending: '진행 대기', unknown: '결과 미기록' })[row.outcome] || '결과 미기록')}</span>` : catalogFileStatus(row);
+  return `<article class="catalog-card">${catalogThumbSlot(row, index, true)}<div class="catalog-card-body">${name}${status}<p class="small muted">${escapeHtml(row.event_name || row.catalog_event_name || '미배정')} · ${sizeLabel(row.size == null ? null : row.size / 1e6)}</p><p class="small muted catalog-path">${escapeHtml(path || row.local_path || '')}</p>${row.thumbnail_error ? `<p class="small form-error">${escapeHtml(row.thumbnail_error)}</p>` : ''}</div><div class="catalog-row-actions">${row.can_download ? `<a class="button" href="/api/archive/download?path=${encodeURIComponent(path)}" target="_blank" rel="noopener">NAS 다운로드</a>` : ''}${catalogGenerateButton(row)}${button('open-catalog-detail-dialog', '상세', { extra: `data-value="${escapeHtml(key)}"` })}</div></article>`;
+}
+
+function openCatalogDetailDialog(key) {
+  const index = view.catalog?.rows.findIndex((row, i) => catalogRowKey(row, i) === key) ?? -1;
+  const row = index >= 0 ? view.catalog.rows[index] : view.preview?.detachedCatalogFile?.id === key ? view.preview.detachedCatalogFile : null;
+  if (!row) return;
+  const details = catalogRowDetail(row, Math.max(0, index)).match(/<dl[\s\S]*<\/dl>/)?.[0] || '';
+  showDialog(escapeHtml(row.name), details, null, null, { scrollBody: true });
+}
+
 function catalogTableRow(row, index, labels) {
   const archives = view.catalogTab === 'archives', remote = view.catalogTab === 'remote';
   const rowKey = catalogRowKey(row, index), expanded = view.catalogExpandedRows.has(rowKey);
   const size = sizeLabel(row.size == null ? null : row.size / 1_000_000);
   const kind = row.kind === 'xmp' ? 'XMP' : row.kind === 'video' ? '영상' : '사진';
   const path = (value, prefix = '') => `<div class="small muted catalog-path mono" title="${escapeHtml(value)}">${prefix}${escapeHtml(formatRelativePath(value, row.name))}</div>`;
-  let file = `<strong>${escapeHtml(row.name)}</strong>${row.kind === 'xmp' ? ' <span class="catalog-kind-tag">XMP</span>' : ''}`;
+  let file = `${(row.media_kind || row.kind) !== 'xmp' ? `<button type="button" class="catalog-file-preview" data-action="preview-catalog" data-value="${escapeHtml(rowKey)}"><strong>${escapeHtml(row.name)}</strong></button>` : `<strong>${escapeHtml(row.name)}</strong>`}${row.kind === 'xmp' ? ' <span class="catalog-kind-tag">XMP</span>' : ''}`;
   if (remote) file += path(row.remote_path) + catalogRootException(row);
   else if (archives) file += (row.target ? path(row.target) : '<div class="small muted catalog-path">목적지 미기록</div>') + catalogRootException(row);
   else if (row.location === 'incoming') file += `<div class="small muted catalog-path mono">${escapeHtml(`incoming/${row.local_path}`)}</div>`;
@@ -2037,8 +2148,8 @@ function catalogTableRow(row, index, labels) {
     : archives ? `<span class="status ${outcome[1]}">${escapeHtml(outcome[0])}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}`
       : catalogFileStatus(row);
   const downloadPath = remote ? row.remote_path : archives ? row.target : row.download_path;
-  status += `<div class="catalog-row-actions">${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(downloadPath)}" target="_blank" rel="noopener">${archives || remote ? '다운로드' : 'NAS 다운로드'}</a>` : ''}<button type="button" class="button catalog-detail-toggle" data-action="toggle-catalog-detail" data-value="${escapeHtml(rowKey)}" aria-expanded="${expanded}"${expanded ? ` aria-controls="catalog-detail-${index}"` : ''} aria-label="${escapeHtml(row.name)} 상세 정보 ${expanded ? '접기' : '펼치기'}">상세</button></div>`;
-  return `<tr class="catalog-row" data-expanded="${expanded}"><td class="catalog-cell-file" data-label="${labels[0]}">${file}</td><td class="catalog-cell-meta" data-label="${labels[1]}">${meta}</td><td class="catalog-cell-status" data-label="${labels[2]}">${status}</td></tr>${expanded ? catalogRowDetail(row, index) : ''}`;
+  status += `<div class="catalog-row-actions">${catalogGenerateButton(row)}${row.thumbnail_error ? `<span class="small form-error">${escapeHtml(row.thumbnail_error)}</span>` : ''}${row.can_download ? `<a class="time-edit-link" href="/api/archive/download?path=${encodeURIComponent(downloadPath)}" target="_blank" rel="noopener">${archives || remote ? '다운로드' : 'NAS 다운로드'}</a>` : ''}<button type="button" class="button catalog-detail-toggle" data-action="toggle-catalog-detail" data-value="${escapeHtml(rowKey)}" aria-expanded="${expanded}"${expanded ? ` aria-controls="catalog-detail-${index}"` : ''} aria-label="${escapeHtml(row.name)} 상세 정보 ${expanded ? '접기' : '펼치기'}">상세</button></div>`;
+  return `<tr class="catalog-row" data-expanded="${expanded}"><td class="catalog-cell-file" data-label="${labels[0]}"><div class="file-cell">${catalogThumbSlot(row, index)}<div class="file-cell-body">${file}</div></div></td><td class="catalog-cell-meta" data-label="${labels[1]}">${meta}</td><td class="catalog-cell-status" data-label="${labels[2]}">${status}</td></tr>${expanded ? catalogRowDetail(row, index) : ''}`;
 }
 
 function catalogPage() {
@@ -2049,6 +2160,7 @@ function catalogPage() {
     ? [['all', '모든 원격 파일'], ['present', 'NAS 보관'], ['remote_only', '원격 전용 (카탈로그 미등록)'], ['missing', 'NAS 누락'], ['xmp', 'XMP']]
     : archives ? [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '전송 실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']]
       : [['all', '모든 파일'], ['managed', '관리 파일 (로컬·NAS)'], ['incoming', 'Incoming 기록'], ['verified', 'NAS 검증 이력 있음'], ['xmp', 'XMP']];
+  options.push(['no_thumbnail', '썸네일 없음']);
   const labels = remote ? ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각']
     : archives ? ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각'] : ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태'];
   const summaryText = !summary ? '기록을 확인하고 있습니다.' : remote
@@ -2065,16 +2177,16 @@ function catalogPage() {
       </div><p class="catalog-summary small muted">${summaryText}</p></div>
       <div id="catalog-tabpanel" role="tabpanel" aria-labelledby="catalog-tab-${view.catalogTab}">
       <div class="catalog-layout">${catalogFolderTree()}<div class="catalog-content">
-      <div class="catalog-context-bar"><div class="catalog-location" aria-label="${remote ? '현재 원격 폴더' : '현재 이벤트 폴더'}">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>${archives || remote ? rootBadge : ''}</div>
+      <div class="catalog-context-bar"><div class="catalog-location" aria-label="${remote ? '현재 원격 폴더' : '현재 이벤트 폴더'}">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>${archives || remote ? rootBadge : ''}${catalogThumbnailAlert()}</div>
       <form id="catalog-search" class="catalog-tools">
         <label class="search">${icon('search')}<span class="sr-only">파일 기록 검색</span><input id="catalog-query" name="query" type="search" maxlength="300" placeholder="파일명·경로·SHA-256 검색" value="${escapeHtml(view.catalogQuery)}"></label>
         <select id="catalog-scope" name="scope" aria-label="파일 기록 필터">${options.map(([value, label]) => `<option value="${value}" ${view.catalogScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
         <button type="submit" class="button" ${view.catalogBusy ? 'disabled' : ''}>검색</button>
-        ${hasFilter ? button('reset-catalog-filters', '필터 초기화') : ''}
+        ${hasFilter ? button('reset-catalog-filters', '필터 초기화') : ''}<div class="view-switch view-switch-icon" role="group" aria-label="기록 보기 방식">${[ ['table', '표 보기', 'table'], ['cards', '카드 보기', 'grid'] ].map(([value, label, glyph]) => button('catalog-view', label, { glyph, extra: `data-value="${value}" aria-pressed="${view.catalogView === value}"` })).join('')}</div>
       </form>
       ${view.catalogError ? `<p class="archive-error form-error" role="alert">${escapeHtml(view.catalogError)}</p>` : ''}
       <div class="catalog-results${view.catalogBusy ? ' is-loading' : ''}" aria-busy="${view.catalogBusy}">
-      ${view.catalogBusy && !view.catalogSoftLoading ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
+      ${view.catalogBusy && !view.catalogSoftLoading ? emptyState('file', '기록을 불러오고 있습니다.') : data?.rows.length ? view.catalogView === 'cards' ? `<div class="catalog-cards incoming-cards">${data.rows.map(catalogCardItem).join('')}</div>` : `<div class="table-wrap catalog-table-wrap" tabindex="0" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브' : '파일'} 기록 표, 가로 스크롤 가능"><table class="catalog-table" aria-label="${remote ? '원격 인덱스' : archives ? '아카이브 기록' : '파일 해시 기록'}">
         <thead><tr>${labels.map(label => `<th scope="col">${label}</th>`).join('')}</tr></thead>
         <tbody>${data.rows.map((row, index) => catalogTableRow(row, index, labels)).join('')}</tbody></table></div>` : emptyState('file', view.catalogError ? '기록을 불러오지 못했습니다.' : hasFilter ? '조건에 맞는 기록이 없습니다.' : remote ? '인덱싱된 원격 파일이 없습니다.' : archives ? '아카이브 전송 기록이 없습니다.' : '파일 기록이 없습니다.', remote ? '아카이브 전송 페이지에서 원격 스토리지에 연결한 뒤 원격 인덱싱을 실행하세요.' : archives ? '아카이브 전송 결과가 이곳에 기록됩니다.' : '가져오기에서 파일을 검사하면 해시 기록을 확인할 수 있습니다.')}
       </div>
@@ -2218,7 +2330,7 @@ function jobHistoryActions(job) {
   return '';
 }
 function patchJobCard(node, job) {
-  const kinds = { scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
+  const kinds = { "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
   const statuses = { queued: '대기 중', running: '진행 중', done: '완료', failed: '실패', cancelled: '중지됨' };
   const result = job.result || {}, active = isJobActive(job), key = jobHistoryKey(job);
   setSlotHtml(node.querySelector('[data-slot="head"]'), `<div><strong>${escapeHtml(kinds[job.kind] || job.kind)}</strong> ${badge(active ? 'draft' : jobHasAttention(job) ? 'review' : 'ready', statuses[job.status] || job.status)}${job.source === 'device' ? '<span class="job-source-tag">이 브라우저 기록</span>' : `<span class="small muted">#${job.id}</span>`}</div><time class="small muted">${catalogTime(job.createdAt)}</time>`);
@@ -2265,6 +2377,92 @@ function maskedSetting(status) {
 function visibleSetting(value) {
   if (value) return `<code class="setting-value mono">${escapeHtml(value)}</code>`;
   return `<span class="small muted">${view.settings ? '미등록' : '확인 중'}</span>`;
+}
+
+function thumbnailJobMessage(r) {
+  return `썸네일 ${r.generated || 0}개 생성${r.reused ? ` · 기존 ${r.reused}개 재사용` : ''}${r.skippedLarge ? ` · 대용량 건너뜀 ${r.skippedLarge}개` : ''}${r.failed ? ` · 실패 ${r.failed}개` : ''}`;
+}
+
+async function loadThumbnailStats({ silent = false } = {}) {
+  try { view.thumbnailStats = await api('settings/thumbnails'); view.thumbnailStatsError = ''; }
+  catch (error) { view.thumbnailStatsError = error.message; }
+  if (!silent) render();
+}
+
+function thumbnailSettingsSection() {
+  const s = view.thumbnailStats;
+  return `<section class="surface settings-section" aria-label="썸네일 캐시"><div class="surface-head"><h2>${icon('photo')} 썸네일 캐시</h2></div>
+    ${view.thumbnailStatsError ? `<p class="form-error" role="alert">${escapeHtml(view.thumbnailStatsError)}</p>` : ''}
+    ${s ? `<dl class="thumbnail-stats"><div><dt>캐시된 썸네일</dt><dd>${s.cachedCount}개 · ${sizeLabel(s.cachedBytes / 1e6)}</dd></div><div><dt>미생성 미디어</dt><dd>${s.missingTotal}개 (로컬 ${s.missingLocal} · 원격 사진 ${s.missingRemotePhotos} · 원격 영상 ${s.missingRemoteVideos})</dd></div><div><dt>미참조(고아) 캐시</dt><dd>${s.orphanCount}개 · ${sizeLabel(s.orphanBytes / 1e6)}</dd></div><div><dt>실패·대용량 건너뜀</dt><dd>실패 ${s.failedCount}개 · 건너뜀 ${s.skippedLargeCount}개</dd></div></dl>` : '<p role="status">캐시 현황을 불러오는 중입니다.</p>'}
+    <p class="small muted">DB 복원 후 누락 썸네일 일괄 생성으로 이미지를 복구할 수 있습니다.${anyJobActive() ? ' 미참조 캐시 정리는 모든 작업이 끝난 뒤 가능합니다.' : ''}</p>
+    <div class="thumbnail-settings-actions">${button('refresh-thumbnail-stats', '현황 새로고침', { disabled: view.thumbnailOpBusy })}${button('open-thumbnail-batch', '누락 썸네일 일괄 생성', { extra: 'data-value="all"', disabled: !s?.missingTotal || exclusiveActive() })}${button('cleanup-orphan-thumbnails', '미참조 썸네일 정리', { disabled: !s?.orphanCount || !s?.canCleanup || anyJobActive() || view.thumbnailOpBusy })}${button('reset-thumbnail-failures', '실패 상태 초기화', { disabled: !((s?.failedCount || 0) + (s?.skippedLargeCount || 0)) || view.thumbnailOpBusy || exclusiveActive() })}</div></section>`;
+}
+
+function thumbnailScopeRequest(scope) {
+  return { scope, view: view.catalogTab, event: view.catalogEvent, device: view.catalogDevice, folder: view.catalogRemoteFolder };
+}
+
+async function openThumbnailBatchDialog(defaultScope = 'folder') {
+  let scope = defaultScope;
+  const hasFolder = view.page === 'catalog' && (view.catalogTab === 'remote' ? view.catalogRemoteFolder : view.catalogEvent !== 'all' || view.catalogDevice);
+  if (!hasFolder) scope = 'all';
+  const plan = await api('thumbnails/plan', 'POST', thumbnailScopeRequest(scope));
+  showDialog('누락 썸네일 일괄 생성', `${hasFolder ? `<fieldset><legend>생성 범위</legend>${[['folder', '현재 폴더 범위'], ['all', '전체 미생성']].map(([value, label]) => `<label class="checkbox-row"><input type="radio" name="thumbnail_scope" value="${value}" ${scope === value ? 'checked' : ''}>${label}</label>`).join('')}</fieldset>` : ''}<div id="thumbnail-plan" role="status"></div><div id="thumbnail-fallback"></div>`, '썸네일 생성', async form => {
+    const result = await api('jobs/thumbnails', 'POST', { ...thumbnailScopeRequest(scope), allow_large_sftp_fallback: form.get('allow_large_sftp_fallback') === '1' });
+    if (result.id) setOptimisticJob({ ...result, result: { phase: '썸네일 생성 대기 중' } });
+    await syncState();
+  });
+  let requestVersion = 0;
+  const paint = plan => {
+    const busy = plan.lane === 'remote' ? remoteBusy() : localBusy();
+    dialog.querySelector('#thumbnail-plan').innerHTML = `<p>로컬 원본 <strong>${plan.local}개</strong> · 원격 사진 ${plan.remotePhotos}개 · 원격 영상 ${plan.remoteVideos}개</p><p class="small muted">예상 디스크 증가량 ${sizeLabel(plan.estimatedBytes / 1e6)} · ${plan.lane === 'remote' ? '원격 작업' : '로컬 작업'}</p>${busy ? '<p class="form-error">해당 작업 레인이 사용 중입니다. 완료 후 다시 실행하세요.</p>' : ''}${plan.lane === 'remote' && !plan.storageConfigured ? '<p class="form-error">설정에서 NAS 연결을 준비하세요.</p>' : ''}`;
+    dialog.querySelector('#thumbnail-fallback').innerHTML = plan.remoteVideos ? `<label class="checkbox-row"><input type="checkbox" name="allow_large_sftp_fallback" value="1"><span>NAS에 ffmpeg가 없을 때 150 MiB 초과 영상도 SFTP로 내려받아 추출</span></label><p class="small muted">현재 대상 중 150 MiB 초과 원격 영상 ${plan.remoteVideosOverLimit}개가 있습니다.</p>` : '';
+    dialog.querySelector('[type="submit"]').disabled = !plan.total || busy || (plan.lane === 'remote' && !plan.storageConfigured);
+  };
+  paint(plan);
+  dialog.querySelectorAll('[name="thumbnail_scope"]').forEach(input => input.addEventListener('change', async event => {
+    scope = event.target.value;
+    const version = ++requestVersion;
+    dialog.querySelector('[type="submit"]').disabled = true;
+    try {
+      const next = await api('thumbnails/plan', 'POST', thumbnailScopeRequest(scope));
+      if (version === requestVersion && dialog.open) paint(next);
+    } catch (error) {
+      if (version === requestVersion) dialog.querySelector('#thumbnail-plan').textContent = error.message;
+    }
+  }));
+}
+
+async function generateCatalogThumbnail(sha) {
+  if (view.thumbnailGeneratingShas.has(sha)) return;
+  view.thumbnailGeneratingShas.add(sha);
+  if (view.preview?.source === 'catalog') renderMediaPreview({ focusTitle: false });
+  let result;
+  try { result = await api('jobs/thumbnails', 'POST', { scope: 'shas', shas: [sha] }); }
+  catch (error) {
+    view.thumbnailGeneratingShas.delete(sha);
+    if (view.preview?.source === 'catalog') renderMediaPreview({ focusTitle: false });
+    throw error;
+  }
+  if (result.id) {
+    setOptimisticJob({ ...result, result: { phase: '썸네일 생성 대기 중' } });
+  }
+  else view.thumbnailGeneratingShas.delete(sha);
+  if (view.preview?.source === 'catalog') renderMediaPreview({ focusTitle: false });
+  if (result.status === 'noop') { await loadCatalog({ soft: true }); reconcilePreview(); }
+  else await syncState();
+  render();
+}
+
+async function thumbnailCacheOperation(path) {
+  if (view.thumbnailOpBusy) return;
+  view.thumbnailOpBusy = true; render();
+  try {
+    const result = await api('settings/thumbnails/' + path, 'POST');
+    view.thumbnailStats = result.stats;
+    announce(path === 'cleanup' ? `미참조 썸네일 ${result.deleted}개 정리` : `실패 상태 ${result.cleared}개 초기화`);
+    if (view.page === 'catalog') await loadCatalog({ soft: true });
+  } finally { view.thumbnailOpBusy = false; render(); }
 }
 
 function settingsPage() {
@@ -2315,11 +2513,12 @@ function settingsPage() {
       <div class="surface-head"><h2>${icon('file')} DB 백업 및 복원</h2></div>
       ${settingRow('카탈로그 백업', '이벤트와 파일 분류 상태가 포함된 SQLite 백업을 다운로드합니다.',
         button('download-catalog', 'DB 백업 다운로드', { glyph: 'download', disabled: anyJobActive() || view.catalogOpBusy }))}
-      ${settingRow('카탈로그 복원', '선택한 백업의 내용으로 현재 카탈로그를 교체합니다.',
+      ${settingRow('카탈로그 복원', '선택한 백업의 내용으로 현재 카탈로그를 교체합니다. 썸네일 이미지 파일은 DB 백업에 포함되지 않습니다. 복원 후 아래 썸네일 캐시의 누락 썸네일 일괄 생성으로 복구할 수 있습니다.',
         `<input id="restore-catalog-file" type="file" accept=".sqlite3,.sqlite,.db,application/octet-stream" hidden>` +
         (view.restoreFile ? maskedSetting('파일 선택됨') : '') + button('pick-catalog-file', '백업 파일 선택', { disabled: anyJobActive() || view.catalogOpBusy }) +
         button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || anyJobActive() || view.catalogOpBusy }))}
     </section>
+    ${thumbnailSettingsSection()}
     <section class="surface settings-section settings-danger" aria-label="데이터 초기화">
       <div class="surface-head"><h2>${icon('trash')} 데이터 초기화</h2><span class="settings-danger-badge">위험 구역</span></div>
       ${settingRow('managed 및 기록 초기화', 'managed 원본과 부가 파일, 썸네일, 카탈로그·작업 기록을 영구 삭제합니다. incoming과 SSH 연결 설정은 유지합니다.',
@@ -2329,6 +2528,7 @@ function settingsPage() {
 }
 
 async function loadSettings() {
+  await loadThumbnailStats({ silent: true });
   await loadDevices();
   try {
     view.settings = await api('settings');
@@ -2530,6 +2730,7 @@ function resetStatus() {
 }
 
 function clearCatalogViews() {
+  view.thumbnailStats = null; view.thumbnailStatsError = ''; view.thumbnailGeneratingShas.clear();
   cancelCatalogSearchDebounce(); clearDismissedResults(); clearDeviceUploadHistory();
   ++jobsRequest;
   Object.assign(view.jobs, { items: [], summary: null, nextBeforeId: null, hasMore: false, busy: false, loadingMore: false, loadedOnce: false, error: '' });
@@ -2803,7 +3004,8 @@ function chooseEvent(id) {
   if (view.eventId !== id) page.querySelector('#event-rows')?.scrollTo(0, 0);
   view.eventId = id;
   view.eventSelection.clear();
-  view.eventStorage = '';
+  view.eventLifecycle = 'all';
+  view.eventMenuOpen = false;
   view.eventDevice = '';
   view.eventDate = '';
   view.eventQuery = '';
@@ -2835,7 +3037,8 @@ function renderNavigation() {
   }).join('')}</div>`).join(''));
 }
 function render() {
-  const catalogScroll = page.querySelector('.catalog-table-wrap');
+  const windowScroll = window.scrollY || 0;
+  const catalogScroll = page.querySelector('.catalog-table-wrap, .catalog-cards');
   const catalogScrollPosition = catalogScroll ? { top: catalogScroll.scrollTop, left: catalogScroll.scrollLeft } : null;
   const folderScroll = page.querySelector('.catalog-folder-list')?.scrollTop || 0;
   const active = document.activeElement;
@@ -2844,6 +3047,7 @@ function render() {
   const route = location.hash.slice(1);
   const current = navigation.find(item => item.id === route) || navigation[0];
   const pageChanged = view.page !== current.id;
+  if (pageChanged) view.eventMenuOpen = false;
   const views = { archive: archivePage, catalog: catalogPage, settings: settingsPage };
   view.page = current.id;
   renderNavigation();
@@ -2870,7 +3074,8 @@ function render() {
     window.scrollTo(0, 0);
     return;
   }
-  if (catalogScrollPosition) page.querySelector('.catalog-table-wrap')?.scrollTo(catalogScrollPosition);
+  if (view.page === 'catalog') window.scrollTo(0, windowScroll);
+  if (catalogScrollPosition) page.querySelector('.catalog-table-wrap, .catalog-cards')?.scrollTo(catalogScrollPosition);
   page.querySelector('.catalog-folder-list')?.scrollTo(0, folderScroll);
   if (pendingPreviewFocus) {
     const focusIntent = pendingPreviewFocus;
@@ -3052,10 +3257,17 @@ async function confirmIncomingCleanup() {
 }
 
 function previewCollection(source) {
+  if (source === 'catalog') {
+    const files = (view.catalog?.rows || []).map((row, index) => ({ ...row, id: catalogRowKey(row, index), kind: row.media_kind || row.kind, thumbnail_status: catalogThumbnailStatus(row) }));
+    const detached = view.preview?.source === 'catalog' ? view.preview.detachedCatalogFile : null;
+    if (detached && !files.some(file => file.id === detached.id)) files.push(detached);
+    return files;
+  }
   return source === 'managed' ? state.managed : state.incoming;
 }
 
 function isPreviewableFile(source, file) {
+  if (source === 'catalog') return Boolean(file && file.kind !== 'xmp');
   if (!file || !file.preview) return false;
   return source === 'managed' ? file.status === 'available' : true;
 }
@@ -3079,6 +3291,7 @@ function previewEventLabel(file) {
 }
 
 function previewMetaHtml(source, file) {
+  if (source === 'catalog') return `<span>${escapeHtml(file.remote_path || file.target || file.download_path || file.local_path || file.name)}</span> · ${sizeLabel(file.size == null ? null : file.size / 1e6)}`;
   if (source === 'managed') {
     const eventName = previewEventLabel(file);
     return `<span class="mono">${escapeHtml(`managed/${file.path}`)}</span> · ${sizeLabel(file.size)}${eventName ? ` · 이벤트: ${escapeHtml(eventName)}` : ''}`;
@@ -3131,6 +3344,11 @@ function restorePreviewFocus(closing) {
   const source = closing.returnFocus?.source || closing.source;
   const currentId = closing.ids?.[closing.index];
   const originalId = closing.returnFocus?.id;
+  if (source === 'catalog' && view.page === 'catalog') {
+    const buttons = [...page.querySelectorAll('[data-action="preview-catalog"]')];
+    (buttons.find(element => element.dataset.value === currentId) || page.querySelector('#catalog-query'))?.focus({ preventScroll: true });
+    return;
+  }
   if (source === 'incoming' && view.page === 'incoming') {
     const buttons = [...page.querySelectorAll('[data-action="preview-incoming"]')];
     const target = buttons.find(element => element.dataset.value === currentId)
@@ -3202,10 +3420,23 @@ function openManagedPreview(id) {
   openMediaPreview('managed', id, ids, { source: 'managed', id, eventId: view.eventId });
 }
 
+function openCatalogPreview(key) {
+  const ids = previewCollection('catalog').filter(file => isPreviewableFile('catalog', file)).map(file => file.id);
+  openMediaPreview('catalog', key, ids, { source: 'catalog', id: key, tab: view.catalogTab });
+}
+
+function catalogPreviewStage(file) {
+  if (file.has_local_original && file.preview) return null;
+  if (file.thumbnail_status === 'ready') return `<div class="preview-stage is-cached-thumb"><img class="preview-cached-img" src="${escapeHtml(file.thumbnail)}" alt="${escapeHtml(file.name)}"><span class="status draft preview-cache-badge">캐시 썸네일 미리보기</span><p class="small muted">로컬 원본이 없어 서버 캐시 썸네일(360×240)을 표시합니다.${file.kind === 'video' ? ' 브라우저 재생을 하려면 NAS 원본을 다운로드하세요.' : ''}</p></div>`;
+  const generating = file.thumbnail_status === 'generating';
+  return `<div class="preview-stage is-empty-thumb"><div role="status">${icon(file.kind === 'video' ? 'video' : 'photo')}<p>${generating ? '썸네일을 생성하고 있습니다…' : file.thumbnail_status === 'unavailable' ? '로컬 원본과 활성 NAS 사본이 없어 썸네일을 생성할 수 없습니다.' : escapeHtml(file.thumbnail_error || '썸네일이 아직 없습니다.')}</p>${file.can_generate_thumbnail || generating ? button('generate-preview-thumb', generating ? '생성 중…' : ['failed', 'skipped_large'].includes(file.thumbnail_status) ? '다시 시도' : '지금 썸네일 생성', { disabled: generating }) : ''}</div></div>`;
+}
+
 function renderMediaPreview({ focusTitle = true } = {}) {
   const preview = view.preview;
   const file = currentPreviewFile(preview);
   if (!preview || !file) return;
+  if (preview.source === 'catalog') preview.catalogSnapshot = { ...file };
   disposePreviewMedia();
   const gen = previewMediaGeneration;
   const name = escapeHtml(file.name);
@@ -3237,6 +3468,16 @@ function renderMediaPreview({ focusTitle = true } = {}) {
   if (metaEl) metaEl.dataset.renderedHtml = metaHtml;
   preview.renderedSrc = file.preview || null;
   preview.renderedKind = file.kind || null;
+  if (preview.source === 'catalog') {
+    preview.renderedStage = file.thumbnail_status;
+    preview.renderedThumb = file.thumbnail;
+    const stage = catalogPreviewStage(file);
+    if (stage) {
+      const element = mediaPreview.querySelector('.preview-stage');
+      element.setAttribute('class', file.thumbnail_status === 'ready' ? 'preview-stage is-cached-thumb' : 'preview-stage is-empty-thumb');
+      element.innerHTML = stage.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '');
+    }
+  }
   renderPreviewFooter();
   if (!mediaPreview.open) mediaPreview.showModal();
   if (focusTitle) mediaPreview.querySelector('#media-preview-title')?.focus();
@@ -3288,7 +3529,7 @@ function renderPreviewFooter() {
   }) : '';
   const hint = preview.message
     ? escapeHtml(preview.message)
-    : isIncoming
+    : preview.source === 'catalog' ? '<kbd>←</kbd> <kbd>→</kbd> 이동' : isIncoming
       ? `<kbd>←</kbd> <kbd>→</kbd> 이동${canDelete ? ' · <kbd>Delete</kbd> 삭제' : ''}`
       : '닫은 뒤 선택 항목을 분류할 수 있습니다 · <kbd>←</kbd> <kbd>→</kbd> 이동';
   const html = `<div class="preview-controls" role="group" aria-label="파일 이동">
@@ -3296,7 +3537,7 @@ function renderPreviewFooter() {
       ${button('next-preview', '다음', { glyph: 'right', disabled: preview.index === preview.ids.length - 1 })}
     </div>
     <div class="preview-controls">
-      ${original}${selection}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
+      ${original}${preview.source === 'catalog' ? `${file.can_download ? `<a class="button" href="/api/archive/download?path=${encodeURIComponent(file.remote_path || file.target || file.download_path)}" target="_blank" rel="noopener">NAS 원본 다운로드</a>` : ''}${button('preview-catalog-detail', '상세 정보')}` : ''}${selection}${canDelete ? button('request-preview-delete', '사진 삭제', { glyph: 'trash', danger: true }) : ''}
     </div>
     <p class="preview-hint small muted" ${preview.message ? 'role="status"' : ''}>${hint}</p>`;
   if (footer.dataset.renderedHtml !== html) {
@@ -3324,6 +3565,20 @@ function isPendingPreviewDelete(preview) {
 function reconcilePreview({ preserveMessage = false } = {}) {
   const preview = view.preview;
   if (!preview || isPendingPreviewDelete(preview)) return;
+  if (preview.source === 'catalog' && view.catalogScope === 'no_thumbnail') {
+    const snapshot = preview.catalogSnapshot;
+    const currentId = preview.ids[preview.index];
+    const stillListed = view.catalog?.rows.some((row, index) => catalogRowKey(row, index) === currentId);
+    const generated = snapshot?.id === currentId && lanes.some(lane => {
+      const job = laneJob(lane);
+      return job?.kind.startsWith('thumbnails-') && !isJobActive(job)
+        && job.result?.items?.some(item => item.sha === snapshot.sha && ['generated', 'reused'].includes(item.status));
+    });
+    if (!stillListed && generated) {
+      preview.detachedCatalogFile = { ...snapshot, thumbnail_status: 'ready', thumbnail_error: '', can_generate_thumbnail: false,
+        thumbnail: `/thumbnails/${snapshot.sha}-v1.jpg` };
+    }
+  }
   const collection = previewCollection(preview.source);
   const byId = new Map(collection.map(file => [file.id, file]));
   const currentId = preview.ids[preview.index];
@@ -3336,7 +3591,8 @@ function reconcilePreview({ preserveMessage = false } = {}) {
   const survivingIndex = nextIds.indexOf(currentId);
   if (survivingIndex >= 0) {
     const currentFile = byId.get(currentId);
-    const mediaChanged = preview.renderedSrc !== (currentFile.preview || null) || preview.renderedKind !== (currentFile.kind || null);
+    const mediaChanged = preview.renderedSrc !== (currentFile.preview || null) || preview.renderedKind !== (currentFile.kind || null)
+      || (preview.source === 'catalog' && (preview.renderedStage !== currentFile.thumbnail_status || preview.renderedThumb !== currentFile.thumbnail));
     preview.ids = nextIds;
     preview.index = survivingIndex;
     if (mediaChanged) renderMediaPreview({ focusTitle: false });
@@ -3471,6 +3727,8 @@ function updatePreviewAfterDelete() {
 }
 
 const previewActions = {
+  'generate-preview-thumb': () => actions['generate-preview-thumb'](),
+  'preview-catalog-detail': () => actions['preview-catalog-detail'](),
   'previous-preview': () => stepPreview(-1),
   'next-preview': () => stepPreview(1),
   'close-preview': () => closeMediaPreview(),
@@ -3510,6 +3768,17 @@ function confirmOffload() {
 }
 
 const actions = {
+  'catalog-view'(value) { view.catalogView = value === 'cards' ? 'cards' : 'table'; storePreference('photo-saver-catalog-view', view.catalogView); render(); },
+  'preview-catalog': openCatalogPreview,
+  'open-catalog-detail-dialog': openCatalogDetailDialog,
+  'preview-catalog-detail'() { if (view.preview) openCatalogDetailDialog(view.preview.ids[view.preview.index]); },
+  'generate-catalog-thumb': generateCatalogThumbnail,
+  'generate-preview-thumb'() { const file = currentPreviewFile(); if (file && file.thumbnail_status !== 'generating') return generateCatalogThumbnail(file.sha); },
+  'open-thumbnail-batch': openThumbnailBatchDialog,
+  'refresh-thumbnail-stats': loadThumbnailStats,
+  'cleanup-orphan-thumbnails'() { return thumbnailCacheOperation('cleanup'); },
+  'reset-thumbnail-failures'() { return thumbnailCacheOperation('reset-failures'); },
+  async 'cancel-thumbnail-job'(id) { await api(`jobs/thumbnails/${id}/cancel`, 'POST'); await syncState(); },
   'incoming-tab'(value) {
     if (!['files', 'xmp', 'companions'].includes(value)) return;
     view.incomingTab = value;
@@ -3585,10 +3854,24 @@ const actions = {
   'restore-catalog': confirmCatalogRestore,
   'reset-catalog': confirmCatalogReset,
   'choose-event': chooseEvent,
+  'event-lifecycle'(value) {
+    if (!['all', 'draft', 'confirmed', 'archived'].includes(value)) return;
+    const next = value !== 'all' && view.eventLifecycle === value ? 'all' : value;
+    if (next === view.eventLifecycle) return;
+    view.eventLifecycle = next;
+    view.eventSelection.clear();
+  },
+  'reset-event-filters'() {
+    view.eventLifecycle = 'all';
+    view.eventDevice = '';
+    view.eventDate = '';
+    view.eventQuery = '';
+    view.eventSelection.clear();
+  },
   'new-event'() { createEventDialog(); },
-  'new-child'() { createEventDialog(eventById(view.eventId)); },
-  'edit-event'() { editEventDialog(eventById(view.eventId)); },
-  'delete-event'() { deleteEventDialog(eventById(view.eventId)); },
+  'new-child'() { closeEventMenu(); createEventDialog(eventById(view.eventId)); },
+  'edit-event'() { closeEventMenu(); editEventDialog(eventById(view.eventId)); },
+  'delete-event'() { closeEventMenu(); deleteEventDialog(eventById(view.eventId)); },
   async collect() {
     const result = await api(`events/${view.eventId}/collect`, 'POST');
     await syncState();
@@ -3660,6 +3943,11 @@ const actions = {
 page.addEventListener('click', async event => {
   const control = event.target.closest('button[data-action]');
   if (!control || control.disabled) return;
+  if (control.dataset.action === 'toggle-event-menu') {
+    view.eventMenuOpen = !view.eventMenuOpen;
+    syncEventMenu();
+    return;
+  }
   if (control.dataset.action === 'choose-incoming-upload-files') {
     // Safari requires the picker to open inside the original user gesture.
     if (!view.deviceUpload.running && !exclusiveActive() && !view.connecting) page.querySelector('#incoming-upload-input')?.click();
@@ -3796,10 +4084,6 @@ page.addEventListener('change', event => {
     view.incomingKind = control.value;
     pruneIncomingSelection();
     render();
-  } else if (control.id === 'event-storage') {
-    view.eventStorage = control.value;
-    view.eventSelection.clear();
-    render();
   } else if (control.id === 'event-device') {
     view.eventDevice = control.value;
     view.eventSelection.clear();
@@ -3848,7 +4132,39 @@ page.addEventListener('input', event => {
   updateIncomingSearch(event.target.value);
 });
 
+document.body.addEventListener('click', event => {
+  if (view.eventMenuOpen && !event.target.closest?.('#event-menu')) closeEventMenu();
+});
+
+document.body.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && view.eventMenuOpen && !dialog.open && !mediaPreview.open) {
+    event.preventDefault();
+    closeEventMenu({ restoreFocus: true });
+  }
+});
+
 page.addEventListener('keydown', event => {
+  const menuTrigger = event.target.closest('#event-menu-toggle');
+  const menuItem = event.target.closest('#event-menu-panel [role="menuitem"]');
+  if (menuTrigger && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+    event.preventDefault();
+    view.eventMenuOpen = true;
+    syncEventMenu();
+    const items = [...page.querySelectorAll('#event-menu-panel [role="menuitem"]')].filter(item => !item.disabled);
+    items[event.key === 'ArrowDown' ? 0 : items.length - 1]?.focus();
+    return;
+  }
+  if (menuItem && view.eventMenuOpen) {
+    if (event.key === 'Tab') { closeEventMenu(); return; }
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      const items = [...page.querySelectorAll('#event-menu-panel [role="menuitem"]')].filter(item => !item.disabled);
+      const index = items.indexOf(menuItem);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length;
+      items[next]?.focus();
+      return;
+    }
+  }
   const incomingTab = event.target.closest('[role="tab"][data-action="incoming-tab"]');
   if (incomingTab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
     event.preventDefault();
@@ -3904,9 +4220,12 @@ function isEditableOrMediaTarget(target) {
   return tag === 'VIDEO' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(target.isContentEditable);
 }
 
-mediaPreview.addEventListener('click', event => {
+mediaPreview.addEventListener('click', async event => {
   const action = event.target.closest('button[data-action]')?.dataset.action;
-  if (action && previewActions[action]) previewActions[action]();
+  if (action && previewActions[action]) {
+    try { await previewActions[action](); }
+    catch (error) { if (view.preview) view.preview.message = error.message; renderPreviewFooter(); announce(error.message); }
+  }
 });
 
 mediaPreview.addEventListener('keydown', event => {
@@ -3966,8 +4285,13 @@ for (const type of ['load', 'loadedmetadata']) {
   }, true);
 }
 
-dialog.addEventListener('click', event => {
-  if (event.target.closest('[data-action="close-dialog"]')) dialog.close();
+dialog.addEventListener('click', async event => {
+  const control = event.target.closest('button[data-action]');
+  if (control?.dataset.action === 'close-dialog') dialog.close();
+  else if (control?.dataset.action === 'copy-record-hash') {
+    try { await actions['copy-record-hash'](control.dataset.value); }
+    catch (error) { announce(error.message); }
+  }
 });
 
 document.querySelectorAll('[data-icon]').forEach(element => { element.innerHTML = icon(element.dataset.icon); });

@@ -41,6 +41,13 @@ class JobsApiTests(unittest.TestCase):
     def test_empty_summary_and_cursor(self):
         self.assertEqual(self.query(), {'jobs': [], 'summary': {'total': 0, 'active': 0, 'attention': 0, 'done': 0}, 'nextBeforeId': None, 'hasMore': False})
 
+    def test_thumbnail_kind_filters_and_incoming_result_isolation(self):
+        original = self.add('move', result={'moved': 1})
+        for kind, lane in [('thumbnails-local', 'local'), ('thumbnails-remote', 'remote')]:
+            job_id = self.add(kind, lane, result={'generated': 2})
+            self.assertEqual([job['id'] for job in self.query(kind=kind)['jobs']], [job_id])
+        self.assertEqual(api.state()['latestIncomingResult']['id'], original)
+
     def test_cursor_is_descending_and_stable_with_new_jobs(self):
         ids = [self.add() for _ in range(5)]
         first = self.query(limit=2)

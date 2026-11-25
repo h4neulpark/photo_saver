@@ -6,6 +6,7 @@ import re
 import sqlite3
 import unicodedata
 import uploads
+import thumbnails
 from contextlib import ExitStack, asynccontextmanager
 from datetime import date, datetime, timezone
 from io import BytesIO
@@ -415,7 +416,7 @@ def job_history_entry(row):
         if total > MAX_JOB_RESULT_LIST:
             if name == "items":
                 def attention(item):
-                    return not isinstance(item, dict) or item.get("status") not in {"moved", "deleted", "cleaned", "linked"}
+                    return not isinstance(item, dict) or item.get("status") not in {"moved", "deleted", "cleaned", "linked", "generated", "reused"}
                 values = [item for item in values if attention(item)] + [item for item in values if not attention(item)]
             result[name] = values[:MAX_JOB_RESULT_LIST]
         meta.update({f"{name}Total": total, f"{name}Shown": min(total, MAX_JOB_RESULT_LIST),
@@ -430,7 +431,7 @@ def job_history(
     before_id: int | None = Query(default=None, ge=1),
     lane: Literal["all", "local", "remote", "exclusive"] = "all",
     status: Literal["all", "active", "attention", "done", "failed", "cancelled"] = "all",
-    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all"] = "all",
+    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote"] = "all",
 ):
     clauses, params = [], []
     if before_id is not None:
@@ -763,7 +764,7 @@ def state():
         active = active_jobs_by_lane(db)
         jobs = latest_jobs_by_lane(db)
         latest_incoming_result = db.execute(
-            """SELECT * FROM jobs WHERE lane='local' AND kind<>'scan'
+            """SELECT * FROM jobs WHERE kind IN ('move','delete','duplicate-cleanup','xmp-link')
                AND status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         compat_job = active['exclusive'] or max(
@@ -791,6 +792,54 @@ def scan_library():
             return {"id": queue_job(db, "scan", {}), "lane": LANE_LOCAL}
         except ValueError as exc:
             error(409, str(exc))
+
+
+@app.post('/api/thumbnails/plan')
+def thumbnail_plan(request: thumbnails.ThumbnailRequest):
+    with database() as db:
+        plan, _ = thumbnails.plan_thumbnails(db, request)
+    return JSONResponse(plan, headers=NO_STORE)
+
+
+@app.post('/api/jobs/thumbnails', status_code=202)
+def start_thumbnails(request: thumbnails.ThumbnailRequest):
+    with database(write=True) as db:
+        result = thumbnails.queue_thumbnails(db, request)
+    return JSONResponse(result, status_code=200 if result['status'] == 'noop' else 202, headers=NO_STORE)
+
+
+@app.post('/api/jobs/thumbnails/{job_id}/cancel')
+def cancel_thumbnails(job_id: int):
+    with database(write=True) as db:
+        job = db.execute("SELECT * FROM jobs WHERE id=? AND kind IN ('thumbnails-local','thumbnails-remote')", (job_id,)).fetchone()
+        if not job:
+            error(404, '썸네일 생성 작업을 찾을 수 없습니다.')
+        if job['status'] in {'queued', 'running'}:
+            result = json.loads(job['result'] or '{}')
+            result.update(cancelRequested=True, phase='중지됨' if job['status'] == 'queued' else '중지 요청됨')
+            if job['status'] == 'queued':
+                result['error'] = '사용자가 썸네일 생성을 중지했습니다.'
+                db.execute("UPDATE jobs SET status='cancelled',finished_at=? WHERE id=?", (now(), job_id))
+            db.execute('UPDATE jobs SET result=? WHERE id=?', (json.dumps(result, ensure_ascii=False), job_id))
+        return view_job(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+
+
+@app.get('/api/settings/thumbnails')
+def get_thumbnail_stats():
+    with database() as db:
+        return JSONResponse(thumbnails.thumbnail_stats(db), headers=NO_STORE)
+
+
+@app.post('/api/settings/thumbnails/cleanup')
+def cleanup_thumbnail_cache():
+    return JSONResponse(thumbnails.cleanup_orphans(), headers=NO_STORE)
+
+
+@app.post('/api/settings/thumbnails/reset-failures')
+def reset_thumbnail_failures():
+    with database(write=True) as db:
+        cleared = db.execute("DELETE FROM thumbnail_cache WHERE status IN ('failed','skipped_large')").rowcount
+        return JSONResponse(dict(cleared=cleared, stats=thumbnails.thumbnail_stats(db)), headers=NO_STORE)
 
 
 @app.post("/api/archive/transfers", status_code=202)

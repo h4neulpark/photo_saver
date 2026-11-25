@@ -80,6 +80,8 @@ class CatalogResetTests(unittest.TestCase):
                     for table in catalog.CATALOG_TABLES}
 
     def test_deletes_managed_and_history_preserves_all_incoming_ssh_and_remote(self):
+        with catalog.database(write=True) as db:
+            db.execute("INSERT INTO thumbnail_cache(sha,status,updated_at) VALUES (?,'failed','now')", ('a' * 64,))
         protected = {str(p): p.read_bytes() for root in (self.settings_dir, self.fixture.remote)
                      for p in root.rglob('*') if p.is_file()}
         (self.root / '.env').write_text('deployment config')

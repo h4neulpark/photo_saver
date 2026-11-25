@@ -95,3 +95,8 @@ SQLite는 WAL, 외래 키 검사, 10초 연결 대기 시간을 사용한다. �
 | [records.py](../backend/records.py) | 로컬 파일·업로드 이력·원격 인덱스의 읽기 전용 검색·집계 |
 
 파일과 DB의 상세 규칙은 [미디어 처리](media-pipeline.md), [아카이브와 스토리지](archive-and-storage.md), [데이터 모델](data-model.md)을 참고한다.
+## 썸네일 캐시 구성
+
+`backend/thumbnails.py`는 디스크 캐시·SHA 참조·읽기 전용 상태 판정·오프라인 계획·추출·고아 정리를 공용화한다. `records.py`는 디스크를 한 번 스캔하고 SQLite 조회만으로 썸네일 상태를 조합한다. `no_thumbnail` 필터는 `json_each(?)`의 단일 JSON 배열 바인딩으로 대규모 캐시에서도 SQLite 파라미터 제한을 피한다.
+
+API는 계획과 관리 동작을, worker는 thumbnails-local/remote 두 작업을 실행한다. remote-index는 같은 SFTP 연결에서 추출 헬퍼를 재사용한다. 두 레인은 병행할 수 있고 exclusive는 기존 데이터 초기화 용도로 유지한다. 썸네일 작업 결과는 Incoming 작업 결과와 분리된다. 프론트엔드는 캐시 생성 완료 시 기록 목록을 soft 갱신하고 열린 미리보기의 단계·이미지 변경만 반영한다.

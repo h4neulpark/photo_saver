@@ -37,6 +37,21 @@ class IncomingWorkflowTests(unittest.TestCase):
         with catalog.database() as db:
             return {row["path"]: dict(row) for row in db.execute("SELECT * FROM scan_files")}
 
+    def test_deleted_incoming_preserves_remote_and_archive_thumbnail_references(self):
+        for source in ('remote', 'archive'):
+            sha = ('a' if source == 'remote' else 'b') * 64
+            media.thumbnail_path(sha).write_bytes(b'cached')
+            with catalog.database(write=True) as db:
+                job_id = catalog.queue_job(db, 'upload', {})
+                db.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
+                if source == 'remote':
+                    catalog.upsert_remote_file(db, 'storage', 'photo.jpg', '/NAS', sha, 1)
+                else:
+                    db.execute("""INSERT INTO archive_entries(job_id,item_index,media_id,asset_kind,local_path,sha,storage_id,archive_root,target,outcome,recorded_at)
+                        VALUES (?,0,'old','media','old.jpg',?,'storage','/NAS','old.jpg','uploaded','now')""", (job_id, sha))
+            worker.refresh_deleted_group(self.managed, sha)
+            self.assertTrue(media.thumbnail_path(sha).is_file())
+
     def test_scan_stages_report_duplicate_and_unmatched_companions(self):
         for name, contents in {
             "a.MP4": b"same video",

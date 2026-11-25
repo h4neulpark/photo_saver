@@ -206,9 +206,9 @@ test('P1-4 archive results and remote status keep exact labels, tones, times and
 
 test('P1-4 scope values stay compatible while labels match each view', () => {
   const expected = {
-    files: [['all', '모든 파일'], ['managed', '관리 파일 (로컬·NAS)'], ['incoming', 'Incoming 기록'], ['verified', 'NAS 검증 이력 있음'], ['xmp', 'XMP']],
-    archives: [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '전송 실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP']],
-    remote: [['all', '모든 원격 파일'], ['present', 'NAS 보관'], ['remote_only', '원격 전용 (카탈로그 미등록)'], ['missing', 'NAS 누락'], ['xmp', 'XMP']],
+    files: [['all', '모든 파일'], ['managed', '관리 파일 (로컬·NAS)'], ['incoming', 'Incoming 기록'], ['verified', 'NAS 검증 이력 있음'], ['xmp', 'XMP'], ['no_thumbnail', '썸네일 없음']],
+    archives: [['all', '모든 결과'], ['verified', '검증 완료'], ['failed', '전송 실패'], ['unknown', '결과 미확정'], ['xmp', 'XMP'], ['no_thumbnail', '썸네일 없음']],
+    remote: [['all', '모든 원격 파일'], ['present', 'NAS 보관'], ['remote_only', '원격 전용 (카탈로그 미등록)'], ['missing', 'NAS 누락'], ['xmp', 'XMP'], ['no_thumbnail', '썸네일 없음']],
   };
   for (const tab of Object.keys(expected)) {
     assert.deepEqual(plain(ready(tab).page.querySelectorAll('#catalog-scope option').map(option => [option.getAttribute('value'), option.textContent])), expected[tab]);

@@ -3,6 +3,7 @@ import errno
 import json
 import stat
 import time
+import thumbnails
 from pathlib import PurePosixPath
 
 from fastapi import HTTPException
@@ -31,6 +32,8 @@ class RemoteIndexRequest(BaseModel):
     connection: str
     path: str = ""
     full_rehash: bool = False
+    generate_thumbnails: bool = False
+    allow_large_sftp_fallback: bool = False
 
 
 def escape_like(value):
@@ -52,6 +55,8 @@ def queue_remote_index(db, request):
         "archiveRoot": config["root"],
         "scope": scope,
         "fullRehash": bool(request.full_rehash),
+        "generateThumbnails": request.generate_thumbnails,
+        "allowLargeSftpFallback": request.allow_large_sftp_fallback,
     }
     try:
         job_id = queue_job(db, "remote-index", payload)
@@ -270,10 +275,26 @@ def index_remote_archive(job, _incoming, _managed):
                         (stamp, stamp, storage_id),
                     )
             result["missing"] = len(missing_paths)
+            if payload.get('generateThumbnails'):
+                with database() as db:
+                    _, items = thumbnails.plan_thumbnails(db, thumbnails.ThumbnailRequest(
+                        scope='folder', view='remote', folder=scope), active_scope=(storage_id, config['root']))
+                summary = dict(total=len(items), generated=0, reused=0, failed=0, skippedLarge=0)
+                result['thumbnails'] = summary
+                ffmpeg_state = {}
+                for index, item in enumerate(items):
+                    result.update(currentSha=item['sha'], phase=f'누락 썸네일 생성 중 ({index}/{len(items)})')
+                    save(True)
+                    outcome = thumbnails.extract_thumbnail_for_item(item, _incoming, _managed,
+                        sftp=sftp, base=str(base), tick=lambda: save(True), ssh_ffmpeg_state=ffmpeg_state,
+                        cancel_exc=IndexCancelled,
+                        allow_large_sftp_fallback=payload.get('allowLargeSftpFallback', False))
+                    summary[{'skipped_large': 'skippedLarge'}.get(outcome['status'], outcome['status'])] += 1
+                result['currentSha'] = ''
         if result["failed"]:
             status = "failed"
             result["error"] = f"{result['failed']}개 파일을 인덱싱하지 못했습니다. 실패 목록을 확인하세요."
-    except IndexCancelled:
+    except (IndexCancelled, UploadCancelled):
         status = "cancelled"
         result["error"] = "원격 인덱싱을 중지했습니다. 완료된 해시 기록과 기존 인덱스는 유지됩니다."
     except Exception as error:
@@ -281,6 +302,7 @@ def index_remote_archive(job, _incoming, _managed):
         result["error"] = error.detail if isinstance(error, HTTPException) else "원격 아카이브 인덱싱에 실패했습니다. 연결 상태를 확인하세요."
     result["phase"] = "완료" if status == "done" else "중지됨" if status == "cancelled" else "실패"
     result["current"] = ""
+    result["currentSha"] = ""
     with database(write=True) as db:
         db.execute(
             "UPDATE jobs SET status=?,result=?,finished_at=? WHERE id=?",

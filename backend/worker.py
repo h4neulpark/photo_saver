@@ -1,3 +1,4 @@
+import thumbnails
 import fcntl
 import json
 import logging
@@ -653,11 +654,7 @@ def refresh_deleted_group(managed, sha):
             """SELECT id,path,status,companions FROM scan_files WHERE sha=? AND status IN ('ready','duplicate')
                ORDER BY (status='ready') DESC,path""", (sha,)
         ).fetchall()
-        references = db.execute(
-            """SELECT 1 FROM scan_files WHERE sha=? AND thumbnail IS NOT NULL AND status NOT IN ('moved','deleted')
-               UNION ALL SELECT 1 FROM media WHERE sha=? AND thumbnail IS NOT NULL AND status IN ('available','archived','offloading','moving')
-               LIMIT 1""", (sha, sha)
-        ).fetchone()
+        references = thumbnails.sha_is_referenced(db, sha)
 
     duplicate = live_duplicate(managed, {sha: [(row["path"], row["fingerprint"]) for row in copies]}, sha)
     remote = archived_hashes().get(sha)
@@ -729,6 +726,8 @@ class WorkerCoordinator:
             "xmp-link": link_xmp_selection, "upload": upload_selection,
             "offload": offload_selection, "remote-index": index_remote_archive,
             "reset-all": reset_local_data,
+            "thumbnails-local": thumbnails.generate_thumbnails,
+            "thumbnails-remote": thumbnails.generate_thumbnails,
         }
         self.poll_interval = poll_interval
         self.running = {}
@@ -807,6 +806,7 @@ def run():
     THUMBNAILS.mkdir(parents=True, exist_ok=True)
     with (DATA / "worker.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        thumbnails.cleanup_temp_thumbnails()
         coordinator = WorkerCoordinator(incoming, managed)
         previous = {}
         if threading.current_thread() is threading.main_thread():

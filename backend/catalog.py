@@ -16,9 +16,9 @@ LANE_EXCLUSIVE = "exclusive"
 LANES = (LANE_LOCAL, LANE_REMOTE, LANE_EXCLUSIVE)
 JOB_LANES = {
     "scan": LANE_LOCAL, "move": LANE_LOCAL, "delete": LANE_LOCAL, "xmp-link": LANE_LOCAL,
-    "duplicate-cleanup": LANE_LOCAL,
+    "duplicate-cleanup": LANE_LOCAL, "thumbnails-local": LANE_LOCAL,
     "upload": LANE_REMOTE, "offload": LANE_REMOTE, "remote-index": LANE_REMOTE,
-    "reset-all": LANE_EXCLUSIVE,
+    "thumbnails-remote": LANE_REMOTE, "reset-all": LANE_EXCLUSIVE,
 }
 
 
@@ -42,10 +42,17 @@ def backfill_job_lanes(connection):
 
 CATALOG_TABLES = (
     "jobs", "events", "device_names", "storages",
-    "media", "scan_files", "scan_xmp", "archive_entries", "remote_files",
+    "media", "scan_files", "scan_xmp", "archive_entries", "remote_files", "thumbnail_cache",
 )
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS thumbnail_cache (
+    sha TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('ready','failed','skipped_large')),
+    source_kind TEXT NOT NULL DEFAULT '', media_kind TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '', size_bytes INTEGER, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thumbnail_cache_by_status ON thumbnail_cache(status, updated_at);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,

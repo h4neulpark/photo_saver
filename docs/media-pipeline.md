@@ -143,3 +143,10 @@ UI는 로컬/원격 버튼을 각 레인의 활성 상태로 제한하고 exclus
 [resets.py](../backend/resets.py)의 `reset_local_data`는 managed·썸네일 디렉터리의 모든 항목과 카탈로그 볼륨의 임시 파일을 삭제한다. 숨김 파일·XMP·THM·LRV·이전 returned 폴더도 포함한다. 루트 디렉터리를 유지하고 하위 항목만 지운다. 링크는 링크 자체를 삭제하며 대상을 따라가지 않는다. 하위 마운트는 순회하지 않고 오류로 중단한다. 초기화 대상 루트가 겹치면 삭제 시작 전에 거부한다.
 
 해시 계산이나 파일 이동 없이 삭제하고, 끝나면 카탈로그·작업 기록을 모두 비운다. SSH 설정·원격 아카이브는 유지한다. 실패 시 이미 지운 파일은 돌아오지 않는다. 중단 후 재시작 시 남아 있는 항목을 계속 삭제한다. incoming의 파일·하위 폴더는 초기화 대상에서 제외한다. 성공 후 수동 검사하면 보존한 incoming 파일을 다시 수집할 수 있다.
+## 파일 기록 썸네일 생성
+
+`thumbnails.py`는 SHA별 전역 JPEG 캐시를 관리한다. 기존 디스크 캐시를 재사용한 뒤 다음 순서로 원본을 찾는다: 동일 SHA의 로컬 available 원본(또는 ready/duplicate Incoming), SFTP 원격 사진, SSH ffmpeg 원격 영상 한 프레임, ffmpeg 미설치 시 SFTP 영상 다운로드 후 로컬 추출. 원격 영상 폴백은 기본 150 MiB 이하이며 사용자가 명시적으로 허용하면 초과 영상을 내려받는다. 원격 사진은 128 MiB, SSH 프레임은 10 MiB, 영상 추출 시간은 45초로 제한한다.
+
+사진과 SSH 프레임은 Pillow로 방향을 보정하고 최대 360×240, JPEG quality 84로 재인코딩한다. 임시 파일에 기록하고 `os.replace`로 게시한다. 로컬 파일은 O_NOFOLLOW와 지문 재검증을 사용하고 로컬 영상은 검증된 열린 FD를 ffmpeg에 전달한다. 성공 후 media/scan_files의 비어 있는 thumbnail 열도 동기화한다. 작업별 임시 다운로드는 finally에서 삭제하고 워커 기동 시 잔여 임시파일을 정리한다.
+
+취소는 파일 시작·SFTP 청크·SSH 폴링·로컬 영상 추출 중 확인한다. 완료된 캐시는 보존하며 재시작하면 reused로 처리한다. `refresh_deleted_group`과 고아 정리는 같은 SHA 참조 기준을 사용한다: 삭제되지 않은 scan_files, available/archived/offloading/moving media, present 원격 미디어, archive_entries의 media 자산. Incoming을 삭제해도 원격·아카이브 참조가 남으면 캐시를 보존한다.

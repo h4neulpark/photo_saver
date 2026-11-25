@@ -1,5 +1,7 @@
 """Read-only catalog views; historical verification is separate from current presence."""
 import math
+import json
+import thumbnails
 from pathlib import PurePosixPath
 from typing import Literal
 
@@ -118,11 +120,31 @@ def build_remote_folders(db):
     return folders, root_count
 
 
+def range_clause(view, event, device, folder):
+    where, params = '1=1', []
+    if view == 'remote':
+        if folder == '__root__':
+            where += " AND instr(remote_path, '/')=0"
+        elif folder.strip('/'):
+            where += " AND remote_path LIKE ? ESCAPE '\\'"
+            params.append(escape_like(folder.strip('/')) + '/%')
+    else:
+        if event == 'unassigned':
+            where += ' AND event_id IS NULL'
+        elif event != 'all':
+            where += ' AND (event_id=?' + (')' if device else ' OR parent_id=?)')
+            params.extend([event] if device else [event, event])
+        if device:
+            where += ' AND device=?'
+            params.append('' if device == '장비 미확인' else device)
+    return where, params
+
+
 @router.get('')
 def catalog_records(
     view: Literal['files', 'archives', 'remote'] = 'files',
     q: str = Query(default='', max_length=300),
-    scope: Literal['all', 'managed', 'incoming', 'xmp', 'verified', 'failed', 'unknown', 'present', 'missing', 'remote_only'] = 'all',
+    scope: Literal['all', 'managed', 'incoming', 'xmp', 'verified', 'failed', 'unknown', 'present', 'missing', 'remote_only', 'no_thumbnail'] = 'all',
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
     event: str = 'all',
@@ -179,6 +201,16 @@ def catalog_records(
             where += ' AND device=?'
             params.append('' if device == '장비 미확인' else device)
     with database() as db:
+        active_scope = active_storage_scope()
+        thumb_context = thumbnails.context(db, active_scope)
+        if scope == 'no_thumbnail':
+            where += " AND kind<>'xmp' AND sha IS NOT NULL AND sha NOT IN (SELECT value FROM json_each(?))"
+            params.append(json.dumps(list(thumb_context['disk_shas'])))
+        range_where, range_params = range_clause(view, event, device, folder)
+        range_rows = [dict(row) for row in db.execute(CTE + f'SELECT * FROM {table} WHERE {range_where}', range_params)]
+        for row in range_rows:
+            row['media_kind'] = thumbnails.media_kind(row['local_path'] or row['target']) if view == 'archives' and row['kind'] != 'xmp' else row['kind']
+        missing_thumbnails = thumbnails.missing_summary(range_rows, thumb_context)
         if view == 'remote':
             folders, unassigned = [], 0
             remote_folders, remote_root_count = build_remote_folders(db)
@@ -223,7 +255,7 @@ def catalog_records(
                     catalog_has_unassigned=any(media['event_id'] is None for media in linked),
                     catalog_file_ids=[media['id'] for media in linked],
                 )
-        active_storage_id, active_root = active_storage_scope()
+        active_storage_id, active_root = active_scope
         present_remote = {}
         if view == 'files' and active_root:
             for remote in db.execute(
@@ -247,6 +279,13 @@ def catalog_records(
             (active_storage_id or '',),
         ).fetchone()
     for row in rows:
+        row['media_kind'] = thumbnails.media_kind(row['local_path'] or row['target']) if view == 'archives' and row['kind'] != 'xmp' else row['kind']
+        row.update(thumbnails.resolve_thumbnail_state(row['media_kind'], row['sha'], **thumb_context))
+        local = thumb_context['local_sources'].get(row['sha']) if row['media_kind'] != 'xmp' else None
+        row.update(has_local_original=bool(local), preview=None, original=None)
+        if local:
+            prefix = f"/api/{local['area']}/{local['id']}"
+            row.update(preview=prefix + '/preview', original=prefix + '/original')
         row['name'] = row.get('name') or PurePosixPath(row.get('remote_path') or row.get('local_path') or row.get('target') or '').name
         if view == 'files':
             download_path = present_remote.get(row['sha']) if active_root and row.get('sha') else None
@@ -268,5 +307,5 @@ def catalog_records(
         },
         'folders': folders, 'unassigned': unassigned,
         'remoteFolders': remote_folders, 'remoteRootCount': remote_root_count,
-        'activeArchiveRoot': active_root,
+        'activeArchiveRoot': active_root, 'missingThumbnails': missing_thumbnails,
     }, headers=NO_STORE)

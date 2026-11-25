@@ -155,13 +155,16 @@ test('08 completed scan strips remove duplicate status counts and retain active 
 
 test('09 Events context bar hides idle controls and keeps one confirm primary with partial offload', async () => {
   const h = createHarness(); h.state.events = [event(), event('other')]; h.state.managed = [makeManaged('one', { canOffload: true }), makeManaged('two')]; h.view.eventId = 'ev1'; route(h, 'events');
-  assert.match(h.page.querySelector('#event-actions').textContent, /파일을 선택하면/);
+  assert.equal(h.page.querySelector('#event-actions').hidden, true);
+  assert.equal(h.page.querySelector('#event-actions .action-bar-idle'), null);
   for (const name of ['move-event', 'edit-media', 'offload-media', 'confirm-event']) assertHiddenDisabled(action(h, name));
   assertHiddenDisabled(h.page.querySelector('#move-event-target'));
   h.view.eventSelection.add('one'); h.view.eventSelection.add('two'); h.render();
+  assert.equal(h.page.querySelector('#event-actions').hidden, false);
   assert.equal(h.page.querySelector('#event-actions').classList.contains('has-selection'), true); assert.match(action(h, 'offload-media').textContent, /NAS 보관 후 로컬 비우기 \(1\)/);
   assert.equal(h.page.querySelectorAll('#event-actions .primary').length, 1); assert.equal(action(h, 'confirm-event').classList.contains('primary'), true);
   click(action(h, 'clear-event-selection')); await flushMicrotasks(); assert.equal(h.view.eventSelection.size, 0); assert.equal(h.page.querySelector('#event-actions').classList.contains('has-selection'), false);
+  assert.equal(h.page.querySelector('#event-actions').hidden, true);
   h.view.eventSelection.add('two'); h.render(); assertHiddenDisabled(action(h, 'offload-media'));
 });
 
@@ -231,6 +234,6 @@ test('13 Archive connection survives revisit, bounds failed attempts and invalid
 test('14 Settings orders daily names, connection, backup and marked danger area', () => {
   const h = createHarness(); h.view.settings = configured(); h.view.devices = []; route(h, 'settings');
   const sections = h.page.querySelectorAll('.settings-section');
-  assert.deepEqual(plain(sections.map(section => section.getAttribute('aria-label'))), ['촬영도구 이름', '스토리지 연결', 'DB 백업 및 복원', '데이터 초기화']);
-  assert.equal(sections[3].classList.contains('settings-danger'), true); assert.equal(sections[3].querySelector('.settings-danger-badge').textContent, '위험 구역');
+  assert.deepEqual(plain(sections.map(section => section.getAttribute('aria-label'))), ['촬영도구 이름', '스토리지 연결', 'DB 백업 및 복원', '썸네일 캐시', '데이터 초기화']);
+  assert.equal(sections[4].classList.contains('settings-danger'), true); assert.equal(sections[4].querySelector('.settings-danger-badge').textContent, '위험 구역');
 });

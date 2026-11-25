@@ -170,3 +170,8 @@ Source에서 선택한 항목을 **업로드**하거나 Destination의 현재 �
 - [설정·SSH 테스트·백업·복원](../backend/settings.py), [파일 기록 조회](../backend/records.py)
 - [워커 재시작 처리](../backend/worker.py), [큐 제약과 스키마](../backend/catalog.py)
 - [탐색·다운로드 테스트](../backend/test_archive.py), [전송 테스트](../backend/test_transfers.py), [원격 인덱싱 테스트](../backend/test_remote_index.py), [로컬 비우기·모델 테스트](../backend/test_offload.py), [파일 기록·백업 호환 테스트](../backend/test_records.py)
+## 인덱싱과 썸네일
+
+원격 인덱싱 다이얼로그의 누락 썸네일 생성은 기본 해제이며 선택을 브라우저에 기억한다. 해시·증분 갱신 후 열려 있는 동일한 SFTP/SSH 연결에서 누락 썸네일을 생성한다. 기존 unchanged 파일도 대상에 포함되고 이미 있는 캐시는 재사용한다. 별도 썸네일 작업은 원격 대상이 하나라도 있으면 remote 레인을 사용한다.
+
+원격 파일은 반드시 `resolve_remote_file`로 루트 하위 경로·상위 디렉터리·일반 파일을 확인하고 심볼릭 링크를 거부한다. SSH ffmpeg는 경로를 `shlex.quote`한 위치 인자로 전달하고 `-protocol_whitelist file`로 입력의 네트워크 프로토콜을 차단한다. 프레임은 바이트 그대로 게시하지 않고 Pillow로 검증·재인코딩한다. 종료 코드 126/127의 미설치 상태는 같은 작업에서 기억하여 이후 영상은 SFTP 폴백을 사용한다. 기본 150 MiB 제한을 초과하는 폴백은 일괄 생성 다이얼로그에서 별도로 허용해야 한다.

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +66,54 @@ class CatalogRecordsTests(unittest.TestCase):
         self.fixture.add_file('special', "한글%_'.MP4", b'special')
         self.assertEqual(self.query(q='%_')['total'], 1)
         self.assertEqual(self.query(q="' OR 1=1 --")['total'], 0)
+
+    def test_archive_video_kind_uses_target_when_local_path_absent(self):
+        import thumbnails
+        self.fixture.run_job(self.fixture.queue())
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE archive_entries SET local_path='',target='only-remote.mov'")
+        result = self.query('archives')
+        self.assertEqual(result['rows'][0]['media_kind'], 'video')
+        self.assertEqual(result['missingThumbnails']['videos'], 1)
+        with catalog.database() as db:
+            plan, items = thumbnails.plan_thumbnails(db, thumbnails.ThumbnailRequest(scope='folder', view='archives'))
+        self.assertEqual(items[0]['media_kind'], 'video')
+        self.assertEqual(plan['localVideos'], 1)
+
+    def test_thumbnail_fields_and_large_disk_set_filter_remain_read_only(self):
+        import thumbnails
+        with patch.object(thumbnails, 'scan_disk_thumbnails', return_value={f'{n:064x}': 10 for n in range(40000)}):
+            result = self.query(scope='no_thumbnail')
+        self.assertEqual(result['total'], 1)
+        row = result['rows'][0]
+        self.assertEqual(row['media_kind'], 'video')
+        self.assertEqual(row['thumbnail_status'], 'missing')
+        self.assertTrue(row['has_local_original'])
+        self.assertEqual(row['preview'], '/api/managed/one/preview')
+        self.assertEqual(result['missingThumbnails']['total'], 1)
+
+    def test_no_thumbnail_query_authorizer_denies_every_write(self):
+        import thumbnails
+        writes = []
+        @contextmanager
+        def read_only():
+            with catalog.database() as db:
+                # SQLite declares json_each's virtual schema on first use. Register
+                # it before denying DML so its internal schema callbacks are not
+                # confused with application INSERT/UPDATE/DELETE statements.
+                db.execute("SELECT value FROM json_each('[]')").fetchall()
+                def authorize(action, *args):
+                    if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
+                        writes.append(action)
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+                db.set_authorizer(authorize)
+                yield db
+                db.set_authorizer(None)
+        with patch.object(records, 'database', read_only), patch.object(thumbnails, 'scan_disk_thumbnails', return_value={f'{n:064x}': 10 for n in range(40000)}):
+            for view in ('files', 'archives', 'remote'):
+                self.query(view, scope='no_thumbnail')
+        self.assertEqual(writes, [])
 
     def test_verified_archive_has_exact_path_hash_size_and_time(self):
         job = self.fixture.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}])

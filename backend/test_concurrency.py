@@ -96,8 +96,8 @@ class ConcurrencyTests(unittest.TestCase):
                         db.execute("UPDATE jobs SET lane='exclusive' WHERE lane='remote'")
 
     def test_local_and_remote_allowed_concurrently_same_lane_rejected(self):
-        for local in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup'):
-            for remote in ('upload', 'offload', 'remote-index'):
+        for local in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'thumbnails-local'):
+            for remote in ('upload', 'offload', 'remote-index', 'thumbnails-remote'):
                 with self.subTest(local=local, remote=remote):
                     a, b = self.queue(local), self.queue(remote)
                     for kind, lane in [(local, 'local'), (remote, 'remote')]:

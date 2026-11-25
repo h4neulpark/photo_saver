@@ -23,6 +23,11 @@ import worker
 
 
 class WalkableLocalSFTP(test_transfers.LocalSFTP):
+    def normalize(self, path):
+        if not isinstance(path, str):
+            raise TypeError('SFTP normalize requires str')
+        return super().normalize(path)
+
     def listdir_iter(self, path, read_aheads=1):
         for entry in sorted(Path(path).iterdir(), key=lambda p: p.name):
             info = entry.lstat()
@@ -33,6 +38,78 @@ class WalkableLocalSFTP(test_transfers.LocalSFTP):
 
 
 class RemoteIndexTests(unittest.TestCase):
+    def test_thumbnail_option_reuses_open_sftp_and_aggregates(self):
+        from PIL import Image
+        import media
+        import thumbnails
+        path = self.fixture.remote / 'photo.jpg'
+        Image.new('RGB', (100, 60), 'red').save(path)
+        cache = self.root / 'thumbs'
+        cache.mkdir()
+        request = remote_index.RemoteIndexRequest(connection=archive.archive_revision(self.fixture.config), generate_thumbnails=True)
+        queued = api.start_remote_index(request)
+        with catalog.database() as db:
+            job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+        with patch.object(catalog, 'THUMBNAILS', cache), patch.object(media, 'THUMBNAILS', cache), patch.object(thumbnails, 'archive_connection', side_effect=AssertionError('reconnection')):
+            remote_index.index_remote_archive(job, None, self.fixture.managed)
+        with catalog.database() as db:
+            result = json.loads(db.execute('SELECT result FROM jobs WHERE id=?', (queued['id'],)).fetchone()[0])
+        self.assertEqual(result['thumbnails']['generated'], 1)
+        self.assertEqual(len(list(cache.glob('*-v1.jpg'))), 1)
+
+    def test_thumbnail_download_cancel_is_not_a_failure_and_clears_current_sha(self):
+        from PIL import Image
+        import media
+        path = self.fixture.remote / 'cancel.jpg'
+        Image.new('RGB', (100, 60), 'red').save(path)
+        cache = self.root / 'thumbs'
+        cache.mkdir()
+        request = remote_index.RemoteIndexRequest(connection=archive.archive_revision(self.fixture.config), generate_thumbnails=True)
+        queued = api.start_remote_index(request)
+        with catalog.database() as db:
+            job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+        original_open = self.sftp.open
+        cancelled = []
+        def cancellable_open(*args, **kwargs):
+            stream = original_open(*args, **kwargs)
+            read = stream.read
+            def cancel_after_read(*args, **kwargs):
+                chunk = read(*args, **kwargs)
+                with catalog.database(write=True) as db:
+                    result = json.loads(db.execute('SELECT result FROM jobs WHERE id=?', (job['id'],)).fetchone()[0])
+                    if result.get('currentSha'):
+                        result['cancelRequested'] = True
+                        db.execute('UPDATE jobs SET result=? WHERE id=?', (json.dumps(result), job['id']))
+                        cancelled.append(True)
+                return chunk
+            stream.read = cancel_after_read
+            return stream
+        with patch.object(catalog, 'THUMBNAILS', cache), patch.object(media, 'THUMBNAILS', cache), patch.object(self.sftp, 'open', side_effect=cancellable_open):
+            remote_index.index_remote_archive(job, None, self.fixture.managed)
+        self.assertTrue(cancelled)
+        with catalog.database() as db:
+            completed = db.execute('SELECT status,result FROM jobs WHERE id=?', (job['id'],)).fetchone()
+            self.assertEqual(completed['status'], 'cancelled')
+            result = json.loads(completed['result'])
+            self.assertEqual(result['currentSha'], '')
+            self.assertEqual(result['thumbnails']['failed'], 0)
+            self.assertEqual(db.execute('SELECT count(*) FROM thumbnail_cache').fetchone()[0], 0)
+        self.assertEqual(list(cache.iterdir()), [])
+
+    def test_thumbnail_upload_cancel_exception_marks_index_cancelled(self):
+        import thumbnails
+        self.write_remote('cancel.jpg', b'photo')
+        request = remote_index.RemoteIndexRequest(connection=archive.archive_revision(self.fixture.config), generate_thumbnails=True)
+        queued = api.start_remote_index(request)
+        with catalog.database() as db:
+            job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+        with patch.object(thumbnails, 'extract_thumbnail_for_item', side_effect=transfers.UploadCancelled):
+            remote_index.index_remote_archive(job, None, self.fixture.managed)
+        with catalog.database() as db:
+            completed = db.execute('SELECT status,result FROM jobs WHERE id=?', (job['id'],)).fetchone()
+        self.assertEqual(completed['status'], 'cancelled')
+        self.assertEqual(json.loads(completed['result'])['currentSha'], '')
+
     def setUp(self):
         self.fixture = test_transfers.TransferTests()
         self.fixture.setUp()

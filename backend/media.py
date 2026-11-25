@@ -207,9 +207,54 @@ def image_metadata(stream, thumbnail):
 
 
 def save_image_preview(image, destination, bounds):
+    if hasattr(destination, 'write'):
+        upright = ImageOps.exif_transpose(image)
+        upright.thumbnail(bounds, Image.Resampling.LANCZOS)
+        upright.convert('RGB').save(destination, format='JPEG', quality=84)
+        return
+    return save_image_preview_atomic(image, destination, bounds)
+
+
+def save_image_preview_atomic(image, destination, bounds=(360, 240)):
+    destination = Path(destination)
+    temporary = destination.parent / f".{uuid4().hex}.tmp.jpg"
     upright = ImageOps.exif_transpose(image)
     upright.thumbnail(bounds, Image.Resampling.LANCZOS)
-    upright.convert("RGB").save(destination, format="JPEG", quality=84)
+    try:
+        upright.convert("RGB").save(temporary, format="JPEG", quality=84)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def video_thumbnail(stream, destination, tick=lambda: None):
+    """Use a verified open FD, bounded runtime, and atomic JPEG publication."""
+    import io
+    import time
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-f", "mov",
+               "-i", f"/proc/self/fd/{stream.fileno()}", "-map", "0:v:0", "-frames:v", "1",
+               "-vf", "scale=360:240:force_original_aspect_ratio=decrease", "-threads", "1",
+               "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    with subprocess.Popen(command, pass_fds=(stream.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        deadline = time.monotonic() + 45
+        try:
+            while True:
+                tick()
+                if time.monotonic() > deadline:
+                    raise TimeoutError("영상 썸네일 생성 시간이 초과되었습니다.")
+                try:
+                    raw, error = process.communicate(timeout=0.3)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if process.returncode or len(raw) > 10 * 1024 * 1024:
+                raise ValueError("영상 프레임을 읽을 수 없습니다.")
+            with Image.open(io.BytesIO(raw)) as image:
+                save_image_preview_atomic(image, destination)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
 
 
 _DJI_TAG_KEYS = {"make", "com.apple.quicktime.make", "encoder", "handler_name"}

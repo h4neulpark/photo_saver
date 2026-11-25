@@ -275,3 +275,19 @@ XMP 시각은 최근 검사에서 연결한 XMP 메타데이터를 사용한다.
 incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격 아카이브는 유지한다. 파일 삭제는 되돌릴 수 없고 중간 실패의 파일 롤백은 없다. DB 삭제는 한 트랜잭션으로 처리한다. 실패한 작업은 오류를 기록해 재실행할 수 있게 남는다. 응답은 `no-store`다.
 
 구현 위치: [api.py](../backend/api.py), [settings.py](../backend/settings.py), [archive.py](../backend/archive.py), [transfers.py](../backend/transfers.py), [remote_index.py](../backend/remote_index.py), [offload.py](../backend/offload.py), [records.py](../backend/records.py).
+## 썸네일 캐시 API
+
+모든 캐시 응답은 `Cache-Control: no-store`를 사용한다. 계획과 현황 조회는 NAS에 접속하지 않는다.
+
+| 요청 | 입력 / 결과 |
+| --- | --- |
+| `POST /api/thumbnails/plan` | `scope: all\|folder\|shas`, `view: files\|archives\|remote`, `event`, `device`, `folder`, `shas`(최대 500개), `include_failed`(기본 true). `total`, `local`, `localPhotos`, `localVideos`, `remotePhotos`, `remoteVideos`, `remoteVideosOverLimit`, `alreadyReady`, `unavailable`, `failed`, `skippedLarge`, `estimatedBytes`, `lane`, `storageConfigured`, `activeArchiveRoot` 반환 |
+| `POST /api/jobs/thumbnails` | 계획 입력에 `allow_large_sftp_fallback`(기본 false) 추가. 로컬만이면 `thumbnails-local`, 원격 포함이면 `thumbnails-remote`로 등록(202). 모두 캐시되었으면 `status: noop`(200), 원본 부재 400, 레인 충돌 409 |
+| `POST /api/jobs/thumbnails/{id}/cancel` | 대기는 즉시 cancelled, 실행 중에는 `cancelRequested`. 완료 작업에 재호출해도 현재 상태 반환 |
+| `GET /api/settings/thumbnails` | `cachedCount/Bytes`, `missingTotal/Local/RemotePhotos/RemoteVideos`, `orphanCount/Bytes`, `failedCount`, `skippedLargeCount`, `activeThumbnailJob`, `canCleanup` |
+| `POST /api/settings/thumbnails/cleanup` | 모든 레인 유휴 필요(작업 중 409). `deleted`, `freedBytes`, 최신 `stats` 반환 |
+| `POST /api/settings/thumbnails/reset-failures` | failed/skipped_large 기록만 초기화. `cleared`, 최신 `stats` 반환 |
+
+`GET /api/catalog`은 `scope=no_thumbnail`을 지원한다. 모든 탭의 행에 `media_kind`, `thumbnail`, `thumbnail_status`, `thumbnail_error`, `can_generate_thumbnail`, `has_local_original`, `preview`, `original`이 추가된다. `kind`의 기존 의미는 유지한다. 로컬 URL은 `/api/managed/{id}/preview|original` 또는 `/api/incoming/{id}/preview|original`이다. 상태는 ready, missing, generating, unavailable, failed, skipped_large, non_media(XMP)이며 실제 디스크 캐시가 우선한다. `missingThumbnails`는 현재 탭·폴더 범위의 생성 가능한 고유 SHA를 집계하고 검색어·상태 필터는 무시한다(`total`, `missing`, `photos`, `videos`, `local`, `remotePhotos`, `remoteVideos`, `failed`, `skippedLarge`).
+
+`POST /api/archive/index`의 기존 `connection`, `path`, `full_rehash` 계약은 유지하며 `generate_thumbnails`, `allow_large_sftp_fallback`(모두 기본 false)을 추가한다. 생성 옵션을 켜면 동일 연결에서 두 번째 단계로 실행하고 결과의 `thumbnails`에 total/generated/reused/failed/skippedLarge를 반환한다. `GET /api/jobs?kind=`는 `thumbnails-local`, `thumbnails-remote`도 허용한다.

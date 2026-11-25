@@ -129,9 +129,9 @@ test('07 eventLifecycleSummary partitions draft, confirmed, and archived without
   const files = [makeManaged('old', { status: 'archived', confirmed: true, archived: true }), makeManaged('done', { confirmed: true, archived: true }), makeManaged('draft'), makeManaged('none', { eventId: null, archived: true })];
   const h = events(files); const s = h.eventLifecycleSummary(files);
   assert.deepEqual(plain(s), { total: 4, draft: 2, confirmed: 1, archived: 1, localArchivedCopy: 2 }); assert.equal(s.draft + s.confirmed + s.archived, s.total);
-  h.view.eventId = 'all'; h.render(); assert.match(h.page.querySelector('#event-lifecycle').textContent, /총 4개.*초안 2.*분류 확정 1.*아카이브 보관 1.*NAS 사본 보유 2/s);
+  h.view.eventId = 'all'; h.render(); assert.match(h.page.querySelector('#event-lifecycle').textContent, /전체 4.*초안 2.*분류 확정 1.*아카이브 보관 1.*NAS 사본 보유 2/s);
   assert.equal(h.page.querySelectorAll('.event-lifecycle-bar span').length, 3);
-  h.view.eventQuery = 'done'; h.render(); assert.match(h.page.querySelector('.event-meta').textContent, /1 \/ 4개/); assert.match(h.page.querySelector('#event-lifecycle').textContent, /총 4개/);
+  h.view.eventQuery = 'done'; h.render(); assert.match(h.page.querySelector('.event-meta').textContent, /1 \/ 4개/); assert.match(h.page.querySelector('#event-lifecycle').textContent, /전체 4/);
   assert.deepEqual(plain(h.eventLifecycleSummary([])), { total: 0, draft: 0, confirmed: 0, archived: 0, localArchivedCopy: 0 }); h.state.managed = []; h.render(); assert.equal(h.page.querySelector('#event-lifecycle'), null);
 });
 
