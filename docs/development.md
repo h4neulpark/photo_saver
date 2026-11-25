@@ -44,7 +44,10 @@ photo_saver/
 │   ├── styles.css
 │   ├── test_media_preview.cjs  # Node 내장 테스트 러너 기반 미리보기 UI 테스트
 │   ├── test_job_concurrency.cjs # 로컬·원격·배타 작업 UI 테스트
-│   └── test_incoming_upload.cjs # 기기 업로드·진행률·결과 상태·취소 테스트
+│   ├── test_incoming_upload.cjs # 기기 업로드·진행률·결과 상태·취소 테스트
+│   ├── test_folder_trees.cjs # 폴더 트리·CSS·스크롤 계약
+│   ├── test_phase1_ui.cjs # 결과 배너·작업 내역·기록 탭
+│   └── test_phase2_ui.cjs # 14개 Phase 2 UI·자동 연결·경로 회귀
 └── docs/                   # 현재 구현 문서
 ```
 
@@ -87,7 +90,8 @@ node --check frontend/test_job_concurrency.cjs
 node --check frontend/test_incoming_upload.cjs
 node --check frontend/test_folder_trees.cjs
 node --check frontend/test_phase1_ui.cjs
-node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs frontend/test_folder_trees.cjs frontend/test_phase1_ui.cjs
+node --check frontend/test_phase2_ui.cjs
+node --test frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_incoming_upload.cjs frontend/test_folder_trees.cjs frontend/test_phase1_ui.cjs frontend/test_phase2_ui.cjs
 git diff --check
 ```
 
@@ -97,6 +101,8 @@ git diff --check
 docker compose up -d --build api worker
 docker compose ps
 curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/health
+curl -fsS -I http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/app.js
+curl -fsS -I http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/styles.css
 curl -fsS -D - "http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/jobs?limit=5" | head -n 30
 curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/state | python3 -c "import sys,json; d=json.load(sys.stdin); print('state ok, keys:', sorted(d.keys()))"
 ```
@@ -104,6 +110,12 @@ curl -fsS http://127.0.0.1:${PHOTO_SAVER_PORT:-8888}/api/state | python3 -c "imp
 Phase 1 검증(2026-11-25): 프론트엔드 **80개**(기존 59개 + Phase 1 21개), 백엔드 **162개**(jobs API 9개 포함)가 통과했다. 기존 폴더 트리 함수·액션·9개 CSS 규칙과 `test_folder_trees.cjs`는 작업 시작 상태와 동일함을 별도로 비교했다. 운영 API는 healthy, worker/frontend는 Up, jobs는 HTTP 200과 no-store 및 전체 집계를 반환했다. 배포된 Incoming·작업 내역·이벤트 관리·파일 기록을 Chrome 320·390·768·1280px에서 확인했고, 긴 경로 실패 배너와 실시간 작업은 브라우저 메모리 fixture로 추가 확인했다. 24개 레이아웃 검사에서 가로 넘침·컨트롤 클리핑·앱 콘솔 오류가 없었다(기존 favicon 404는 별도 제외).
 
 Phase 1 리뷰 수정 Round 1(2026-11-25): 프론트엔드 **87개**(Phase 1 28개 포함), 백엔드 **163개**(jobs API 10개 포함)가 통과했다. 첫 페이지 갱신 시 필터 이탈 작업 제거와 커서 갱신·과거 페이지 보존, 활성 상태의 hasAttention 제외, Incoming 후속 액션 순서·재사용 ID의 상세 펼침 독립성, 혼합 ISO 시각·동률 ID 정렬 회귀를 추가했다. 운영 API·worker 재빌드 후 API healthy와 `/api/health`, `/api/jobs?limit=5`의 HTTP 200·no-store를 재확인했다.
+
+Phase 2 검증(2026-11-25): 프론트엔드 **101개**(기존 87개 + `test_phase2_ui.cjs` 14개), 네트워크 차단·읽기 전용 임시 컨테이너의 백엔드 **163개**가 통과했다. 7개 JavaScript 파일의 `node --check`와 `git diff --check`를 확인했다. 기존 테스트 수정은 미리보기 2줄과 Phase 1 1줄의 승인된 문자열 갱신에 한정했으며, `backend/*`, `index.html`의 5개 루트 ID, Compose, 나머지 테스트 및 폴더 트리 CSS 규칙은 보존했다.
+
+Phase 2 자동 연결은 `loadRoute()`에서만 실행하며 `render()`는 요청을 시작하지 않는다. 5개 스토리지 설정 플래그가 모두 참일 때 한 번 시도하고 실패 뒤 재방문으로 재시도하지 않는다. 설정 변경·초기화는 연결 세대를 갱신하여 이전 요청의 늦은 응답을 무시한다. NAS 미리보기는 서버와 같은 논리 경로에서 현재 로컬 접두 경로를 잘라 원격 목적지에 결합하고, 체크박스 변경은 패널만 갱신한다.
+
+프론트엔드는 운영 Nginx에 읽기 전용 바인드 마운트되어 파일 수정이 즉시 반영된다. 서비스 재빌드 없이 API healthy, worker/frontend Up, health `{"status":"ok"}`, 배포된 `app.js`·`styles.css` HTTP 200 및 로컬 파일과 응답의 SHA-256 일치를 확인했다. 운영 데이터 변경 없이 Chrome 320·390·768·1280px에서 6개 페이지 24개 레이아웃과 메모리 fixture 24개, 혼합 선택·이벤트 선택·긴 NAS 경로·미연결 16개 레이아웃을 검증했다. 가로 넘침·컨트롤 클리핑·브랜드/상태 겹침·앱 콘솔 오류는 0건(favicon 404 제외)이다. 390×844·768×1024·1280×800에서 작업 3개 페이지의 첫 파일 행 전체 노출, 탭 키보드 이동·DOM/스크롤 보존과 위험 구역 배지 대비 **7.87:1**을 확인했다. 768px 선택 바는 줄바꿈하고 760px 이하 이벤트 목록은 높이를 제한해 스크롤하며, 폴더 링크 규칙은 바꾸지 않았다. 디자인 탐지기의 4개 경고는 기존 결과 배너 3개와 승인 설계에 명시된 위험 구역 4px 경계선 1개다. 실제 NAS 파일 업로드·삭제는 이 UI 검증에서 실행하지 않았다.
 
 한 부문만 실행할 때는 마지막 백엔드 명령을 `python -m unittest test_transfers -v`처럼 지정한다. 테스트는 외부 SSH·OMV 연결을 모의 객체 또는 로컬 SFTP 대역으로 대체한다.
 

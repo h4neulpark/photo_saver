@@ -275,7 +275,7 @@ test('truncated history details explain bounds and escape API content', () => {
 test('events has one confirm primary action and secondary create for existing events', () => {
   const h = createHarness(); h.state.events = [{ id: 'ev1', name: 'Trip', parent: null }]; h.state.managed = [makeManaged('one')]; h.view.eventId = 'ev1'; h.view.eventSelection.add('one'); h.render();
   assert.equal(h.page.querySelectorAll('[data-action="confirm-event"]').length, 1);
-  assert.match(h.page.querySelector('[data-action="confirm-event"]').textContent, /선택 1개 배치 확정/);
+  assert.match(h.page.querySelector('[data-action="confirm-event"]').textContent, /선택 1개 분류 확정/);
   assert.equal(h.page.querySelector('[data-action="new-event"]').classList.contains('primary'), false);
 });
 

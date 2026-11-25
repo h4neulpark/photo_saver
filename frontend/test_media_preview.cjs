@@ -822,7 +822,7 @@ test('ignores stale errors/HEAD responses, diagnoses 404/403/409/200 without tre
   h.mediaPreview.dispatchEvent({ type: 'error', target: refreshedImg });
   headResolvers.shift()({ status: 409 });
   await flushMicrotasks();
-  assert.match(h.mediaPreview.querySelector('.preview-error-message').textContent, /Incoming Library/);
+  assert.match(h.mediaPreview.querySelector('.preview-error-message').textContent, /가져오기/);
 });
 
 test('R1: incoming delete preserves remaining list across running/deleting, running/deleted, failed/review, and immediate done', async () => {
@@ -1131,7 +1131,7 @@ test('duplicate cleanup click survives polling render and modal cancel without s
   assert.equal(h.dialog.open, false);
   assert.equal(h.view.cleanupPlanning, false);
   assert.equal(h.page.querySelector('[data-action="cleanup-incoming"]').disabled, false);
-  assert.match(h.page.querySelector('[data-action="cleanup-incoming"]').textContent, /중복 1개 정리/);
+  assert.match(h.page.querySelector('[data-action="cleanup-incoming"]').textContent, /중복 정리 \(1\)/);
 });
 
 test('duplicate cleanup aborts modal when localBusy or status changes during plan fetch', async () => {
