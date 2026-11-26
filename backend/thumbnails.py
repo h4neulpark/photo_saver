@@ -42,6 +42,7 @@ class ThumbnailRequest(BaseModel):
     event: str = 'all'
     device: str = ''
     folder: str = ''
+    job_id: int | None = Field(default=None, ge=1, le=2**63-1)
     shas: list[str] = Field(default_factory=list, max_length=500)
     include_failed: bool = True
     allow_large_sftp_fallback: bool = False
@@ -169,7 +170,7 @@ def plan_thumbnails(db, request, *, active_scope=None):
     elif request.scope == 'folder':
         from records import CTE, range_clause
         table = {'files': 'files', 'archives': 'archive_files', 'remote': 'remote_view'}[request.view]
-        where, params = range_clause(request.view, request.event, request.device, request.folder)
+        where, params = range_clause(request.view, request.event, request.device, request.folder, request.job_id)
         candidates = {r['sha']: (media_kind(r['local_path'] or r['target']) if request.view == 'archives' and r['kind'] != 'xmp' else r['kind'])
                       for r in db.execute(CTE + f'SELECT * FROM {table} WHERE {where}', params)}
     else:

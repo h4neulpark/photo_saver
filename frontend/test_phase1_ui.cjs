@@ -281,7 +281,7 @@ test('events has one confirm primary action and secondary create for existing ev
 
 test('catalog has semantic counted tabs and keyboard navigation', async () => {
   const h = createHarness(); catalog(h); h.setFetch(async () => response(h.view.catalog));
-  assert.equal(h.page.querySelectorAll('[role="tab"]').length, 3); assert.equal(h.page.querySelector('[role="tab"].primary'), null);
+  assert.equal(h.page.querySelectorAll('[role="tab"]').length, 2); assert.equal(h.page.querySelector('[role="tab"].primary'), null);
   const tab = h.page.querySelector('#catalog-tab-files'); tab.dispatchEvent({ type: 'keydown', key: 'End', target: tab }); await flushMicrotasks();
   assert.equal(h.view.catalogTab, 'remote'); assert.equal(h.doc.activeElement.id, 'catalog-tab-remote');
   assert.equal(h.page.querySelector('[role="tabpanel"]').getAttribute('aria-labelledby'), 'catalog-tab-remote');

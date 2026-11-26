@@ -131,7 +131,7 @@ test('P0-3 active root slash is preserved and root/path HTML is escaped', () => 
 
 test('P1-4 all views use exactly three labelled columns and show XMP tags', () => {
   const expected = {
-    files: ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태'],
+    files: ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태 / 최근 업로드'],
     archives: ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각'],
     remote: ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각'],
   };
@@ -160,7 +160,7 @@ test('P1-4 files show event timezone capture date and equipment, with safe fallb
 test('P1-4 managed statuses explain local/NAS presence, history and classification', () => {
   const cases = [
     [{ status: 'archived' }, 'NAS 보관', 'archived', '로컬 비움 완료'],
-    [{ status: 'archived', can_download: false }, 'NAS 보관', 'archived', '로컬 비움 · 활성 루트 미확인'],
+    [{ status: 'archived', can_download: false }, '로컬 비움 / NAS 보관 이력', 'archived', '현재 NAS 사본 미확인'],
     [{}, '로컬 + NAS', 'ready', '분류 확정'],
     [{ confirmed: false }, '로컬 + NAS', 'ready', '분류 미확정'],
     [{ can_download: false }, '로컬 + 이력', 'ready', '분류 확정 · 다른 루트 또는 과거 이력'],
@@ -175,7 +175,7 @@ test('P1-4 managed statuses explain local/NAS presence, history and classificati
     assert.equal(badge.textContent, label); assert.ok(badge.classList.contains(tone)); assert.ok(cell(h, 'status').textContent.includes(note));
   }
   const unset = ready('files', [{ status: 'archived', can_download: false }], { activeArchiveRoot: null });
-  assert.match(cell(unset, 'status').textContent, /로컬 비움 완료/);
+  assert.match(cell(unset, 'status').textContent, /현재 NAS 사본 미확인/);
   const history = ready('files', [{ can_download: false, confirmed: false }], { activeArchiveRoot: null });
   assert.match(cell(history, 'status').textContent, /분류 미확정 · 검증 이력 있음/);
 });
@@ -191,7 +191,7 @@ test('P1-4 Incoming statuses and NAS identical-file notes are distinct', () => {
 });
 
 test('P1-4 archive results and remote status keep exact labels, tones, times and errors', () => {
-  for (const [outcome, label, tone] of [['uploaded', '업로드 검증', 'ready'], ['skipped', '동일 파일 확인', 'ready'], ['legacy_verified', '과거 전송 완료', 'ready'], ['failed', '전송 실패', 'danger'], ['pending', '진행 대기', 'draft'], ['unknown', '결과 미기록', 'draft']]) {
+  for (const [outcome, label, tone] of [['uploaded', '업로드 검증', 'ready'], ['skipped', '동일 파일 확인', 'ready'], ['legacy_verified', '과거 전송 완료', 'draft'], ['failed', '전송 실패', 'danger'], ['pending', '진행 대기', 'draft'], ['unknown', '결과 미기록', 'draft']]) {
     const h = ready('archives', [{ outcome, error: '<error>실패' }]), badge = cell(h, 'status').querySelector('.status');
     assert.equal(badge.textContent, label); assert.ok(badge.classList.contains(tone));
     assert.match(cell(h, 'meta').textContent, /작업 #7 · 원본 · 1 MB.*GoPro/s);
@@ -257,8 +257,8 @@ test('P1-5 per-view details expose full audit fields and do not invent absent me
   const archive = ready('archives', [{ error: '<error>detail', archive_root: null, target: null }]);
   await toggle(archive);
   const a = detailMap(archive);
-  for (const label of ['파일 ID', '작업 정보', '내부 로컬 경로', '원래 Incoming 경로', '아카이브 루트', '목적지 상대 경로', '시각', '오류 상세']) assert.ok(label in a, label);
-  assert.equal(a['아카이브 루트'], '미기록'); assert.equal(a['목적지 상대 경로'], '미기록'); assert.match(a['시각'], /기록 .* · 검증 /); assert.equal(a['오류 상세'], '<error>detail');
+  for (const label of ['파일 ID', '작업 정보', '내부 로컬 경로', '원래 Incoming 경로', '아카이브 루트', '목적지 상대 경로', '기록 시각', '검증 시각', '오류 상세']) assert.ok(label in a, label);
+  assert.equal(a['아카이브 루트'], '미기록'); assert.equal(a['목적지 상대 경로'], '미기록'); assert.ok(a['기록 시각']); assert.ok(a['검증 시각']); assert.equal(a['오류 상세'], '<error>detail');
   const remote = ready('remote', [{ catalog_events: ['A', 'B'], catalog_has_unassigned: true, catalog_file_ids: ['one', 'two'] }]);
   await toggle(remote); const r = detailMap(remote);
   assert.equal(r['원격 전체 경로'], base.remote_path); assert.equal(r['아카이브 루트'], '/NAS'); assert.equal(r['스토리지 ID'], 'storage'); assert.match(r['확인 시각'], /최초 .* · 검증 .* · 최근 /); assert.equal(r['연동 이벤트'], 'A, B · 미배정 포함 · one, two');
@@ -311,16 +311,16 @@ test('P1-5 download links retain exact encoded path and per-view action labels',
 });
 
 test('P1-6 header puts counted tabs and view-only summary outside tabpanel, context before search', () => {
-  const expected = { files: '고유 해시 2개 · NAS 검증 4건', archives: '검증 4건 · 실패 1건', remote: 'NAS 보관 6개 · 원격 전용 2개 · 누락 3개 · 인덱싱' };
+  const expected = { files: '폴더 기준 최근 업로드', archives: '전체 0개 기록', remote: 'NAS 보관 6개 · 원격 전용 2개 · 누락 3개 · 인덱싱' };
   for (const tab of ['files', 'archives', 'remote']) {
     const h = ready(tab), top = h.page.querySelector('.catalog-topbar'), panel = h.page.querySelector('#catalog-tabpanel');
-    assert.ok(top.querySelector('.catalog-tabs')); assert.equal(top.querySelector('.catalog-tabs').getAttribute('role'), 'tablist');
+    assert.ok(top.querySelector('.catalog-tabs')); assert.equal(top.querySelector('.catalog-tabs').getAttribute('role'), tab === 'archives' ? null : 'tablist');
     assert.equal(panel.querySelector('.catalog-tabs'), null); assert.equal(panel.querySelector('.catalog-summary'), null);
     assert.ok(top.querySelector('.catalog-summary').textContent.startsWith(expected[tab]));
     const content = h.page.querySelector('.catalog-content');
     assert.ok(content.children[0].classList.contains('catalog-context-bar')); assert.equal(content.children[1].getAttribute('id'), 'catalog-search');
     assert.equal(h.page.querySelector('.catalog-note'), null);
-    assert.match(h.page.textContent, /보유 파일, 아카이브 이력, 원격 인덱스를 조회합니다\./);
+    assert.match(h.page.textContent, /보유 파일과 원격 인덱스를 조회합니다\.|아카이브 전송의 파일별 결과를 조회합니다\./);
   }
   const h = ready('remote', [{}], { summary: { remotePresent: 1, remoteOnly: 0, remoteMissing: 0 } });
   assert.equal(h.page.querySelector('.catalog-summary').textContent, 'NAS 보관 1개 · 원격 전용 0개');
@@ -384,3 +384,49 @@ test('Round 1: mobile detail background overrides the white main card with highe
   assert.equal((rules[detail].selector.match(/\.[\w-]+/g) || []).length, 2);
 });
 
+
+test('latest result remains separate from storage and details escape full errors', async () => {
+  const h = ready('files', [{latest_archive:{job_id:123,outcome:'failed',error:'<script>unsafe</script>',archive_root:'/other',target:'photo.jpg'},has_verified_history:true}]);
+  assert.match(cell(h,'status').textContent,/로컬 \+ NAS/);
+  assert.match(cell(h,'status').textContent,/최근 업로드 · 전송 실패/);
+  await toggle(h);
+  assert.match(h.page.textContent,/이전 검증 완료 이력 있음/);
+  assert.equal(h.page.querySelector('.catalog-detail-row script'),null);
+  assert.equal(h.page.querySelector('[data-action="open-job-archives"]').dataset.value,'123');
+});
+
+test('same jobs route selects exact job and reset retains scope while all-history clears it', async () => {
+  const h = ready(); h.win.location.hash='#jobs'; h.view.page='jobs';
+  const reply={...h.view.catalog,view:'archives',archiveSelection:{jobId:123,total:1,uploaded:1}};
+  h.setFetch(async()=>({ok:true,status:200,json:async()=>reply}));
+  await h.actions['open-job-archives']('123');
+  assert.equal(h.view.jobsTab,'archives'); assert.equal(h.view.catalogJobId,123);
+  assert.ok(h.page.querySelector('#jobs-tab-archives'));
+  assert.ok(h.fetchCalls.at(-1).url.includes('job_id=123'));
+  h.view.catalogQuery='cause';h.view.catalogScope='failed';h.view.catalogPage=2;
+  await h.actions['reset-catalog-filters']();
+  assert.equal(h.view.catalogJobId,123);assert.ok(h.fetchCalls.at(-1).url.includes('job_id=123'));
+  await h.actions['all-archives']();assert.equal(h.view.catalogJobId,null);
+  assert.ok(!h.fetchCalls.at(-1).url.includes('job_id='));
+});
+
+test('owned upload-result select composes with location scope', async () => {
+  const h=ready();h.view.catalogScope='managed';
+  const select=h.page.querySelector('#catalog-upload-result');select.value='failed';
+  select.dispatchEvent({type:'change',target:select});await flushMicrotasks();
+  assert.equal(h.view.catalogUploadResult,'failed');
+  assert.ok(h.fetchCalls.at(-1).url.includes('upload_result=failed'));
+  assert.ok(h.fetchCalls.at(-1).url.includes('scope=managed'));
+});
+
+test('late owned response cannot overwrite a newly selected job browser', async () => {
+  const h=ready();let release;
+  const oldData=h.view.catalog;
+  h.setFetch(()=>new Promise(resolve=>{release=()=>resolve({ok:true,status:200,json:async()=>oldData});}));
+  const old=h.loadCatalog();h.win.location.hash='#jobs';h.view.page='jobs';
+  const selected={...oldData,view:'archives',rows:[],archiveSelection:{jobId:456,total:0}};
+  h.setFetch(async()=>({ok:true,status:200,json:async()=>selected}));
+  await h.actions['open-job-archives']('456');release();await old;
+  assert.equal(h.view.catalog.view,'archives');assert.equal(h.view.catalogJobId,456);
+  assert.equal(h.view.catalog.archiveSelection.jobId,456);
+});

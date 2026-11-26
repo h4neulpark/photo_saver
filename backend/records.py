@@ -3,9 +3,9 @@ import math
 import json
 import thumbnails
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import JSONResponse
 
 from archive import active_storage_scope
@@ -32,7 +32,7 @@ CTE = f"""
 WITH archive_history AS (
     SELECT 'archive:'||a.job_id||':'||a.item_index AS record_key,a.media_id AS file_id,
            a.asset_kind AS kind,a.local_path,a.sha,a.size,a.storage_id,a.archive_root,
-           a.target,a.outcome,a.verified_at,a.recorded_at,a.error,a.job_id,j.status AS job_status
+           a.target,a.outcome,a.verified_at,a.recorded_at,a.error,a.job_id,j.status AS job_status,a.item_index
     FROM archive_entries a JOIN jobs j ON j.id=a.job_id
     UNION ALL
     SELECT 'archive:'||j.id||':'||f.key,json_extract(f.value,'$.id'),
@@ -42,7 +42,7 @@ WITH archive_history AS (
            CASE WHEN j.status='done' THEN 'legacy_verified'
                 WHEN j.status IN ('queued','running') THEN 'pending' ELSE 'unknown' END,
            CASE WHEN j.status='done' THEN j.finished_at END,coalesce(j.finished_at,j.created_at),
-           NULL,j.id,j.status
+           NULL,j.id,j.status,CAST(f.key AS INTEGER)
     FROM jobs j, json_each(CASE WHEN json_valid(j.payload) THEN j.payload ELSE '{{}}' END,'$.files') f
     WHERE j.kind='upload' AND NOT EXISTS (
         SELECT 1 FROM archive_entries a WHERE a.job_id=j.id AND a.item_index=CAST(f.key AS INTEGER))
@@ -86,6 +86,25 @@ WITH archive_history AS (
 """
 
 
+ENRICHED_CTE = CTE.rstrip() + f""", ranked_archive AS (
+ SELECT *,row_number() OVER (PARTITION BY file_id,kind,sha ORDER BY job_id DESC,item_index DESC) AS rank,
+ max(outcome IN {VERIFIED}) OVER (PARTITION BY file_id,kind,sha) AS has_verified_history
+ FROM archive_history
+), files_with_archive AS (
+ SELECT files.*,a.record_key AS latest_record_key,a.job_id AS latest_job_id,
+ a.item_index AS latest_item_index,a.outcome AS latest_outcome,a.job_status AS latest_job_status,
+ a.storage_id AS latest_storage_id,a.archive_root AS latest_archive_root,a.target AS latest_target,
+ a.recorded_at AS latest_recorded_at,a.verified_at AS latest_verified_at,a.error AS latest_error,
+ coalesce(a.has_verified_history,0) AS has_verified_history,
+ CASE WHEN a.record_key IS NULL THEN 'none' WHEN a.outcome IN ('uploaded','skipped') THEN 'success'
+ WHEN a.outcome='legacy_verified' THEN 'legacy' WHEN a.outcome IN ('failed','pending') THEN a.outcome
+ ELSE 'unknown' END AS upload_result
+ FROM files LEFT JOIN ranked_archive a ON a.file_id=files.file_id AND a.kind=files.asset_kind
+ AND a.sha=files.sha AND a.rank=1
+)
+"""
+
+
 def escape_like(value):
     return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
@@ -120,7 +139,7 @@ def build_remote_folders(db):
     return folders, root_count
 
 
-def range_clause(view, event, device, folder):
+def range_clause(view, event, device, folder, job_id=None):
     where, params = '1=1', []
     if view == 'remote':
         if folder == '__root__':
@@ -137,6 +156,9 @@ def range_clause(view, event, device, folder):
         if device:
             where += ' AND device=?'
             params.append('' if device == '장비 미확인' else device)
+    if view == 'archives' and job_id is not None:
+        where += ' AND job_id=?'
+        params.append(job_id)
     return where, params
 
 
@@ -150,7 +172,14 @@ def catalog_records(
     event: str = 'all',
     device: str = '',
     folder: str = '',
+    upload_result: Literal['all','success','failed','pending','unknown','legacy','none'] = 'all',
+    job_id: Annotated[int | None, Query(ge=1, le=2**63-1)] = None,
 ):
+    if job_id is not None and (view != 'archives' or not 1 <= job_id <= 2**63-1):
+        raise HTTPException(422, 'job_id requires archives and a positive signed 64-bit integer')
+    if upload_result != 'all' and view != 'files':
+        raise HTTPException(422, 'upload_result requires files')
+    query_cte = ENRICHED_CTE if view == 'files' else CTE
     if view == 'files':
         table = 'files'
         where, params = search_clause(['name', 'local_path', 'original_path', 'sha', 'device', 'event_name', 'file_id'], q.strip())
@@ -161,10 +190,13 @@ def catalog_records(
             where += " AND kind='xmp'"
         elif scope == 'verified':
             where += f" AND {FILE_VERIFIED_SQL}"
+        if upload_result != 'all':
+            where += ' AND upload_result=?'
+            params.append(upload_result)
         order = 'local_path,record_key'
     elif view == 'archives':
         table = 'archive_files'
-        where, params = search_clause(['local_path', 'target', 'archive_root', 'sha', 'file_id', 'event_name', 'device', 'CAST(job_id AS TEXT)'], q.strip())
+        where, params = search_clause(['local_path', 'target', 'archive_root', 'sha', 'file_id', 'event_name', 'device', 'CAST(job_id AS TEXT)', 'error'], q.strip())
         if scope == 'verified':
             where += f' AND outcome IN {VERIFIED}'
         elif scope == 'failed':
@@ -173,7 +205,7 @@ def catalog_records(
             where += " AND outcome IN ('unknown','pending')"
         elif scope == 'xmp':
             where += " AND kind='xmp'"
-        order = 'job_id DESC,record_key'
+        order = 'job_id DESC,item_index ASC,record_key'
     else:
         table = 'remote_view'
         where, params = search_clause(['remote_path', 'archive_root', 'sha'], q.strip())
@@ -200,34 +232,40 @@ def catalog_records(
         if device:
             where += ' AND device=?'
             params.append('' if device == '장비 미확인' else device)
+    if view == 'archives' and job_id is not None:
+        where += ' AND job_id=?'
+        params.append(job_id)
     with database() as db:
         active_scope = active_storage_scope()
         thumb_context = thumbnails.context(db, active_scope)
         if scope == 'no_thumbnail':
             where += " AND kind<>'xmp' AND sha IS NOT NULL AND sha NOT IN (SELECT value FROM json_each(?))"
             params.append(json.dumps(list(thumb_context['disk_shas'])))
-        range_where, range_params = range_clause(view, event, device, folder)
+        range_where, range_params = range_clause(view, event, device, folder, job_id)
         range_rows = [dict(row) for row in db.execute(CTE + f'SELECT * FROM {table} WHERE {range_where}', range_params)]
         for row in range_rows:
             row['media_kind'] = thumbnails.media_kind(row['local_path'] or row['target']) if view == 'archives' and row['kind'] != 'xmp' else row['kind']
         missing_thumbnails = thumbnails.missing_summary(range_rows, thumb_context)
+        facet_table = '(SELECT * FROM archive_files WHERE job_id=?)' if view == 'archives' and job_id is not None else table
+        facet_params = [job_id] if view == 'archives' and job_id is not None else []
         if view == 'remote':
             folders, unassigned = [], 0
             remote_folders, remote_root_count = build_remote_folders(db)
         else:
             folders = [dict(row) for row in db.execute(CTE + f"""SELECT e.id,e.name,e.folder,e.parent_id,e.start,e.zone,
-                       count(t.record_key) AS count FROM events e LEFT JOIN {table} t ON t.event_id=e.id
-                       GROUP BY e.id ORDER BY e.start DESC,e.name,e.id""")]
-            device_counts = [dict(row) for row in db.execute(CTE + f"SELECT event_id,device,count(*) AS count FROM {table} GROUP BY event_id,device ORDER BY device")]
+                       count(t.record_key) AS count FROM events e LEFT JOIN {facet_table} t ON t.event_id=e.id
+                       GROUP BY e.id ORDER BY e.start DESC,e.name,e.id""", facet_params)]
+            device_counts = [dict(row) for row in db.execute(CTE + f"SELECT event_id,device,count(*) AS count FROM {facet_table} GROUP BY event_id,device ORDER BY device", facet_params)]
             unassigned = sum(row['count'] for row in device_counts if row['event_id'] is None)
             for item in folders:
                 item['devices'] = [{'name': row['device'] or '장비 미확인', 'count': row['count']} for row in device_counts if row['event_id'] == item['id']]
             remote_folders, remote_root_count = [], 0
-        total = db.execute(CTE + f'SELECT count(*) FROM {table} WHERE {where}', params).fetchone()[0]
+        page_table = 'files_with_archive AS files' if view == 'files' else table
+        total = db.execute(query_cte + f'SELECT count(*) FROM {page_table} WHERE {where}', params).fetchone()[0]
         pages = max(1, math.ceil(total / page_size))
         page = min(page, pages)
         extra = f", {FILE_VERIFIED_SQL} AS has_archive" if view == 'files' else ''
-        rows = [dict(row) for row in db.execute(CTE + f'SELECT * {extra} FROM {table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', [*params, page_size, (page - 1) * page_size])]
+        rows = [dict(row) for row in db.execute(query_cte + f'SELECT * {extra} FROM {page_table} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?', [*params, page_size, (page - 1) * page_size])]
         if view == 'remote':
             hashes = list(dict.fromkeys(row['sha'] for row in rows if row['sha'] is not None))
             matches = {sha: {} for sha in hashes}
@@ -265,6 +303,13 @@ def catalog_records(
                 (active_root, active_storage_id or ''),
             ):
                 present_remote.setdefault(remote['sha'], remote['path'])
+        upload_summary = None
+        if view == 'files':
+            upload_summary = dict(db.execute(ENRICHED_CTE + 'SELECT count(*) AS total,' + ','.join(f"coalesce(sum(upload_result='{key}'),0) AS {key}" for key in ('success','failed','pending','unknown','legacy','none')) + f' FROM files_with_archive WHERE {range_where}', range_params).fetchone())
+        archive_selection = None
+        if view == 'archives':
+            archive_selection = dict(db.execute(CTE + 'SELECT count(*) AS total,' + ','.join(f"coalesce(sum(outcome='{outcome}'),0) AS {key}" for key,outcome in [('uploaded','uploaded'),('skipped','skipped'),('legacy','legacy_verified'),('failed','failed'),('pending','pending')]) + f",coalesce(sum(outcome NOT IN ('uploaded','skipped','legacy_verified','failed','pending')),0) AS unknown FROM archive_files WHERE {range_where}", range_params).fetchone())
+            archive_selection['jobId'] = job_id
         file_summary = db.execute(CTE + 'SELECT count(*) AS files,count(DISTINCT sha) AS hashes FROM files').fetchone()
         archive_summary = db.execute(CTE + f"SELECT count(*) AS attempts,coalesce(sum(outcome IN {VERIFIED}),0) AS verified,coalesce(sum(outcome='failed'),0) AS failed FROM archive_history").fetchone()
         remote_summary = db.execute(CTE + """
@@ -288,6 +333,10 @@ def catalog_records(
             row.update(preview=prefix + '/preview', original=prefix + '/original')
         row['name'] = row.get('name') or PurePosixPath(row.get('remote_path') or row.get('local_path') or row.get('target') or '').name
         if view == 'files':
+            fields = ('record_key','job_id','item_index','outcome','job_status','storage_id','archive_root','target','recorded_at','verified_at','error')
+            latest = {field: row.pop('latest_' + field) for field in fields}
+            row['latest_archive'] = latest if latest['record_key'] is not None else None
+            row['has_verified_history'] = bool(row['has_verified_history'])
             download_path = present_remote.get(row['sha']) if active_root and row.get('sha') else None
             row['download_path'] = download_path
             row['can_download'] = bool(download_path)
@@ -300,6 +349,8 @@ def catalog_records(
             row['in_catalog'] = bool(row['in_catalog'])
             row['can_download'] = bool(active_root and row.get('status') == 'present' and row.get('archive_root') == active_root)
     return JSONResponse({
+        'uploadSummary': upload_summary,
+        'archiveSelection': archive_selection,
         'view': view, 'rows': rows, 'total': total, 'page': page, 'pages': pages, 'pageSize': page_size,
         'summary': {
             **dict(file_summary), **dict(archive_summary), **dict(remote_summary),

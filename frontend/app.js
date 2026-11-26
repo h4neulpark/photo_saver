@@ -106,7 +106,7 @@ const view = {
   catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
   catalogRemoteFolder: '', catalogRemoteExpanded: new Set(),
   catalogExpandedRows: new Set(),
-  catalog: null, catalogTab: 'files', catalogQuery: '', catalogScope: 'all', catalogPage: 1, catalogBusy: false, catalogError: '',
+  jobsTab: 'list', catalogJobId: null, catalogUploadResult: 'all', catalog: null, catalogTab: 'files', catalogQuery: '', catalogScope: 'all', catalogPage: 1, catalogBusy: false, catalogError: '',
 };
 let refreshTimer;
 let stateRequest = 0;
@@ -400,9 +400,9 @@ async function syncState() {
     }
     if (messages.length) announce(messages.filter(Boolean).join(' · '));
     if (completed) view.thumbnailGeneratingShas.clear();
-    if (completed && view.page === 'catalog') await loadCatalog({ soft: true });
+    if (completed && recordBrowserVisible()) await loadCatalog({ soft: true });
     if (completed && view.page === 'settings') await loadThumbnailStats({ silent: true });
-    if (view.page === 'jobs' && (completed || lanes.some(lane => {
+    if (view.page === 'jobs' && view.jobsTab === 'list' && (completed || lanes.some(lane => {
       const job = activeLaneJob(lane);
       return job && !view.jobs.items.some(item => item.id === job.id);
     }))) await loadJobs({ silent: true, preserveLoaded: true });
@@ -1636,7 +1636,7 @@ function uploadStatus() {
   if (job?.kind !== 'upload') return '';
   const result = job.result || {};
   const active = jobActive(job);
-  if (!active) return resultBanner(job, '아카이브 업로드 결과', job.status === 'done' ? button('open-catalog-tab', '아카이브 기록 보기', { extra: 'data-value="archives"' }) : '');
+  if (!active) return resultBanner(job, '아카이브 업로드 결과', button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` }));
   const percent = Math.min(100, Math.round((result.transferredBytes || 0) / (result.totalBytes || 1) * 100));
   return `<section class="surface upload-status" aria-label="아카이브 업로드 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '업로드 대기 중' : result.phase || '업로드 중' : job.status === 'done' ? '업로드 완료' : job.status === 'cancelled' ? '업로드 중지됨' : '업로드 실패'}</strong>
@@ -1992,7 +1992,7 @@ function catalogFolderTree() {
       })}</li>`).join('')}</ul>` : ''}
     </li>`;
   };
-  const count = view.catalogTab === 'archives' ? data?.summary.attempts : data?.summary.files;
+  const count = view.catalogTab === 'archives' ? data?.archiveSelection?.total : data?.summary.files;
   const unassignedItem = `<li>${catalogFolderRow({ depth: 0, buttonHtml: folderButton('unassigned', '', '미배정', data?.unassigned || 0, 'unassigned') })}</li>`;
   return `<nav class="catalog-folders" aria-label="이벤트 폴더"><div class="catalog-folders-heading"><h2>이벤트</h2><p class="small muted">이벤트 · 소분류 · 장비</p></div>
     <div class="catalog-folder-list">${folderButton('all', '', '전체 파일', count || 0)}
@@ -2022,6 +2022,25 @@ function catalogRootException(row) {
   return view.catalogTab === 'archives' ? '<div class="small muted catalog-path">아카이브 루트 미기록</div>' : '';
 }
 
+function recordBrowserVisible() { return view.page === 'catalog' || (view.page === 'jobs' && view.jobsTab === 'archives'); }
+function jobsTabs() {
+  return `<div class="catalog-tabs" role="tablist" aria-label="작업 내역 종류">${[['list','작업 목록'],['archives','아카이브 기록']].map(([key,label]) => `<button type="button" role="tab" id="jobs-tab-${key}" class="catalog-tab" data-action="jobs-tab" data-value="${key}" aria-selected="${view.jobsTab === key}" aria-controls="jobs-panel" tabindex="${view.jobsTab === key ? 0 : -1}">${label}</button>`).join('')}</div>`;
+}
+function openArchiveHistory(id = null) {
+  closeMediaPreview({ restoreFocus: false });
+  cancelCatalogSearchDebounce(); ++catalogRequest; ++jobsRequest;
+  view.jobs.busy = false; view.jobs.loadingMore = false;
+  view.jobsTab = 'archives'; view.catalogTab = 'archives'; view.catalogJobId = id ? Number(id) : null;
+  view.catalogScope = 'all'; view.catalogUploadResult = 'all'; view.catalogQuery = '';
+  view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogPage = 1;
+  view.catalog = null; view.catalogExpandedRows.clear();
+  if (location.hash === '#jobs') { render(); return loadCatalog(); }
+  location.hash = 'jobs';
+}
+function latestUploadLabel(attempt) {
+  if (!attempt) return '전송 이력 없음';
+  return '최근 업로드 · ' + (({uploaded:'성공',skipped:'동일 파일 확인',failed:'전송 실패',pending:'대기·진행 중',legacy_verified:'과거 전송 완료'})[attempt.outcome] || '결과 미기록');
+}
 function catalogFileStatus(row) {
   let label, tone = 'draft', note = '';
   const activeRoot = view.catalog?.activeArchiveRoot;
@@ -2029,10 +2048,10 @@ function catalogFileStatus(row) {
   if (row.location === 'incoming') {
     label = ({ ready: 'Incoming 대기', duplicate: 'Incoming 중복', review: 'Incoming 검토', moving: 'Incoming 이동 중', moved: 'Incoming 이동됨', deleting: 'Incoming 삭제 중', deleted: 'Incoming 삭제됨' })[row.status] || row.status;
     tone = ({ duplicate: 'duplicate', review: 'review' })[row.status] || 'draft';
-    if (row.has_archive) note = 'NAS 동일 파일 있음';
+    if (row.has_archive) note = row.can_download ? 'NAS 동일 파일 있음' : '과거 검증 또는 다른 루트 사본';
   } else if (row.status === 'archived') {
-    label = 'NAS 보관'; tone = 'archived';
-    note = row.can_download ? '로컬 비움 완료' : (activeRoot ? '로컬 비움 · 활성 루트 미확인' : '로컬 비움 완료');
+    label = row.can_download ? 'NAS 보관' : '로컬 비움 / NAS 보관 이력'; tone = 'archived';
+    note = row.can_download ? '로컬 비움 완료' : '현재 NAS 사본 미확인';
   } else if (row.status === 'available') {
     label = row.can_download ? '로컬 + NAS' : row.has_archive ? '로컬 + 이력' : '로컬만';
     tone = row.can_download || row.has_archive ? 'ready' : 'local';
@@ -2041,7 +2060,7 @@ function catalogFileStatus(row) {
     label = '로컬 누락'; tone = 'review';
     note = row.can_download ? 'NAS 사본 있음' : row.has_archive ? '과거 아카이브 이력 있음' : '로컬 원본 없음';
   } else label = row.status === 'offloading' ? '로컬 비우기 중' : row.status;
-  return `<span class="status ${tone}">${escapeHtml(label)}</span>${note ? `<div class="small muted">${escapeHtml(note)}</div>` : ''}`;
+  return `<span class="status ${tone}">${escapeHtml(label)}</span>${note ? `<div class="small muted">${escapeHtml(note)}</div>` : ''}<div class="small ${row.latest_archive?.outcome === 'failed' ? 'form-error' : ['uploaded','skipped'].includes(row.latest_archive?.outcome) ? 'catalog-upload-success' : 'muted'}">${escapeHtml(latestUploadLabel(row.latest_archive))}</div>`;
 }
 
 function catalogRowDetail(row, index) {
@@ -2051,6 +2070,17 @@ function catalogRowDetail(row, index) {
     ? `<code class="catalog-hash-full mono">${escapeHtml(row.sha)}</code> ${button('copy-record-hash', '복사', { glyph: 'copy', extra: `data-value="${escapeHtml(row.sha)}" aria-label="${escapeHtml(row.name)} SHA-256 복사"` })}`
     : '<code class="mono muted">해시 미기록</code>', { wide: true, html: true });
   if (view.catalogTab === 'files') {
+    if (row.latest_archive) {
+      const a = row.latest_archive;
+      details += entry('최근 업로드 작업', button('open-job-archives', `작업 #${a.job_id}`, {extra: `data-value="${a.job_id}"`}), {html:true});
+      details += entry('최근 업로드 결과', latestUploadLabel(a));
+      details += entry('아카이브 루트', a.archive_root); details += entry('목적지 상대 경로', a.target);
+      details += entry('기록 시각', time(a.recorded_at));
+      details += entry(a.outcome === 'legacy_verified' ? '과거 작업 완료 시각' : '검증 시각', time(a.verified_at));
+      if (a.job_status === 'cancelled' && a.outcome === 'unknown') details += entry('작업 상태', '중지됨 · 파일 결과 미기록');
+      if (row.has_verified_history && a.outcome === 'failed') details += entry('이전 이력', '이전 검증 완료 이력 있음');
+      if (a.error) details += entry('오류 상세', a.error, {wide:true});
+    }
     details += entry('파일 ID', row.file_id);
     details += entry('내부 경로', `${row.location === 'incoming' ? 'incoming' : 'managed'}/${row.local_path || ''}`);
     if (row.original_path) details += entry('원래 Incoming 경로', `incoming/${row.original_path}`);
@@ -2064,7 +2094,9 @@ function catalogRowDetail(row, index) {
     if (row.original_path) details += entry('원래 Incoming 경로', `incoming/${row.original_path}`);
     details += entry('아카이브 루트', row.archive_root || '미기록');
     details += entry('목적지 상대 경로', row.target || '미기록');
-    details += entry('시각', `기록 ${time(row.recorded_at)} · 검증 ${time(row.verified_at)}`);
+    details += entry('기록 시각', time(row.recorded_at));
+    details += entry(row.outcome === 'legacy_verified' ? '과거 작업 완료 시각' : '검증 시각', time(row.verified_at));
+    if (row.job_status === 'cancelled' && row.outcome === 'unknown') details += entry('작업 상태', '중지됨 · 파일 결과 미기록');
     if (row.error) details += entry('오류 상세', row.error, { wide: true });
   } else {
     details += entry('원격 전체 경로', row.remote_path);
@@ -2142,7 +2174,7 @@ function catalogTableRow(row, index, labels) {
   const meta = remote ? `${catalogRemoteLinkLabel(row)}<div class="small muted">${kind} · ${size}</div>`
     : archives ? `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted">작업 #${row.job_id} · ${row.kind === 'xmp' ? 'XMP' : '원본'} · ${size}</div>${row.device ? `<div class="small muted">${escapeHtml(row.device)}</div>` : ''}`
       : `<div>${escapeHtml(row.event_name || '미배정')}</div><div class="small muted numbers">${row.captured_at ? catalogTime(row.captured_at, row.event_zone) : '—'}</div><div class="small muted">${escapeHtml(row.device || '장비 미확인')} · ${size}</div>`;
-  const outcomes = { uploaded: ['업로드 검증', 'ready'], skipped: ['동일 파일 확인', 'ready'], legacy_verified: ['과거 전송 완료', 'ready'], failed: ['전송 실패', 'danger'], pending: ['진행 대기', 'draft'], unknown: ['결과 미기록', 'draft'] };
+  const outcomes = { uploaded: ['업로드 검증', 'ready'], skipped: ['동일 파일 확인', 'ready'], legacy_verified: ['과거 전송 완료', 'draft'], failed: ['전송 실패', 'danger'], pending: ['진행 대기', 'draft'], unknown: ['결과 미기록', 'draft'] };
   const outcome = outcomes[row.outcome] || [row.outcome || '결과 미기록', 'draft'];
   let status = remote ? `<span class="status ${row.status === 'present' ? 'archived' : 'review'}">${row.status === 'present' ? 'NAS 보관' : 'NAS 누락'}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.last_seen_at)}</div>`
     : archives ? `<span class="status ${outcome[1]}">${escapeHtml(outcome[0])}</span><div class="small muted numbers">${catalogTime(row.verified_at || row.recorded_at)}</div>${row.error ? `<p class="small form-error catalog-path">${escapeHtml(row.error)}</p>` : ''}`
@@ -2162,25 +2194,26 @@ function catalogPage() {
       : [['all', '모든 파일'], ['managed', '관리 파일 (로컬·NAS)'], ['incoming', 'Incoming 기록'], ['verified', 'NAS 검증 이력 있음'], ['xmp', 'XMP']];
   options.push(['no_thumbnail', '썸네일 없음']);
   const labels = remote ? ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각']
-    : archives ? ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각'] : ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태'];
+    : archives ? ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각'] : ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태 / 최근 업로드'];
   const summaryText = !summary ? '기록을 확인하고 있습니다.' : remote
     ? `NAS 보관 ${summary.remotePresent || 0}개 · 원격 전용 ${summary.remoteOnly || 0}개${summary.remoteMissing ? ` · 누락 ${summary.remoteMissing}개` : ''}${summary.lastIndexedAt ? ` · 인덱싱 ${catalogTime(summary.lastIndexedAt)}` : ''}`
-    : archives ? `검증 ${summary.verified || 0}건 · 실패 ${summary.failed || 0}건` : `고유 해시 ${summary.hashes || 0}개 · NAS 검증 ${summary.verified || 0}건`;
-  const hasFilter = (remote ? view.catalogRemoteFolder : view.catalogEvent !== 'all' || view.catalogDevice) || view.catalogQuery || view.catalogScope !== 'all';
+    : archives ? `전체 ${data?.archiveSelection?.total || 0}개 기록 · 성공 ${(data?.archiveSelection?.uploaded || 0) + (data?.archiveSelection?.skipped || 0)} · 실패 ${data?.archiveSelection?.failed || 0} · 과거 완료 ${data?.archiveSelection?.legacy || 0} · 대기 ${data?.archiveSelection?.pending || 0} · 미기록 ${data?.archiveSelection?.unknown || 0}` : `폴더 기준 최근 업로드 · 성공 ${data?.uploadSummary?.success || 0} · 실패 ${data?.uploadSummary?.failed || 0} · 대기 ${data?.uploadSummary?.pending || 0} · 미기록 ${data?.uploadSummary?.unknown || 0} · 과거 완료 ${data?.uploadSummary?.legacy || 0}`;
+  const hasFilter = (remote ? view.catalogRemoteFolder : view.catalogEvent !== 'all' || view.catalogDevice) || view.catalogQuery || view.catalogScope !== 'all' || view.catalogUploadResult !== 'all';
   const rootBadge = data?.activeArchiveRoot
     ? `<span class="catalog-root-badge mono" title="활성 NAS 루트: ${escapeHtml(data.activeArchiveRoot)}"><span class="catalog-root-label">NAS 루트</span>${escapeHtml(data.activeArchiveRoot)}</span>`
     : '<span class="catalog-root-badge is-unset">NAS 루트 미설정</span>';
-  return `${header('파일 기록', '보유 파일, 아카이브 이력, 원격 인덱스를 조회합니다.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
+  return `${header(archives ? '작업 내역' : '파일 기록', archives ? '아카이브 전송의 파일별 결과를 조회합니다.' : '보유 파일과 원격 인덱스를 조회합니다.', button('refresh-catalog', '새로 고침', { glyph: 'refresh', disabled: view.catalogBusy }))}
     <section class="surface" aria-label="파일 카탈로그">
-      <div class="catalog-topbar"><div class="catalog-tabs" role="tablist" aria-label="기록 종류">
-        ${[['files', '보유 파일', summary?.files], ['archives', '아카이브 기록', summary?.attempts], ['remote', '원격 인덱스', summary?.remoteTotal]].map(([key, title, count]) => `<button type="button" role="tab" id="catalog-tab-${key}" class="catalog-tab" data-action="catalog-tab" data-value="${key}" aria-selected="${view.catalogTab === key}" aria-controls="catalog-tabpanel" tabindex="${view.catalogTab === key ? '0' : '-1'}">${title} <span class="catalog-tab-count">${count ?? '—'}</span></button>`).join('')}
+      <div class="catalog-topbar"><div class="catalog-tabs" ${archives ? '' : 'role="tablist" aria-label="기록 종류"'}>
+        ${(archives ? [] : [['files', '보유 파일', summary?.files], ['remote', '원격 인덱스', summary?.remoteTotal]]).map(([key, title, count]) => `<button type="button" role="tab" id="catalog-tab-${key}" class="catalog-tab" data-action="catalog-tab" data-value="${key}" aria-selected="${view.catalogTab === key}" aria-controls="catalog-tabpanel" tabindex="${view.catalogTab === key ? '0' : '-1'}">${title} <span class="catalog-tab-count">${count ?? '—'}</span></button>`).join('')}
       </div><p class="catalog-summary small muted">${summaryText}</p></div>
-      <div id="catalog-tabpanel" role="tabpanel" aria-labelledby="catalog-tab-${view.catalogTab}">
+      <div id="catalog-tabpanel" ${archives ? '' : `role="tabpanel" aria-labelledby="catalog-tab-${view.catalogTab}"`}>${archives ? `<p class="small muted">종료된 작업의 미기록 항목은 파일별 실패가 확인된 결과와 구분합니다.</p><p>${view.catalogJobId ? `작업 #${view.catalogJobId} · 아카이브 기록 ${button('all-archives','전체 아카이브 기록')}` : '전체 아카이브 기록'}</p>` : ''}
       <div class="catalog-layout">${catalogFolderTree()}<div class="catalog-content">
       <div class="catalog-context-bar"><div class="catalog-location" aria-label="${remote ? '현재 원격 폴더' : '현재 이벤트 폴더'}">${icon('folder')}<strong>${escapeHtml(catalogFolderLabel())}</strong></div>${archives || remote ? rootBadge : ''}${catalogThumbnailAlert()}</div>
       <form id="catalog-search" class="catalog-tools">
         <label class="search">${icon('search')}<span class="sr-only">파일 기록 검색</span><input id="catalog-query" name="query" type="search" maxlength="300" placeholder="파일명·경로·SHA-256 검색" value="${escapeHtml(view.catalogQuery)}"></label>
         <select id="catalog-scope" name="scope" aria-label="파일 기록 필터">${options.map(([value, label]) => `<option value="${value}" ${view.catalogScope === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+        ${!archives && !remote ? `<select id="catalog-upload-result" aria-label="최근 업로드 결과">${[['all','모든 업로드 결과'],['success','성공'],['failed','실패'],['pending','대기·진행 중'],['unknown','결과 미기록'],['legacy','과거 전송 완료'],['none','전송 이력 없음']].map(([key,label]) => `<option value="${key}" ${view.catalogUploadResult === key ? 'selected' : ''}>${label}</option>`).join('')}</select>` : ''}
         <button type="submit" class="button" ${view.catalogBusy ? 'disabled' : ''}>검색</button>
         ${hasFilter ? button('reset-catalog-filters', '필터 초기화') : ''}<div class="view-switch view-switch-icon" role="group" aria-label="기록 보기 방식">${[ ['table', '표 보기', 'table'], ['cards', '카드 보기', 'grid'] ].map(([value, label, glyph]) => button('catalog-view', label, { glyph, extra: `data-value="${value}" aria-pressed="${view.catalogView === value}"` })).join('')}</div>
       </form>
@@ -2203,7 +2236,7 @@ function scheduleCatalogSearch() {
   if (catalogComposing) return;
   catalogSearchTimer = window.setTimeout(() => {
     catalogSearchTimer = null;
-    if (view.page !== 'catalog') return;
+    if (!recordBrowserVisible()) return;
     view.catalogPage = 1; loadCatalog({ soft: true });
   }, view.catalogQuery ? 280 : 0);
 }
@@ -2213,12 +2246,14 @@ async function loadCatalog({ soft = false } = {}) {
   view.catalogSoftLoading = soft && Boolean(view.catalog);
   view.catalogBusy = true;
   view.catalogError = '';
-  if (view.page === 'catalog') render();
+  if (recordBrowserVisible()) render();
   try {
     const query = new URLSearchParams({
       view: view.catalogTab, q: view.catalogQuery, scope: view.catalogScope, page: view.catalogPage,
       event: view.catalogEvent, device: view.catalogDevice, folder: view.catalogRemoteFolder,
     });
+    if (view.catalogTab === 'archives' && view.catalogJobId) query.set('job_id', view.catalogJobId);
+    if (view.catalogTab === 'files') query.set('upload_result', view.catalogUploadResult);
     const result = await api(`catalog?${query}`);
     if (request !== catalogRequest) return;
     view.catalog = result;
@@ -2230,7 +2265,7 @@ async function loadCatalog({ soft = false } = {}) {
   } finally {
     if (request === catalogRequest) {
       view.catalogBusy = false;
-      if (view.page === 'catalog') render();
+      if (recordBrowserVisible()) render();
     }
   }
 }
@@ -2311,18 +2346,18 @@ async function loadJobs({ reset = false, silent = false, preserveLoaded = false,
   }
 }
 function mountJobsPage() {
-  page.innerHTML = `<main aria-labelledby="page-title" data-page="jobs"><div id="page-active-jobs"></div><div id="page-load-error"></div><div id="jobs-header"></div>
+  page.innerHTML = `<main aria-labelledby="page-title" data-page="jobs"><div id="page-active-jobs"></div><div id="page-load-error"></div><div id="jobs-header"></div>${jobsTabs()}<div id="jobs-panel" role="tabpanel" aria-labelledby="jobs-tab-list">
     <section class="surface" aria-label="작업 내역 목록"><div class="jobs-toolbar"><div id="jobs-status-filters" class="filters" aria-label="작업 상태 필터"></div>
       <label>작업 영역 <select id="jobs-lane-filter"><option value="all">모든 영역</option><option value="local">로컬 파일</option><option value="remote">원격 아카이브</option><option value="device">기기 업로드 (이 브라우저)</option><option value="exclusive">시스템</option></select></label></div>
-    <div id="jobs-error"></div><div id="jobs-list" class="jobs-list"></div><div id="jobs-footer" class="jobs-footer"></div></section></main>`;
+    <div id="jobs-error"></div><div id="jobs-list" class="jobs-list"></div><div id="jobs-footer" class="jobs-footer"></div></section></div></main>`;
 }
 function jobHistoryActions(job) {
   const result = job.result || {};
   if (isJobActive(job)) {
     const cancel = { upload: 'cancel-archive-upload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
-    return cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : '';
+    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
   }
-  if (job.kind === 'upload') return button('open-catalog-tab', '아카이브 기록 보기', { extra: 'data-value="archives"' });
+  if (job.kind === 'upload') return button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` });
   if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
   if (job.kind === 'offload') return button('open-events', '이벤트 분류 열기');
   if (job.kind === 'device-upload') return button('open-incoming', '가져오기 열기');
@@ -2399,15 +2434,15 @@ function thumbnailSettingsSection() {
 }
 
 function thumbnailScopeRequest(scope) {
-  return { scope, view: view.catalogTab, event: view.catalogEvent, device: view.catalogDevice, folder: view.catalogRemoteFolder };
+  return { scope, view: view.catalogTab, event: view.catalogEvent, device: view.catalogDevice, folder: view.catalogRemoteFolder, ...(scope === 'folder' && view.catalogTab === 'archives' && view.catalogJobId ? {job_id:view.catalogJobId} : {}) };
 }
 
 async function openThumbnailBatchDialog(defaultScope = 'folder') {
   let scope = defaultScope;
-  const hasFolder = view.page === 'catalog' && (view.catalogTab === 'remote' ? view.catalogRemoteFolder : view.catalogEvent !== 'all' || view.catalogDevice);
+  const hasFolder = recordBrowserVisible() && (view.catalogTab === 'remote' ? view.catalogRemoteFolder : view.catalogEvent !== 'all' || view.catalogDevice || (view.catalogTab === 'archives' && view.catalogJobId));
   if (!hasFolder) scope = 'all';
   const plan = await api('thumbnails/plan', 'POST', thumbnailScopeRequest(scope));
-  showDialog('누락 썸네일 일괄 생성', `${hasFolder ? `<fieldset><legend>생성 범위</legend>${[['folder', '현재 폴더 범위'], ['all', '전체 미생성']].map(([value, label]) => `<label class="checkbox-row"><input type="radio" name="thumbnail_scope" value="${value}" ${scope === value ? 'checked' : ''}>${label}</label>`).join('')}</fieldset>` : ''}<div id="thumbnail-plan" role="status"></div><div id="thumbnail-fallback"></div>`, '썸네일 생성', async form => {
+  showDialog('누락 썸네일 일괄 생성', `${hasFolder ? `<fieldset><legend>생성 범위</legend>${[['folder', view.catalogTab === 'archives' && view.catalogJobId ? `작업 #${view.catalogJobId} · 현재 폴더 범위` : '현재 폴더 범위'], ['all', '전체 미생성']].map(([value, label]) => `<label class="checkbox-row"><input type="radio" name="thumbnail_scope" value="${value}" ${scope === value ? 'checked' : ''}>${label}</label>`).join('')}</fieldset>` : ''}<div id="thumbnail-plan" role="status"></div><div id="thumbnail-fallback"></div>`, '썸네일 생성', async form => {
     const result = await api('jobs/thumbnails', 'POST', { ...thumbnailScopeRequest(scope), allow_large_sftp_fallback: form.get('allow_large_sftp_fallback') === '1' });
     if (result.id) setOptimisticJob({ ...result, result: { phase: '썸네일 생성 대기 중' } });
     await syncState();
@@ -2461,7 +2496,7 @@ async function thumbnailCacheOperation(path) {
     const result = await api('settings/thumbnails/' + path, 'POST');
     view.thumbnailStats = result.stats;
     announce(path === 'cleanup' ? `미참조 썸네일 ${result.deleted}개 정리` : `실패 상태 ${result.cleared}개 초기화`);
-    if (view.page === 'catalog') await loadCatalog({ soft: true });
+    if (recordBrowserVisible()) await loadCatalog({ soft: true });
   } finally { view.thumbnailOpBusy = false; render(); }
 }
 
@@ -2751,6 +2786,7 @@ function clearCatalogViews() {
   clearArchiveDrag();
   view.catalog = null; view.catalogBusy = false; view.catalogError = '';
   view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogQuery = '';
+  view.catalogJobId = null; view.catalogUploadResult = 'all'; view.jobsTab = 'list';
   view.catalogScope = 'all'; view.catalogPage = 1; view.catalogExpanded.clear();
   view.catalogRemoteFolder = ''; view.catalogRemoteExpanded.clear();
   view.catalogExpandedRows.clear();
@@ -3061,8 +3097,8 @@ function render() {
     if (!inPlace) mountEventsPage();
     patchEventsPage();
   } else if (view.page === 'jobs') {
-    if (!inPlace) mountJobsPage();
-    patchJobsPage();
+    if (view.jobsTab === 'archives') page.innerHTML = `<main data-page="jobs-archives">${jobsTabs()}<div id="jobs-panel" role="tabpanel" aria-labelledby="jobs-tab-archives">${catalogPage()}</div></main>`;
+    else { if (!inPlace || !page.querySelector('#jobs-list')) mountJobsPage(); patchJobsPage(); }
   } else {
     page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
   }
@@ -3074,7 +3110,7 @@ function render() {
     window.scrollTo(0, 0);
     return;
   }
-  if (view.page === 'catalog') window.scrollTo(0, windowScroll);
+  if (recordBrowserVisible()) window.scrollTo(0, windowScroll);
   if (catalogScrollPosition) page.querySelector('.catalog-table-wrap, .catalog-cards')?.scrollTo(catalogScrollPosition);
   page.querySelector('.catalog-folder-list')?.scrollTo(0, folderScroll);
   if (pendingPreviewFocus) {
@@ -3344,7 +3380,7 @@ function restorePreviewFocus(closing) {
   const source = closing.returnFocus?.source || closing.source;
   const currentId = closing.ids?.[closing.index];
   const originalId = closing.returnFocus?.id;
-  if (source === 'catalog' && view.page === 'catalog') {
+  if (source === 'catalog' && recordBrowserVisible()) {
     const buttons = [...page.querySelectorAll('[data-action="preview-catalog"]')];
     (buttons.find(element => element.dataset.value === currentId) || page.querySelector('#catalog-query'))?.focus({ preventScroll: true });
     return;
@@ -3803,10 +3839,13 @@ const actions = {
   'jobs-status-filter'(filter) { view.jobs.statusFilter = filter; return loadJobs({ reset: true }); },
   'open-incoming'() { location.hash = 'incoming'; },
   'open-events'() { location.hash = 'events'; },
-  'open-catalog-tab'(tab) { cancelCatalogSearchDebounce(); view.catalogExpandedRows.clear(); view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; location.hash = 'catalog'; },
+  'open-job-archives': openArchiveHistory,
+  'all-archives'() { return openArchiveHistory(); },
+  'jobs-tab'(tab) { if (tab === 'archives') return openArchiveHistory(view.catalogJobId); ++catalogRequest; view.jobsTab = 'list'; render(); return view.jobs.items.length ? Promise.resolve() : loadJobs({reset:true}); },
+  'open-catalog-tab'(tab) { if (tab === 'archives') return openArchiveHistory(); cancelCatalogSearchDebounce(); view.catalogExpandedRows.clear(); view.catalogTab = tab; view.catalogScope = 'all'; view.catalogPage = 1; view.catalog = null; if (location.hash === '#catalog') return loadCatalog(); location.hash = 'catalog'; },
   'reset-catalog-filters'() {
     view.catalogExpandedRows.clear();
-    cancelCatalogSearchDebounce(); view.catalogQuery = ''; view.catalogScope = 'all'; view.catalogPage = 1;
+    cancelCatalogSearchDebounce(); view.catalogQuery = ''; view.catalogUploadResult = 'all'; view.catalogScope = 'all'; view.catalogPage = 1;
     view.catalogEvent = 'all'; view.catalogDevice = ''; view.catalogRemoteFolder = '';
     return loadCatalog({ soft: true });
   },
@@ -4070,6 +4109,8 @@ page.addEventListener('change', event => {
     cancelCatalogSearchDebounce();
     view.catalogScope = control.value;
     view.catalogPage = 1; loadCatalog({ soft: true });
+  } else if (control.id === 'catalog-upload-result') {
+    view.catalogUploadResult = control.value; view.catalogPage = 1; view.catalogExpandedRows.clear(); loadCatalog({soft:true});
   } else if (control.id === 'jobs-lane-filter') {
     view.jobs.laneFilter = control.value; loadJobs({ reset: true });
   } else if (control.dataset.select) {
@@ -4169,19 +4210,24 @@ page.addEventListener('keydown', event => {
   if (incomingTab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
     event.preventDefault();
     const tabs = ['files', 'xmp', 'companions'], index = tabs.indexOf(incomingTab.dataset.value);
-    const target = event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (index + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+    const target = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
     actions['incoming-tab'](tabs[target]);
     page.querySelector(`#incoming-tab-${tabs[target]}`)?.focus();
     return;
   }
+  const jobsTab = event.target.closest('[data-action="jobs-tab"]');
+  if (jobsTab && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
+    event.preventDefault(); const target = event.key === 'Home' ? 'list' : event.key === 'End' ? 'archives' : jobsTab.dataset.value === 'list' ? 'archives' : 'list';
+    Promise.resolve(actions['jobs-tab'](target)).then(() => page.querySelector(`#jobs-tab-${target}`)?.focus()); return;
+  }
   const tab = event.target.closest('[role="tab"][data-action="catalog-tab"]');
   if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
     event.preventDefault();
-    const tabs = ['files', 'archives', 'remote'], index = tabs.indexOf(tab.dataset.value);
-    const target = event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (index + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+    const tabs = ['files', 'remote'], index = tabs.indexOf(tab.dataset.value);
+    const target = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
     const loading = actions['catalog-tab'](tabs[target]);
     page.querySelector(`#catalog-tab-${tabs[target]}`)?.focus();
-    loading.then(() => { if (view.page === 'catalog' && view.catalogTab === tabs[target]) page.querySelector(`#catalog-tab-${tabs[target]}`)?.focus(); });
+    loading.then(() => { if (recordBrowserVisible() && view.catalogTab === tabs[target]) page.querySelector(`#catalog-tab-${tabs[target]}`)?.focus(); });
     return;
   }
   const card = event.target.closest('[data-card-preview]');
@@ -4288,6 +4334,7 @@ for (const type of ['load', 'loadedmetadata']) {
 dialog.addEventListener('click', async event => {
   const control = event.target.closest('button[data-action]');
   if (control?.dataset.action === 'close-dialog') dialog.close();
+  else if (control?.dataset.action === 'open-job-archives') { dialog.close(); openArchiveHistory(control.dataset.value); }
   else if (control?.dataset.action === 'copy-record-hash') {
     try { await actions['copy-record-hash'](control.dataset.value); }
     catch (error) { announce(error.message); }
@@ -4299,9 +4346,12 @@ function loadRoute() {
   cancelCatalogSearchDebounce(); catalogComposing = false;
   ++jobsRequest; view.jobs.busy = false; view.jobs.loadingMore = false;
   closeMediaPreview({ restoreFocus: false });
+  ++catalogRequest;
+  if (location.hash === '#catalog' && view.catalogTab === 'archives') { view.catalogTab = 'files'; view.catalog = null; view.catalogScope = 'all'; }
+  if (location.hash === '#jobs' && view.jobsTab === 'archives') view.catalogTab = 'archives';
   render();
-  if (view.page === 'catalog') loadCatalog();
-  if (view.page === 'jobs') loadJobs({ reset: true });
+  if (recordBrowserVisible()) loadCatalog();
+  if (view.page === 'jobs' && view.jobsTab === 'list') loadJobs({ reset: true });
   if (view.page === 'archive') maybeAutoConnectArchive();
   if (view.page === 'settings') loadSettings().then(() => {
     if (view.page === 'settings') render();

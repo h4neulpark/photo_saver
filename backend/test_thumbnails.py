@@ -46,6 +46,19 @@ class ThumbnailTests(unittest.TestCase):
             db.execute("UPDATE media SET kind='photo' WHERE id='photo'")
             return db.execute("SELECT sha FROM media WHERE id='photo'").fetchone()[0], path
 
+    def test_archive_folder_plan_respects_exact_job_and_id_bounds(self):
+        sha,path = self.photo()
+        with catalog.database(write=True) as db:
+            jobs = []
+            for files in ([{'id':'photo','kind':'media','local':'photo/photo.jpg','sha':sha}], []):
+                jobs.append(db.execute("INSERT INTO jobs(kind,lane,status,payload,created_at) VALUES ('upload','remote','done',?,'now')",(json.dumps({'files':files}),)).lastrowid)
+            first,_ = thumbs.plan_thumbnails(db,thumbs.ThumbnailRequest(scope='folder',view='archives',job_id=jobs[0]))
+            empty,_ = thumbs.plan_thumbnails(db,thumbs.ThumbnailRequest(scope='folder',view='archives',job_id=jobs[1]))
+        self.assertEqual(first['total'],1)
+        self.assertEqual(empty['total'],0)
+        for value in (0,-1,2**63):
+            self.assertEqual(self.client.post('/api/thumbnails/plan',json={'scope':'folder','view':'archives','job_id':value}).status_code,422)
+
     def jpeg(self):
         output = io.BytesIO()
         Image.new('RGB', (800, 600), 'blue').save(output, format='JPEG')

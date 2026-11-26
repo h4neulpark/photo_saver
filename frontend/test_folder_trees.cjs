@@ -48,7 +48,7 @@ function remoteNode(name, children = [], parent = '') {
 }
 function catalogData() {
   return {
-    summary: { files: 20, attempts: 30, hashes: 20, verified: 10, failed: 0, remoteTotal: 10, remotePresent: 10, remoteOnly: 0, remoteMissing: 0 },
+    archiveSelection: {total:30}, summary: { files: 20, attempts: 30, hashes: 20, verified: 10, failed: 0, remoteTotal: 10, remotePresent: 10, remoteOnly: 0, remoteMissing: 0 },
     remoteRootCount: 1,
     remoteFolders: [
       remoteNode('261030_고프로백업', [{ name: '100GOPRO' }]),

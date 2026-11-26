@@ -38,6 +38,16 @@ class JobsApiTests(unittest.TestCase):
         self.assertTrue(all('payload' not in job for job in response.json()['jobs']))
         return response.json()
 
+    def test_catalog_job_bounds_and_result_validation(self):
+        for value in ('0','-1',str(2**63),'invalid'):
+            self.assertEqual(self.client.get('/api/catalog',params={'view':'archives','job_id':value}).status_code,422)
+        for params in ({'view':'files','job_id':1},{'upload_result':'invalid'},{'view':'remote','upload_result':'failed'}):
+            self.assertEqual(self.client.get('/api/catalog',params=params).status_code,422)
+        response = self.client.get('/api/catalog',params={'view':'archives','job_id':999})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()['archiveSelection']['total'],0)
+        self.assertEqual(response.headers['cache-control'],'no-store')
+
     def test_empty_summary_and_cursor(self):
         self.assertEqual(self.query(), {'jobs': [], 'summary': {'total': 0, 'active': 0, 'attention': 0, 'done': 0}, 'nextBeforeId': None, 'hasMore': False})
 

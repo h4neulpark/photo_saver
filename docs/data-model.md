@@ -154,3 +154,6 @@ CREATE INDEX thumbnail_cache_by_status ON thumbnail_cache(status, updated_at);
 준비 상태는 `/thumbnails/<sha>-v1.jpg` 일반 파일 실존을 기준으로 판정한다. DB는 실패 사유와 추출 출처(local, remote_photo, remote_video_ssh, remote_video_sftp)를 보존한다. 디스크 파일은 과거 failed 기록보다 우선하며 DB 복원만으로 이미지가 복구되지는 않는다.
 
 `JOB_LANES`의 `thumbnails-local`은 local, `thumbnails-remote`는 remote에 고정된다. 재기동·복원 시 기존 backfill 규칙을 그대로 적용한다. `CATALOG_TABLES`와 백업 복원 화이트리스트에 `thumbnail_cache`가 포함되며 테이블이 없는 구버전 백업도 복원할 수 있다. 전체 초기화는 행과 캐시 파일을 함께 삭제한다.
+
+
+보유 자산의 최신 업로드 결과는 저장된 상태가 아닌 읽기 전용 파생값이다. 병합된 archive_entries/legacy manifest 이력을 `(file_id, asset_kind, current sha)`로 분할하여 `job_id DESC, item_index DESC`의 첫 결과를 선택한다. 원본과 XMP, 다른 ID의 동일 바이트, 변경 전 SHA는 서로 결과를 물려받지 않는다. 과거 성공 뒤 실패·대기·성공 재시도는 현재 표시만 변경하고 이전 작업 기록은 그대로 유지한다. 파일별 결과 없는 종료 작업은 unknown, 기존 완료 manifest는 legacy_verified로 유지한다. NAS 현재 사본과 다운로드 가능 여부는 기존 활성 루트 remote_files 스냅샷 규칙을 따른다.

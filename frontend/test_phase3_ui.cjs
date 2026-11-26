@@ -182,7 +182,7 @@ test('11 Catalog details show the full hash and copy value across all 3 tabs', (
 
 test('12 Catalog rows include responsive data-label and cell classes across files, archives, and remote tabs', () => {
   const h = createHarness();
-  for (const [tab, labels] of [['files', ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태']], ['archives', ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각']], ['remote', ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각']]]) {
+  for (const [tab, labels] of [['files', ['파일 / 보관 경로', '분류 / 촬영 일시', '보관 상태 / 최근 업로드']], ['archives', ['파일 / 목적지', '분류 / 작업 정보', '검증 결과 / 시각']], ['remote', ['원격 파일 / 폴더', '연동 이벤트 / 크기', 'NAS 상태 / 확인 시각']]]) {
     catalog(h, tab); const cells = h.page.querySelectorAll('.catalog-table tbody td');
     assert.deepEqual(plain(cells.map(cell => cell.dataset.label)), labels); assert.deepEqual(plain(cells.map(cell => cell.getAttribute('class'))), ['catalog-cell-file', 'catalog-cell-meta', 'catalog-cell-status']);
     assert.deepEqual(plain(h.page.querySelectorAll('.catalog-table th').map(th => th.textContent)), labels);

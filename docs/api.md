@@ -291,3 +291,10 @@ incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격
 `GET /api/catalog`은 `scope=no_thumbnail`을 지원한다. 모든 탭의 행에 `media_kind`, `thumbnail`, `thumbnail_status`, `thumbnail_error`, `can_generate_thumbnail`, `has_local_original`, `preview`, `original`이 추가된다. `kind`의 기존 의미는 유지한다. 로컬 URL은 `/api/managed/{id}/preview|original` 또는 `/api/incoming/{id}/preview|original`이다. 상태는 ready, missing, generating, unavailable, failed, skipped_large, non_media(XMP)이며 실제 디스크 캐시가 우선한다. `missingThumbnails`는 현재 탭·폴더 범위의 생성 가능한 고유 SHA를 집계하고 검색어·상태 필터는 무시한다(`total`, `missing`, `photos`, `videos`, `local`, `remotePhotos`, `remoteVideos`, `failed`, `skippedLarge`).
 
 `POST /api/archive/index`의 기존 `connection`, `path`, `full_rehash` 계약은 유지하며 `generate_thumbnails`, `allow_large_sftp_fallback`(모두 기본 false)을 추가한다. 생성 옵션을 켜면 동일 연결에서 두 번째 단계로 실행하고 결과의 `thumbnails`에 total/generated/reused/failed/skippedLarge를 반환한다. `GET /api/jobs?kind=`는 `thumbnails-local`, `thumbnails-remote`도 허용한다.
+
+
+`GET /api/catalog` 추가 매개변수: `job_id`는 `view=archives`에서만 사용하며 1부터 2^63-1까지의 정수다. 다른 뷰와 함께 사용하거나 범위를 벗어나면 422이며 알 수 없는 유효 ID는 빈 결과다. `upload_result=all|success|failed|pending|unknown|legacy|none`은 보유 파일의 최신 시도 필터이며 기존 `scope=verified`의 과거 검증/원격 인덱스 의미를 바꾸지 않는다. `all` 이외의 값을 다른 뷰에 적용하면 422다.
+
+보유 행의 `latest_archive`는 시도가 없으면 null이며, 있으면 `record_key`, `job_id`, 숫자 `item_index`, `outcome`, `job_status`, `storage_id`, `archive_root`, `target`, `recorded_at`, `verified_at`, `error`를 제공한다. `has_verified_history`는 동일 ID·자산 종류·현재 SHA의 성공 이력이다. `uploadSummary`는 선택 이벤트/장비 범위의 현재 자산별 total/success/failed/pending/unknown/legacy/none을 제공하며 검색/선택 필터는 무시한다. `archiveSelection`은 jobId/total/uploaded/skipped/legacy/failed/pending/unknown을 제공하며 작업·이벤트·장비 범위를 반영하고 검색/결과 필터는 무시한다. 기존 전역 summary는 유지한다. 아카이브 검색은 오류 문자열도 포함하며 정렬은 작업 번호 내림차순, 숫자 manifest 위치 오름차순이다.
+
+썸네일 계획/작업의 선택적 `job_id`도 같은 정수 범위를 가지며 `scope=folder,view=archives` 범위에 적용한다. 전체 생성에는 job_id를 보내지 않는다. 다운로드/썸네일 권한은 최근 업로드 결과에서 파생하지 않는다.

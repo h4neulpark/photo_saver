@@ -23,6 +23,89 @@ class CatalogRecordsTests(unittest.TestCase):
         self.assertEqual(response.headers['cache-control'], 'no-store')
         return json.loads(response.body)
 
+    def scoped(self, **kwargs):
+        return json.loads(records.catalog_records(**{'q':'', 'page':1, 'page_size':50, **kwargs}).body)
+
+    def manifest_job(self, files, status='failed', outcomes=None):
+        with catalog.database(write=True) as db:
+            job = db.execute("INSERT INTO jobs(kind,lane,status,payload,created_at) VALUES ('upload','remote',?,?,?)", (status,json.dumps({'files':files}), 'same-time')).lastrowid
+            for index,outcome in (outcomes or {}).items():
+                f = files[index]
+                db.execute("INSERT INTO archive_entries(job_id,item_index,media_id,asset_kind,local_path,sha,target,outcome,recorded_at,error,storage_id,archive_root) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (job,index,f['id'],f.get('kind','media'),f['local'],f['sha'],f['target'],outcome,'same-time', 'literal %_\\ cause' if outcome == 'failed' else None,'fixture','/fixture'))
+        return job
+
+    def test_partial_100_exact_selection_latest_and_constant_queries(self):
+        files = []
+        for index in range(100):
+            self.fixture.add_file(f'asset{index}', f'{index}.jpg', str(index).encode())
+        with catalog.database() as db:
+            for row in db.execute("SELECT id,path,sha FROM media WHERE id LIKE 'asset%'"):
+                files.append(dict(id=row['id'],local=row['path'],sha=row['sha'],target=row['path'],kind='media'))
+        job = self.manifest_job(files, outcomes={i:'uploaded' if i < 97 else 'failed' for i in range(100)})
+        owned = self.scoped(view='files',upload_result='failed')
+        self.assertEqual(owned['total'],3)
+        self.assertEqual(owned['uploadSummary']['success'],97)
+        self.assertEqual(owned['uploadSummary']['failed'],3)
+        self.assertTrue(all(r['latest_archive']['verified_at'] is None for r in owned['rows']))
+        history = self.scoped(view='archives',job_id=job)
+        self.assertEqual(history['total'],100)
+        self.assertEqual([r['item_index'] for r in history['rows']],list(range(50)))
+        self.assertEqual(history['archiveSelection']['failed'],3)
+        second_page = self.scoped(view='archives',job_id=job,page=2)
+        self.assertEqual([r['item_index'] for r in second_page['rows']],list(range(50,100)))
+        self.assertEqual(next(f for f in history['folders'] if f['id']=='child')['count'],100)
+        later = self.manifest_job([files[99]],status='done',outcomes={0:'uploaded'})
+        self.assertEqual(self.scoped(view='files',upload_result='failed')['total'],2)
+        self.assertEqual(self.scoped(view='archives',job_id=job,scope='failed')['total'],3)
+        self.assertEqual(self.scoped(view='archives',job_id=later)['total'],1)
+        self.assertEqual(next(f for f in self.scoped(view='archives',job_id=later)['folders'] if f['id']=='child')['count'],1)
+        self.assertEqual(self.scoped(view='archives',job_id=999999)['archiveSelection']['total'],0)
+        self.assertEqual(self.scoped(view='archives',job_id=job,q='literal %_\\ cause')['total'],3)
+        pending = self.manifest_job([files[99]],status='queued')
+        self.assertEqual(self.scoped(view='files',upload_result='pending')['rows'][0]['latest_archive']['job_id'],pending)
+        counts = []
+        plans = []
+        original = records.database
+        @contextmanager
+        def traced():
+            with original() as db:
+                queries = []
+                db.set_trace_callback(queries.append)
+                yield db
+                counts.append(len([q for q in queries if q.lstrip().upper().startswith(('WITH','SELECT'))]))
+                plans.extend(str(tuple(row)) for row in db.execute('EXPLAIN QUERY PLAN ' + records.ENRICHED_CTE + 'SELECT * FROM files_with_archive LIMIT 100'))
+                db.set_trace_callback(None)
+        with patch.object(records,'database',traced):
+            records.catalog_records(q='',page=1,page_size=1)
+            records.catalog_records(q='',page=1,page_size=100)
+        self.assertEqual(counts[0],counts[1])
+        print('latest history SELECT counts (1/100):',counts,'query plan:',plans)
+
+    def test_identity_legacy_and_cancelled_missing_positions(self):
+        with catalog.database() as db:
+            media = dict(db.execute("SELECT * FROM media WHERE id='one'").fetchone())
+        f = {'id':'one','kind':'media','local':media['path'],'sha':media['sha'],'target':'clip.MP4'}
+        old = self.manifest_job([f],status='done')
+        self.assertEqual(self.scoped(view='files',upload_result='legacy')['total'],1)
+        failed = self.manifest_job([f],outcomes={0:'failed'})
+        row = self.scoped(view='files',upload_result='failed')['rows'][0]
+        self.assertTrue(row['has_verified_history'])
+        self.assertFalse(row['can_download'])
+        self.assertEqual(row['latest_archive']['job_id'],failed)
+        self.fixture.add_file('same-bytes','same.MP4',b'first video')
+        self.assertEqual(self.scoped(view='files',upload_result='failed')['total'],1)
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE media SET sha=? WHERE id='one'",('f'*64,))
+        self.assertEqual(self.scoped(view='files',upload_result='failed')['total'],0)
+        self.assertEqual(self.scoped(view='archives',job_id=failed)['total'],1)
+        sidecar = {**f,'kind':'xmp','sha':media['xmp_sha'],'local':media['xmp_path']}
+        cancelled = self.manifest_job([f,sidecar],status='cancelled',outcomes={0:'uploaded'})
+        history = self.scoped(view='archives',job_id=cancelled)
+        self.assertEqual(history['archiveSelection']['uploaded'],1)
+        self.assertEqual(history['archiveSelection']['unknown'],1)
+        self.assertEqual(self.scoped(view='files',upload_result='unknown')['rows'][0]['asset_kind'],'xmp')
+        self.assertEqual(self.scoped(view='archives',job_id=old)['rows'][0]['outcome'],'legacy_verified')
+
     def test_event_tree_parent_child_device_and_pagination_are_independent(self):
         self.fixture.add_file('two', 'parent.MP4', b'parent')
         with catalog.database(write=True) as db:

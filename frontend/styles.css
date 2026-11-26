@@ -754,3 +754,5 @@ dialog::backdrop { background: #111d34a1; }
 .device-name-form .setting-controls { flex: 1 1 300px; }
 .device-name-form input { flex: 1; min-width: 0; width: 100%; }
 .device-name-error { flex-basis: 100%; }
+
+.catalog-upload-success { color: var(--teal); }
