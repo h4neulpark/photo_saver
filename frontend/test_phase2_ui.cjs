@@ -199,7 +199,7 @@ test('11 Archive preview matches server paths, XMP, size, samples and in-place c
 test('12 Archive auto-connect checks all settings flags and only runs on route entry', async () => {
   const h = createHarness(); route(h, 'archive'); assert.equal(h.fetchCalls.filter(call => call.url.includes('/api/archive')).length, 0);
   h.setFetch(async url => response(url === '/api/settings' ? configured() : remote())); h.loadRoute(); await flushMicrotasks();
-  assert.deepEqual(plain(h.fetchCalls.slice(1).map(call => call.url)), ['/api/settings', '/api/archive?path=']); assert.ok(h.view.archive); assert.equal(h.view.archiveAutoConnecting, false);
+  assert.deepEqual(plain(h.fetchCalls.map(call => call.url)), ['/api/storage/status', '/api/state', '/api/settings', '/api/archive?path=']); assert.ok(h.view.archive); assert.equal(h.view.archiveAutoConnecting, false);
   for (const flag of Object.keys(configured()).filter(key => key !== 'keyCopied')) assert.equal(h.isStorageConfigured({ ...configured(), [flag]: false }), false);
   const missing = createHarness(); missing.setFetch(async () => response({ addressConfigured: true })); missing.win.location.hash = '#archive'; missing.loadRoute(); await flushMicrotasks();
   assert.equal(missing.fetchCalls.filter(call => call.url.startsWith('/api/archive')).length, 0); assert.match(missing.page.textContent, /스토리지 설정이 필요합니다/); assert.ok(missing.page.querySelector('[href="#settings"]')); assert.equal(missing.view.archiveError, '');

@@ -213,6 +213,7 @@ def archive_connection(expected=None):
         settings.fail(409, "전송 예약 후 SSH 설정이 변경되었습니다. 다시 업로드하세요.")
     address, account = config["address"], config["account"]
     known_hosts = settings.known_host_file(address)
+    stage = 'connecting'
     try:
         trusted = paramiko.HostKeys(str(known_hosts)).lookup(settings.host_alias(address))
         if not trusted:
@@ -225,6 +226,7 @@ def archive_connection(expected=None):
                 allow_agent=False, look_for_keys=False, timeout=5,
                 banner_timeout=5, auth_timeout=5, channel_timeout=5,
             )
+            stage = 'sftp'
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(10)
                 yield sftp, config
@@ -242,5 +244,9 @@ def archive_connection(expected=None):
         if error.errno == errno.ENOTDIR:
             settings.fail(400, "선택한 경로가 폴더가 아닙니다.")
         settings.fail(502, "아카이브에 연결할 수 없습니다. IP와 SSH 서비스 상태를 확인하세요.")
-    except (paramiko.SSHException, ValueError):
-        settings.fail(502, "SFTP로 파일 목록을 읽을 수 없습니다. 설정의 접속 테스트와 서버의 SFTP 지원을 확인하세요.")
+    except (paramiko.SSHException, paramiko.SFTPError, ValueError) as error:
+        # Keep the public archive response stable while preserving typed evidence
+        # for startup observation. Generic SSH errors include banner/transport loss.
+        failure = HTTPException(502, "SFTP로 파일 목록을 읽을 수 없습니다. 설정의 접속 테스트와 서버의 SFTP 지원을 확인하세요.")
+        failure.archive_failure = 'sftp' if stage == 'sftp' and isinstance(error, paramiko.SFTPError) else 'transport'
+        raise failure from error

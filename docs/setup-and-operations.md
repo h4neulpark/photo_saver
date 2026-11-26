@@ -1,5 +1,36 @@
 # 실행과 운영
 
+## OMV 원격 시작 선택 설정
+
+기존 Home Assistant 스크립트를 그대로 사용한다. 앱의 기본 HA 대상은 `script.wake_omv`와 `binary_sensor.omv_running`이다. HA 스크립트·자동화·플러그를 수정하거나 직접 WOL·종료를 추가하지 않는다. SSH 설정 전에도 선택 기능을 사용할 수 있고 HA 미설정은 일반 API health/아카이브 기능에 영향을 주지 않는다.
+
+사용자가 실제 `.env`에 아래 값을 직접 등록한다. 토큰은 상태 읽기와 기존 스크립트 실행 권한이 있는 long-lived access token이며 브라우저에 입력하지 않는다. 커넥터에서 자격 증명을 추출하지 않는다.
+
+```dotenv
+PHOTO_SAVER_HA_URL=https://home-assistant.example
+PHOTO_SAVER_HA_TOKEN=<사용자가 발급한 토큰>
+PHOTO_SAVER_HA_SCRIPT_ENTITY=script.wake_omv
+PHOTO_SAVER_HA_RUNNING_ENTITY=binary_sensor.omv_running
+PHOTO_SAVER_HA_STALE_SECONDS=0
+PHOTO_SAVER_WAKE_TIMEOUT_SECONDS=180
+```
+
+URL·토큰을 비워 두면 선택 기능만 비활성화된다. entity와 timeout의 빈 값은 기본값을 사용한다. timeout은 30–600초 정수이며 작업 접수부터 종료까지 고정된다. 기본 180초에는 큐 대기·조회·DNS·SSH·인증·폴더 읽기가 포함된다. HA URL은 `/api`를 제외한 절대 http/https URL이고 reverse proxy 경로 접두부를 허용한다. userinfo·query·fragment·제어문자·모호한 경로는 거부한다. HTTP는 신뢰하는 LAN에서 의도적으로 사용할 때만 선택하고 HTTPS는 시스템 CA와 호스트 이름을 검증한다. redirect와 환경 proxy 자동 사용은 차단한다.
+
+실행 중인 파일 작업이 없을 때 다음으로 API/worker를 재생성한다. `restart`만으로는 `.env` 변경이 반영되지 않는다. frontend는 기존 바인드 마운트라 별도 빌드하지 않는다.
+
+```sh
+docker compose config --quiet
+docker compose up -d --build api worker
+docker compose ps
+curl -fsS http://127.0.0.1:8888/api/health
+curl -fsS http://127.0.0.1:8888/api/storage/wake
+```
+
+설정 API에는 가용성·안전한 안내·timeout·불투명 targetRevision만 추가한다. URL/토큰/헤더/키 내용이나 환경 확장된 compose 설정을 로그·보고서에 출력하지 않는다. 진단은 `ha_not_configured`, `ha_config_invalid`, 작업 outcome과 세 가지 상태 사실을 사용한다. GET만으로 기동 테스트를 대신하지 않으며 실제 전원 테스트는 사용자가 OMV 켜기를 명시적으로 누르는 별도 단계다. 현재 자격 증명 없는 로컬 smoke와 모의 HA/SSH 테스트는 실제 기동 검증과 구분한다.
+
+동일 UUID의 중복 방지는 카탈로그 작업 행과 함께 보존된다. 백업 복원 시 활성 작업은 failed로 바뀌고 다시 실행되지 않는다. 초기화/과거 백업으로 UUID 행이 사라지면 그 이후까지 멱등성이 유지되지는 않는다. 브라우저는 알려진 초기화·복원 시 보류 UUID와 조회 표식을 지우며 자동으로 새 POST를 만들지 않는다. 설정 변경은 이전 작업 대기를 중지한다. 이미 네트워크에 나간 요청은 되돌릴 수 없다.
+
 ## Incoming 기기 업로드 운영
 
 API에 기존 Incoming 디렉터리를 /incoming-upload로 읽기·쓰기 바인드한다(create_host_path: false). /incoming-preview와 /managed-preview는 계속 읽기 전용이다. API 프로세스에는 Incoming 쓰기 권한과 파일 크기 +64MiB 이상의 여유 공간이 필요하다. 신규 의존성은 없다.
@@ -141,3 +172,10 @@ docker compose down
 `api`, `worker`는 `thumbnails:/thumbnails` 읽기·쓰기 볼륨을 공유하고 frontend는 같은 볼륨을 읽기 전용으로 서빙한다. API의 catalog/settings 및 incoming-preview/incoming-upload/managed-preview 마운트는 유지한다. `backend/Dockerfile`은 신규 `thumbnails.py`를 명시적으로 복사하므로 API와 worker 이미지를 함께 빌드한다.
 
 SQLite 백업에는 이미지 파일이 포함되지 않는다. 복원 후 설정 → 썸네일 캐시 → 현황 새로고침 → 누락 썸네일 일괄 생성을 실행한다. 로컬 원본 또는 활성 NAS 사본이 있어야 복구할 수 있다. 실패 상태 초기화는 캐시 이미지를 삭제하지 않으며 재시도 상태만 초기화한다. 미참조 썸네일 정리는 모든 레인의 작업이 끝난 뒤 실행하며 배타적 catalog 잠금 안에서 참조를 다시 확인한다. 원격 사본과 전송 이력이 참조하는 캐시는 보존한다.
+## OMV 읽기 전용 상태 모니터
+
+모니터는 HA 센서 GET과 저장된 IP의 비인증 SSH 배너를 병행한다. 원격 기동 스크립트·timeout 오류와 무관하게 센서 GET이 동작하며 HA 미설정이어도 SSH 도달성을 확인한다. 토큰 양 끝의 CRLF/공백은 제거하고 내부 제어 문자는 거부한다. 실제 `.env`의 값은 응답·로그로 공개하지 않는다.
+
+기본 신선도 정책 `PHOTO_SAVER_HA_STALE_SECONDS=0`은 장기 안정 상태를 허용한다. 명시적으로 90 등 양수를 주면 해당 초수 이후 보고 지연으로 표시한다. 음수/비정수는 0으로 처리한다. 보고 시각 파싱 실패와 30초 넘는 미래는 항상 진단한다. 상태별 조회 주기는 설정 변경 1초, 부팅 5초, 작동/응답 없음 15초, 오류/보고 지연 30초, 미설정 60초다. 숨긴 탭은 멈추고 10초 이상 숨겼거나 다음 조회 시각이 지났을 때 재개한다. 수동 확인은 5초 쿨다운을 따르며 자동 조회 중 클릭도 예약한다.
+
+Docker에서 `.local`은 mDNS로 해석되지 않을 수 있으므로 HA의 LAN IP를 권장한다. 호스트의 HA는 `host.docker.internal`을 사용할 수 있으며 api/worker 모두 host-gateway 매핑을 제공한다. 환경값 변경 후 `docker compose up -d --force-recreate api worker`로 컨테이너 환경을 다시 읽힌다. SSH 배너 예산은 2.5초, 인증된 기동 검증은 12초이며 HA 오류의 인증/DNS/TLS/시간 초과/리디렉션/5xx 원인을 별도로 안내한다.

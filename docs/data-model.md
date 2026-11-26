@@ -1,5 +1,13 @@
 # 데이터 모델
 
+## OMV 시작 작업 추가
+
+`storage-wake`는 기존 `jobs`의 `remote` 레인을 사용한다. 테이블이나 일반 대기열을 추가하지 않는다. 같은 UUID와 진행 중 동일 설정의 별칭은 하나의 작업 ID에 원자적으로 결합하고 다른 remote/exclusive 작업과 충돌한다. 로컬 scan은 병행 가능하다.
+
+버전 1 payload에는 `requests:[{id,targetRevision}]`(최대 128), `targetRevision`, `storageRevision`, `configRevision`, `archiveConfiguredAtAdmission`, `requestedAt`, `deadlineAt`, `timeoutSeconds`, `attempt:{state,count,intentAt,receiptAt}`를 저장한다. 토큰·계정 raw값·개인키는 저장하지 않는다. public targetRevision은 공용 대상·키/신뢰 증거와 불투명 archive revision/HA 대상 정체성을 결합하며 HA 토큰과 개인키 내용을 제외한다. storageRevision은 SSH 계정·키·신뢰의 비공개 aggregate이고 configRevision은 여기에 HA 설정/토큰을 결합한 비공개 aggregate다. 별도의 credential digest를 노출하지 않는다.
+
+원래 deadline과 정체성은 재시작 때 유지한다. count는 0/1이며 `not_started`에서 durable `intent`를 먼저 commit한 뒤만 단일 앱 전송을 시도한다. intent 복구는 unknown으로 바꾸고 관찰만 한다. accepted/unknown/rejected/observing_existing/not_needed 역시 새 요청으로 되돌리지 않는다. 손상된 ledger는 invalid_operation으로 실패한다. SQLite와 HA 간 exactly-once 전달을 보장하는 구조가 아니며 crash 창에서는 전송이 0회일 수 있다. 공개 결과는 [API 계약](api.md#omv-원격-시작)의 허용 필드만 사용하고 취소 flag를 최신 행에 병합한다. 복원은 기존 활성 작업 failed 규칙을 유지한다. 초기화·복원으로 이력 행이 사라진 이후에는 과거 UUID 보존을 보장하지 않는다.
+
 ## 저장 방식
 
 카탈로그 파일은 기본 `/data/catalog.sqlite3`이다. API와 워커가 같은 Docker `catalog` 볼륨을 사용한다. [catalog.py](../backend/catalog.py)의 `SCHEMA`와 `initialize()`가 실제 스키마의 기준이다.

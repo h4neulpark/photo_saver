@@ -1,5 +1,26 @@
 # 개발과 검증
 
+## OMV 시작 검증
+
+추가 모듈은 `storage_wake.py`, `storage_wake_io.py`이며 Dockerfile에 둘 다 명시적으로 복사한다. 운영 의존성 추가는 없다. 실제 HA services 호출이나 NAS 쓰기를 테스트에 사용하지 않는다. 네트워크 차단·운영 볼륨 없는 기존 테스트 이미지에서 temp SQLite/settings와 모의 HA/SSH를 사용한다.
+
+```sh
+docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev \
+  -v "$PWD/backend:/app:ro" -w /app photo-saver-backend-tests \
+  python -m unittest test_storage_wake test_concurrency test_jobs_api test_archive test_transfers test_remote_index test_reset -v
+node --check frontend/app.js
+node --check frontend/test_storage_wake.cjs
+node --test frontend/test_storage_wake.cjs frontend/test_job_concurrency.cjs frontend/test_phase2_ui.cjs frontend/test_phase1_ui.cjs
+node --test frontend/test_*.cjs
+docker compose config --quiet
+git diff --check
+docker compose build api worker
+```
+
+`test_storage_wake`는 실제 HTTP routes, 별도 연결의 동시 admission/별칭·terminal replay, 원래 기한·corrupt ledger·intent crash와 restart observation, 취소·설정 변경·잠금 중 shutdown, 실제 WorkerCoordinator의 local/remote 공존, watchdog 프로세스 종료·parent kill/reap, 토큰 비노출, HA REST body·redirect/TLS/큰 응답, SSH root/빈 목록·읽기 권한, 복원 후 실행 방지를 검사한다. UI 테스트는 두 버튼·정확한 취소 ID·비파일 상태, 안전한 UUID 생성·sessionStorage 실패·응답 유실 GET 복구, cold 완료·다른 원격 작업 이후 표시, busy browse/늦은 응답/설정 변경/재방문 갱신을 검사한다. 기존 protected 테스트를 약화하지 않는다.
+
+렌더는 모든 API를 intercept하는 안전한 fixture로 미설정/대기 중/SSH 설정 필요를 320·390·768·1280px에서 확인한다. 긴 한국어 상태, 키보드 초점, 중지 도달, 200% 텍스트도 확인한다. live HA URL/token이 없는 상태의 health/unavailable/GET smoke는 실제 전원 기동 검증과 별개다. 실제 기동 검증은 사용자가 자격 증명을 등록하고 명시적으로 버튼을 누른 뒤 HA의 단일 호출·서버 응답·인증된 SFTP 준비 또는 설정 필요를 확인하는 별도 수동 검사다. 전체 백엔드 suite 명령은 아래 기존 개발 절차를 따른다.
+
 ## Incoming 기기 업로드 검증
 
 [uploads.py](../backend/uploads.py), [test_uploads.py](../backend/test_uploads.py), [test_incoming_upload.cjs](../frontend/test_incoming_upload.cjs)가 청크 API와 브라우저 업로드를 구성한다. 운영 requirements.txt에는 패키지를 추가하지 않는다. FastAPI HTTP 테스트만 테스트 전용 이미지의 httpx 0.28.1을 사용한다.
@@ -183,3 +204,12 @@ Incoming 회귀 테스트는 실제 FastAPI HTTP 경로의 중복 정리 계획�
 `backend/thumbnails.py`의 신규 회귀는 `backend/test_thumbnails.py`에서 실제 임시 SQLite·이미지·로컬 SFTP 대역으로 검증한다. 디스크 우선 상태, 로컬 우선·원격 사진·SSH 영상·SFTP 폴백, 150 MiB 제한, 경로 이스케이프와 심볼릭 링크 차단, 취소·재실행, 캐시 정리와 구버전 백업 호환을 포함한다. `frontend/test_catalog_thumbnails.cjs`는 상태 슬롯, 표/카드 및 상세, 캐시 미리보기와 열린 모달 교체, 일괄 계획 재조회, 설정 관리를 검증한다. 기존 기록 read-only authorizer와 3컬럼·CSS 특이성 테스트는 유지한다.
 
 실행은 위의 테스트 전용 이미지(`httpx` 포함)와 `-v "$PWD/backend:/app:ro"`를 사용한다. 운영 Dockerfile에는 테스트 파일이 포함되지 않으므로 마운트 없이 unittest를 실행하면 전수 검증이 아니다. Compose 빌드는 `docker compose build api worker`, 전체 UI 검증은 `node --test frontend/test_*.cjs`로 실행한다. 실제 NAS ffmpeg 설치·권한, OMV 네트워크와 브라우저 영상 코덱은 별도 운영 환경에서 확인한다.
+## OMV 상태 모니터 검증
+
+백엔드 `test_storage_status`는 증거 시각·캐시·구성 세대·async single-flight 및 health 응답성, helper 제한과 비밀 비노출을 검증한다. 기존 `test_storage_wake`의 정확한 legacy GET projection과 기동 복구·중지 계약도 유지한다. 테스트는 `photo-saver-backend-tests` 이미지에 backend를 `/app:ro`로 바인드하고 `--network none --read-only --tmpfs /tmp:rw,nosuid,nodev`로 실행한다. 운영 데이터 볼륨을 연결하지 않는다.
+
+2계층 회귀는 장기 안정 상태(300초/3600초/24시간), 옵트인 신선도, HA/SSH 조합, booting/ha_lagging, 배너 비인증 확인과 3xx/5xx/DNS/timeout 분류를 검증한다. 상태 서비스는 주소 파일만 직접 읽고 DB/settings_lock에는 접근하지 않는다. 기동 회귀는 CRLF 토큰, 잠금 파일 부재, 잠금 밖 SSH I/O, 12초 예산, 30초 waiting_mount 회복/종료, ever_ha_on 래치와 상세 오류 보존을 포함한다. PHOTO_SAVER_HA_STALE_SECONDS 기본 0을 바꾸는 테스트는 환경을 명시한다.
+
+프런트엔드는 `node --test frontend/test_storage_status.cjs frontend/test_storage_wake.cjs`와 전체 `node --test frontend/test_*.cjs`로 독립 초기 조회, 공유 스케줄러, 만료/숨김/복귀/늦은 응답, 상세/포커스 보존, 정확한 중지 ID와 변경 요청 없음을 확인한다. 브라우저 검증은 탐색 전에 모든 `/api/**`를 가로채고 320/390/768/1280 및 실제 computed font-size 200%에서 확인한다.
+
+통합 상태 모델의 active wake → 연결됨 → 모니터 우선순위, null 신선도, 알 수 없는 안전한 reasonCode, 1/5/15/30/60초 폴링, 짧은 focus 전환 억제, 수동 갱신 예약과 wake 종료 재조회를 검증한다. 650ms 작업 폴링에서는 아카이브 트리·선택·스크롤·설정 입력을 유지하고 상태 슬롯만 패치한다. 설정 로드 직후 기동 버튼을 활성화하되 초기 GET 순서는 status → state → settings → archive 계약을 유지한다. phase2/phase3 보호 테스트는 수정하지 않는다. app.js/styles.css 수정 후 SHA-256 앞 12자리를 index.html의 v 쿼리에 반영하고 `docker compose config --quiet`, `git diff --check`, `docker compose build api worker`를 실행한다. Docker .local 이름 해석은 운영 문서의 LAN IP 안내를 따른다.

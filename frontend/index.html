@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#151e2d">
   <title>Photo Saver</title>
   <!-- Refresh these SHA-256 prefixes whenever the corresponding asset changes. -->
-  <link rel="stylesheet" href="./styles.css?v=5ae805420f80">
-  <script src="./app.js?v=741f17b51839" defer></script>
+  <link rel="stylesheet" href="./styles.css?v=750c5c19bc0d">
+  <script src="./app.js?v=50faf750c6ca" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -16,12 +16,13 @@
       <span>Photo Saver</span>
     </a>
     <nav id="navigation" aria-label="주 메뉴"></nav>
-    <div class="sidebar-footer"><span class="demo-dot"></span> 로컬 라이브러리</div>
+    <div class="sidebar-footer"><span class="local-library"><span class="demo-dot"></span> 로컬 라이브러리</span><button id="storage-summary" class="storage-summary" type="button"><span data-storage-label>확인 중…</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></div>
   </aside>
   <div class="workspace">
     <div id="page" class="page"></div>
   </div>
   <div id="notice" class="notice" role="status"></div>
+  <div id="storage-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <dialog id="media-preview" class="media-preview" aria-labelledby="media-preview-title"></dialog>
   <dialog id="dialog"></dialog>
 </body>

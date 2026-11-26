@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import threading
+from storage_wake import run_storage_wake
 import time
 from collections import defaultdict
 from functools import partial
@@ -720,7 +721,9 @@ def finish(db, job_id, result, status="done"):
 class WorkerCoordinator:
     def __init__(self, incoming=None, managed=None, *, handlers=None, poll_interval=0.4):
         self.incoming, self.managed = incoming, managed
+        self.stop_event = threading.Event()
         self.handlers = handlers if handlers is not None else {
+            "storage-wake": partial(run_storage_wake, stop_event=self.stop_event),
             "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
             "duplicate-cleanup": partial(cleanup_duplicates, refresh_group=refresh_deleted_group),
             "xmp-link": link_xmp_selection, "upload": upload_selection,
@@ -732,7 +735,6 @@ class WorkerCoordinator:
         self.poll_interval = poll_interval
         self.running = {}
         self.wake_event = threading.Event()
-        self.stop_event = threading.Event()
 
     def recover_stale_jobs(self):
         with database(write=True) as db:

@@ -1,5 +1,13 @@
 # 시스템 구조
 
+## 선택적 OMV 시작 경로
+
+`storage_wake.py`가 설정 snapshot/불투명 revision, SQLite admission·UUID 별칭·취소, 단일 시도 ledger와 워커 상태 기계를 담당한다. API는 설정 공유 잠금을 해제한 뒤 DB admission을 수행하고 네트워크를 호출하지 않는다. worker는 기존 remote 슬롯에서만 실행하며 기존 local 슬롯과 병행한다. 모든 설정/DB/catalog 잠금 획득은 비차단 재시도와 짧은 control tick으로 제한한다. 설정·취소·shutdown·원래 deadline을 반복 확인하고 네트워크 중 DB 트랜잭션을 유지하지 않는다.
+
+각 HA GET/POST와 SSH probe는 `storage_wake_io.py`의 일회성 subprocess다. argv는 Python·모듈 경로뿐이고 비밀은 서버 메모리의 stdin pipe로만 전달한다. HA 환경변수를 child 환경에서 제거하고 stderr를 버린다. stdout은 작은 typed JSON만 사용한다. parent는 최대 250ms communicate 구간 사이에 control을 확인하고 종료 시 kill/reap한다. child도 원래 요청 slice의 독립 watchdog을 사용하며 I/O마다 최대 5초 또는 남은 전체 예산으로 제한한다. DNS·SSH banner/auth/SFTP/root 작업의 합산 지연도 subprocess 종료로 제한한다. SSH child는 read-only settings SH를 유지하고 기존 archive_connection의 신뢰·인증 정책을 재사용한다.
+
+intent-before-effect를 DB에 저장하고 재시작은 원래 deadline으로 관찰만 재개한다. graceful stop은 현재 I/O를 회수하고 ledger를 종료 처리하지 않아 다음 worker가 재개할 수 있다. 사용자 취소는 별개이며 child 종료 전 running 레인을 해제하지 않는다. 설정 revision이 바뀌면 이전 대상 대기를 중지하고 새 대상에 요청을 옮기지 않는다. 마지막 확인 이후 이미 시작한 네트워크 요청은 소급 취소할 수 없으며 exactly-once 전달을 주장하지 않는다. 프런트엔드는 GET 상태 복구와 기존 연결 generation guard를 사용하고 render 자체에서 wake/refresh 요청을 시작하지 않는다.
+
 ## 기기 업로드 경로
 
 API는 Incoming을 /incoming-upload에 별도 읽기·쓰기로 마운트한다. 기존 /incoming-preview와 /managed-preview의 읽기 전용 권한은 유지한다. [uploads.py](../backend/uploads.py)는 검증·스트리밍 청크·세션 잠금·원자적 게시·유휴 정리를 담당하고 [media.py](../backend/media.py)의 rename_noreplace를 공유한다. 새 패키지나 DB 테이블은 없다.

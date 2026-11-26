@@ -7,6 +7,8 @@ import sqlite3
 import unicodedata
 import uploads
 import thumbnails
+import storage_wake
+import storage_status
 from contextlib import ExitStack, asynccontextmanager
 from datetime import date, datetime, timezone
 from io import BytesIO
@@ -37,6 +39,10 @@ from devices import router as devices_router, device_names, effective_device, de
 @asynccontextmanager
 async def lifespan(_app):
     ZoneInfo(DEFAULT_ZONE)
+    for directory, name in ((storage_wake.catalog.DATA, 'catalog.lock'),
+                            (storage_wake.settings.SETTINGS_DIR, 'settings.lock')):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / name).touch(exist_ok=True)
     initialize()
     storage_id = ensure_storage_id()
     with database(write=True) as db:
@@ -54,6 +60,27 @@ app.include_router(archive_router)
 app.include_router(records_router)
 app.include_router(devices_router)
 app.include_router(uploads.router)
+
+
+@app.get('/api/storage/status')
+async def get_storage_status(refresh: bool = False):
+    return JSONResponse(await storage_status.service.get(refresh), headers=NO_STORE)
+
+
+@app.post('/api/storage/wake', status_code=202)
+def start_storage_wake(request: storage_wake.WakeRequest):
+    return JSONResponse(storage_wake.admit(request), status_code=202, headers=NO_STORE)
+
+
+@app.get('/api/storage/wake')
+def get_storage_wake(request_id: storage_wake.UUID | None = None):
+    with database() as db:
+        return JSONResponse({'job': view_job(storage_wake.latest(db, request_id))}, headers=NO_STORE)
+
+
+@app.post('/api/storage/wake/{job_id}/cancel')
+def cancel_storage_wake(job_id: int):
+    return JSONResponse({'job': view_job(storage_wake.cancel(job_id))}, headers=NO_STORE)
 
 
 @app.exception_handler(RemoteDuplicateError)
@@ -431,7 +458,7 @@ def job_history(
     before_id: int | None = Query(default=None, ge=1),
     lane: Literal["all", "local", "remote", "exclusive"] = "all",
     status: Literal["all", "active", "attention", "done", "failed", "cancelled"] = "all",
-    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote"] = "all",
+    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote", "storage-wake"] = "all",
 ):
     clauses, params = [], []
     if before_id is not None:
@@ -776,6 +803,7 @@ def state():
             "timezone": DEFAULT_ZONE,
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
             "latestIncomingResult": view_job(latest_incoming_result),
+            "latestStorageWake": view_job(storage_wake.latest(db)),
             "job": view_job(compat_job),
             "jobs": {lane: view_job(row) for lane, row in jobs.items()},
             "activeJobs": {lane: view_job(row) for lane, row in active.items()},

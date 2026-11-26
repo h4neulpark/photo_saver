@@ -1,5 +1,7 @@
 # Photo Saver 초기 설계
 
+선택 기능 **OMV 켜기**는 Home Assistant의 기존 `script.wake_omv`를 사용합니다. 아카이브·스토리지 설정에서 명시적으로 실행하며 파일 업로드는 별도입니다. [원격 시작 설정과 운영](docs/setup-and-operations.md#omv-원격-시작-선택-설정)을 참고하세요.
+
 > 현재까지 구현된 기능과 사용·운영·개발 방법은 **[구현 문서 목록](docs/README.md)**에서 확인할 수 있다. 아래 본문은 초기 설계와 후속 계획을 포함하며, 실제 구현과의 차이는 해당 문서에 정리했다.
 
 Photo Saver는 Apple Silicon Mac에서 촬영 영상을 수집하고, 사용자가 이벤트와 촬영 장비별로 배치한 원본을 OpenMediaVault(OMV)에 보관하는 개인용 웹 앱이다. Mac의 `incoming`에 모은 영상은 로컬 중복 검사 결과를 사용자가 확인한 뒤, 이동을 지시한 신규 파일만 `managed`로 옮긴다. OMV 전원이 꺼져 있어도 Mac에서 파일 분석, 분류, 전송 예약을 할 수 있다. 원본의 SHA-256과 OMV에 있는 사본의 검증 이력을 SQLite에 남긴다.

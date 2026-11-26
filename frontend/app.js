@@ -86,7 +86,7 @@ function savedEventView() {
   }
 }
 
-const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
+const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, latestStorageWake: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
   catalogView: savedPreference('photo-saver-catalog-view', 'table') === 'cards' ? 'cards' : 'table', thumbnailGeneratingShas: new Set(),
   thumbnailStats: null, thumbnailStatsError: '', thumbnailOpBusy: false,
@@ -102,6 +102,7 @@ const view = {
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
   catalogOpBusy: false, sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '', archiveAutoAttempted: false, archiveAutoConnecting: false,
+  wakeStarting: false, wakePending: loadWakePending(), wakeUncertain: false, wakeError: '', wakeLookupBusy: false,
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
   catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
   catalogRemoteFolder: '', catalogRemoteExpanded: new Set(),
@@ -116,6 +117,9 @@ let catalogSearchTimer;
 let catalogComposing = false;
 let devicesRequest = 0;
 let archiveConnectionVersion = 0;
+let wakeRefreshPending = null;
+let wakeRefreshChecking = false;
+const wakeRefreshDone = new Set();
 let previewMediaGeneration = 0;
 let pendingPreviewFocus = null;
 
@@ -225,7 +229,7 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-const jobLanes = { "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const jobLanes = { "storage-wake": "remote", "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
 const MAX_DISMISSED_RESULTS = 100;
@@ -351,17 +355,18 @@ function activeJobsBar() {
 function laneJobsBar() {
   if (!anyJobActive()) return '';
   const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
-  const kinds = { "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
   return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
     const job = activeLaneJob(lane);
     if (!job) return '';
     const result = job.result || {};
-    const cancel = job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
-    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
+    const cancel = job.kind === 'storage-wake' ? 'cancel-storage-wake' : job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
+    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
   }).join('')}</div>`;
 }
 
 function jobMessage(job) {
+  if (job.kind === 'storage-wake') return job.result?.message || job.result?.phase || 'OMV 시작 확인 중';
   if (job.status === 'cancelled') return job.result.error || '작업을 중지했습니다.';
   if (job.status === 'failed') return job.result.error;
   if (job.kind.startsWith("thumbnails-")) return thumbnailJobMessage(job.result);
@@ -383,6 +388,10 @@ async function syncState() {
     const snapshot = await api('state');
     if (request !== stateRequest) return;
     Object.assign(state, snapshot, normalizeJobs(snapshot));
+    if (Object.values(previousJobs).some(job => job?.kind === 'storage-wake' && isJobActive(job) &&
+        !isJobActive(storageWakeJob()))) requestStorageStatus(true, { force: true });
+    await reconcileWakeRequest();
+    await reconcileWakeArchive();
     view.loadError = '';
     const messages = [];
     let completed = false;
@@ -416,7 +425,7 @@ async function syncState() {
   } finally {
     if (request === stateRequest) {
       view.connecting = false;
-      if (anyJobActive() || view.loadError) refreshTimer = window.setTimeout(async () => {
+      if (anyJobActive() || view.loadError || view.wakePending) refreshTimer = window.setTimeout(async () => {
         await syncState();
         render();
       }, view.loadError ? 2500 : 650);
@@ -1597,13 +1606,13 @@ function archivePage() {
         }).join('')}</ul>` : emptyState('folder', '표시할 파일이 없습니다.', '이벤트 분류에서 분류를 확정하세요.')}
       </section>
       <section class="surface browser archive-destination" aria-labelledby="destination-title" ${view.archive && !view.archiveBusy && !busy ? `data-archive-drop="${escapeHtml(view.archivePath)}"` : ''}>
-        <div class="surface-head archive-heading"><div><h2 id="destination-title">${icon('disk')} 원격 아카이브 (NAS)</h2><p class="small muted">${view.archive ? '대상 폴더로 이동한 뒤 보낼 항목의 업로드를 누르거나 여기로 드래그하세요' : 'NAS 원격 폴더 연결'}</p></div>
-          <div class="archive-actions">
-            ${view.archive ? button('open-remote-index', '원격 인덱싱', { glyph: 'search', disabled: busy || view.archiveBusy }) : ''}
-            ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
-              { glyph: 'refresh', primary: !view.archive, disabled: view.archiveBusy })}
-          </div></div>
-        ${archiveDestination()}
+        <div class="surface-head archive-heading"><div class="storage-identity"><h2 id="destination-title">${icon('disk')} 원격 아카이브 (NAS)</h2><button type="button" class="storage-disclosure" data-action="storage-disclosure" aria-expanded="${storageMonitor.open}" aria-controls="archive-storage-detail"><span data-storage-label></span>${icon('right')}</button></div></div>
+          <div class="archive-actions archive-toolbar">
+            ${archiveStorageActions()}
+          </div>
+        <div id="archive-wake-banner">${storageWakeActivity()}</div>
+        <div id="archive-storage-detail" class="storage-detail" ${storageMonitor.open ? '' : 'hidden'}><div class="storage-detail-head"><strong>OMV 연결 진단</strong><div>${button('refresh-storage-status', '상태 확인')} <a class="button" href="#settings">설정 열기</a></div></div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus()}</div></div>
+        <div id="archive-destination-content">${archiveDestination()}</div>
       </section>
     </div><section id="archive-preview-slot" class="surface archive-preview" aria-label="NAS 최종 경로 미리보기"></section>`;
 }
@@ -1626,6 +1635,8 @@ function archiveDestination() {
             `<span class="tree-file">${icon('file')}${escapeHtml(entry.name)}</span><span class="meta numbers">${entry.kind === 'link' ? '심볼릭 링크' : sizeLabel(entry.size === null ? null : entry.size / 1_000_000)}</span>${entry.kind === 'file' ? `<a class="button icon" href="/api/archive/download?path=${encodeURIComponent(entryPath)}" target="_blank" rel="noopener" aria-label="${escapeHtml(entry.name)} 다운로드" title="다운로드">${icon('download')}</a>` : ''}`}
         </li>`;
         }).join('')}</ul>` : emptyState('folder', '빈 폴더입니다.')) :
+        storageCurrent().status === 'no_response' && view.settings?.storageWake?.available ?
+        emptyState('disk', 'OMV가 꺼져 있거나 응답하지 않습니다.', '위의 OMV 켜기로 서버를 시작하세요. 연결을 확인한 뒤 파일을 전송할 수 있습니다.') :
         emptyState('disk', view.archiveError ? '파일 목록을 불러오지 못했습니다.' : view.settings && !isStorageConfigured(view.settings) ? '스토리지 설정이 필요합니다.' : '원격 아카이브에 연결하세요.',
           view.archiveError ? '다시 연결하거나 설정에서 SSH 연결 정보를 확인하세요.' : view.settings && !isStorageConfigured(view.settings) ? '<a class="button" href="#settings">설정에서 스토리지 연결하기</a>' : '설정에 저장된 SSH 연결 정보와 저장 절대경로를 사용합니다.')}
     </div>`;
@@ -1786,12 +1797,17 @@ async function browseArchive(path = view.archivePath) {
     if (version !== archiveConnectionVersion) return;
     view.archive = archive;
     view.archivePath = view.archive.path;
+    patchStorageStatus();
   } catch (error) {
     if (version !== archiveConnectionVersion) return;
     view.archive = null;
     view.archiveError = error.message;
+    patchStorageStatus();
+    if (storageNow() - storageMonitor.completed >= 5000) requestStorageStatus();
   } finally {
     if (version === archiveConnectionVersion) view.archiveBusy = false;
+    patchStorageStatus();
+    await flushWakeArchiveRefresh();
   }
 }
 
@@ -1799,8 +1815,404 @@ function isStorageConfigured(settings) {
   return Boolean(settings?.addressConfigured && settings?.storageRootConfigured && settings?.accountConfigured && settings?.keyGenerated && settings?.hostKeyTrusted);
 }
 
+function loadWakePending() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem('photo-saver-wake-v1'));
+    return value && /^[0-9a-f-]{36}$/i.test(value.requestId) && /^[0-9a-f]{64}$/.test(value.targetRevision) ? value : null;
+  } catch { return null; }
+}
+function saveWakePending(value) {
+  view.wakePending = value;
+  try {
+    if (value) sessionStorage.setItem('photo-saver-wake-v1', JSON.stringify(value));
+    else sessionStorage.removeItem('photo-saver-wake-v1');
+  } catch { /* Keep the in-memory request when storage is disabled. */ }
+}
+function wakeRequestId() {
+  const crypto = globalThis.crypto;
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  if (!crypto?.getRandomValues) throw new Error('이 브라우저에서는 안전한 요청 ID를 만들 수 없습니다. 최신 브라우저를 사용하세요.');
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+  const hex = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+function storageWakeJob() {
+  const active = activeLaneJob('remote');
+  return active?.kind === 'storage-wake' ? active : state.latestStorageWake;
+}
+function storageWakeButton() {
+  const job = storageWakeJob();
+  if (isJobActive(job)) return button('cancel-storage-wake', job.result?.cancelRequested ? '중지 중…' : '대기 중지',
+    { disabled: job.result?.cancelRequested, extra: `data-value="${job.id}"` });
+  return button('start-storage-wake', view.wakeStarting ? '요청 중…' : view.wakePending ? '같은 요청 다시 확인' : 'OMV 켜기',
+    { primary: storageCurrent().status === 'no_response', disabled: view.wakeStarting || remoteBusy() || !view.settings?.storageWake?.available });
+}
+function archiveStorageActions() {
+  return `${isJobActive(storageWakeJob()) ? '' : storageWakeButton()}
+    ${view.archive ? button('open-remote-index', '원격 인덱싱', { glyph: 'search', disabled: remoteBusy() || view.archiveBusy }) : ''}
+    ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
+      { glyph: 'refresh', primary: !view.archive && storageCurrent().status !== 'no_response', disabled: view.archiveBusy })}`;
+}
+function wakeFacts(job) {
+  const r = job?.result || {};
+  const attempt = { not_started: '보내지 않음', not_needed: '응답 확인으로 생략', observing_existing: '기존 스크립트 실행 관찰 중',
+    intent: '처리 여부 확인 중', accepted: 'HA 요청 수신 확인', rejected: 'HA 요청 거부', unknown: '처리 여부 알 수 없음' };
+  const server = { unknown: '현재 응답 미확인', ha_reported_on: 'HA에서 응답 보고', ssh_responding: 'SSH 서버 응답', archive_ready: '아카이브 접근 확인' };
+  const archive = { settings_required: 'SSH 설정 필요', checking: '접근 확인 중', ready: '인증 및 폴더 읽기 확인', unreachable: '접근 미확인',
+    auth_failed: 'SSH 인증 실패 · 계정과 공개키 확인', host_key_error: '호스트 키 확인 필요 · 설정에서 접속 테스트',
+    path_missing: '저장 폴더 없음 · 경로 확인', permission_denied: '폴더 읽기 권한 필요', not_directory: '저장 경로가 폴더가 아님', sftp_error: 'SFTP 지원 확인 필요' };
+  return `<dl class="wake-facts"><div><dt>켜기 요청</dt><dd>${escapeHtml(attempt[r.attemptState] || '미확인')}</dd></div><div><dt>서버 응답</dt><dd>${escapeHtml(server[r.serverState] || '미확인')}${r.haStateStale && r.haState === 'on' ? ' · HA 보고 갱신 대기' : ''}</dd></div><div><dt>아카이브 접근</dt><dd>${escapeHtml(archive[r.archiveState] || '미확인')}</dd></div></dl>`;
+}
+function wakeElapsed(job) {
+  const r = job.result || {};
+  const elapsed = Math.max(0, Math.min(r.timeoutSeconds || 180, Math.floor((Date.now() - Date.parse(r.requestedAt || job.createdAt)) / 1000) || 0));
+  return `경과 ${elapsed}초 · 최대 ${r.timeoutSeconds || 180}초`;
+}
+const storageMonitor = { snapshot: { status: 'loading' }, promise: null, sequence: 0,
+  timer: null, expiry: Infinity, nextPoll: 0, cooldown: 0, completed: -Infinity, open: false, announced: '',
+  pendingManualRefresh: false, pendingForce: false, refreshing: false, hiddenAt: null };
+const storageNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+const storageReasons = {
+  sensor_unknown: 'HA가 센서 상태를 확인하지 못했습니다.', sensor_unavailable: 'HA가 센서 상태를 확인하지 못했습니다.',
+  sensor_missing: 'HA에서 OMV 상태 센서를 찾을 수 없습니다.', ha_auth_error: 'Home Assistant 인증 설정을 확인하세요.',
+  ha_tls_error: 'Home Assistant 보안 연결을 확인할 수 없습니다.', ha_unreachable: 'Home Assistant에 연결할 수 없습니다. 잠시 후 다시 확인하세요.',
+  ha_response_invalid: 'Home Assistant 상태 응답을 확인할 수 없습니다.', report_stale: 'HA 보고가 설정된 유효 시간을 넘었습니다.',
+  ha_dns_error: 'HA 주소를 찾을 수 없습니다. Docker에서는 .local 대신 LAN IP를 사용하세요.',
+  ha_timeout: 'HA 응답 시간이 초과되었습니다. 네트워크를 확인하세요.',
+  ha_redirect_blocked: 'HA의 최종 주소를 .env에 설정하세요.', ha_http_5xx: 'HA 서버 오류입니다. 잠시 후 다시 확인하세요.',
+  ha_lagging: 'SSH 서버가 응답합니다. HA 센서 갱신을 기다리는 중입니다.', ssh_unreachable: 'HA는 작동 중으로 보고했으며 SSH 응답을 기다리고 있습니다.',
+  report_time_invalid: 'HA 보고 시각을 확인할 수 없습니다.', report_time_future: 'HA 보고 시각과 앱 시각이 맞지 않습니다.',
+  ha_not_configured: '설정에서 HA 연결 구성을 확인하세요.', ha_config_invalid: 'Home Assistant 상태 조회 설정을 확인하세요.',
+  config_changed: '설정이 변경되어 다시 확인합니다.', status_busy: '상태를 확인 중입니다. 잠시 후 다시 확인하세요.',
+  api_unreachable: '앱에 연결할 수 없습니다. 다시 확인하세요.' };
+function storageCurrent() {
+  const value = storageMonitor.snapshot;
+  return ['running', 'no_response'].includes(value.status) && storageNow() >= storageMonitor.expiry
+    ? { ...value, status: 'stale', reasonCode: 'report_stale', freshForSeconds: 0 } : value;
+}
+function storageLabel(value = storageCurrent()) {
+  return ({ loading: '확인 중…', booting: '부팅 중 · SSH 대기', running: value.ssh?.status === 'reachable' ? '작동 중 · 연결 가능' : '작동 중', no_response: '꺼짐 · 응답 없음',
+    unknown: '상태 확인 불가', stale: '보고 지연', unconfigured: 'HA 미설정' })[value.status];
+}
+function deriveStorageViewModel() {
+  const snapshot = storageCurrent(), job = storageWakeJob();
+  if (isJobActive(job)) return { tone: 'waking', label: job.result?.phaseCode === 'waiting_mount' ? '마운트 대기 중' :
+    job.result?.phaseCode === 'checking_archive' && job.result?.serverState && job.result.serverState !== 'unknown' ? '아카이브 확인 중' : '켜는 중' };
+  if (view.archive !== null) return { tone: 'connected', label: '연결됨' };
+  return { tone: ({ booting: 'waking', running: 'running', no_response: 'offline', stale: 'warn', unknown: 'error', unconfigured: 'muted', loading: 'muted' })[snapshot.status] || 'muted',
+    label: storageLabel(snapshot) };
+}
+function storageTime(value) {
+  return value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR') : '확인되지 않음';
+}
+function wakeStep(r) {
+  if (r.archiveState === 'ready' || r.phaseCode === 'waiting_mount' || r.serverState && r.serverState !== 'unknown') return 2;
+  if (r.phaseCode === 'requesting' && r.attemptState === 'intent') return 0;
+  return r.attemptCount || ['accepted', 'unknown', 'observing_existing', 'not_needed'].includes(r.attemptState) ? 1 : 0;
+}
+function storageWakeActivity() {
+  const job = storageWakeJob();
+  const active = isJobActive(job), r = job?.result || {};
+  if (!active && !view.wakeError && !view.wakePending && (!job || !jobHasAttention(job))) return '';
+  const step = wakeStep(r);
+  return `<section class="wake-stepper" aria-label="OMV 기동 진행"><ol>${['켜기 요청', '서버 기동', '아카이브 연결'].map((label, index) => `<li${active && step === index ? ' aria-current="step"' : ''} class="${index < step || r.archiveState === 'ready' ? 'complete' : ''}"><span>${index + 1}</span>${label}</li>`).join('')}</ol>
+    ${job ? `<div class="wake-stepper-foot"><div><strong data-wake-phase>${escapeHtml(active ? r.phase || '서버 응답 대기 중' : jobMessage(job))}</strong><p class="small muted" data-wake-elapsed>${active ? wakeElapsed(job) : escapeHtml(catalogTime(job.createdAt))}</p></div>${active ? storageWakeButton() : ''}</div>` : ''}
+    ${view.wakePending && (!job || view.wakeUncertain) ? '<p class="small muted">요청 결과 확인 중 · 자동 재전송 없음</p>' : ''}
+    ${view.wakeError ? `<p class="form-error" role="alert">${escapeHtml(view.wakeError)}</p>` : ''}</section>`;
+}
+function patchWakeActivity() {
+  const node = page.querySelector('#archive-wake-banner');
+  if (!node) return;
+  const job = storageWakeJob(), active = isJobActive(job), r = job?.result || {};
+  const identity = JSON.stringify([job?.id, active, r.outcome, view.wakeError, !!view.wakePending, view.wakeUncertain]);
+  if (node.dataset.wakeIdentity !== identity) {
+    setSlotHtml(node, storageWakeActivity());
+    node.dataset.wakeIdentity = identity;
+    return;
+  }
+  if (!active) return;
+  const phase = node.querySelector('[data-wake-phase]'), elapsed = node.querySelector('[data-wake-elapsed]');
+  if (phase) phase.textContent = r.phase || '서버 응답 대기 중';
+  if (elapsed) elapsed.textContent = wakeElapsed(job);
+  const step = wakeStep(r);
+  node.querySelectorAll('li').forEach((item, index) => {
+    setClass(item, 'complete', index < step);
+    if (index === step) item.setAttribute('aria-current', 'step'); else item.removeAttribute('aria-current');
+  });
+  const stop = node.querySelector('[data-action="cancel-storage-wake"]');
+  if (stop) { stop.disabled = !!r.cancelRequested; stop.textContent = r.cancelRequested ? '중지 중…' : '대기 중지'; }
+}
+function patchStorageStatus() {
+  const value = storageCurrent();
+  const model = deriveStorageViewModel(), label = model.label;
+  document.querySelectorAll('[data-storage-label]').forEach(node => {
+    const global = node.closest?.('#storage-summary');
+    node.textContent = global ? `OMV · ${label}` : label;
+    node.dataset.tone = model.tone;
+  });
+  const trigger = page.querySelector('[data-action="storage-disclosure"]');
+  trigger?.setAttribute('aria-expanded', String(storageMonitor.open));
+  const detail = page.querySelector('#archive-storage-detail');
+  if (detail) detail.hidden = !storageMonitor.open;
+  const summary = document.querySelector?.('#storage-summary');
+  summary?.setAttribute('aria-label', `OMV 상태: ${label}. 자세히 보기`);
+  patchWakeActivity();
+  setSlotHtml(page.querySelector('.archive-actions'), archiveStorageActions());
+  if (view.archive === null) setSlotHtml(page.querySelector('#archive-destination-content'), archiveDestination());
+  setSlotHtml(page.querySelector('[data-storage-history]'), storageWakeStatus(view.page === 'settings'));
+  setSlotHtml(page.querySelector('[data-storage-settings-actions]'), isJobActive(storageWakeJob()) ? '' : storageWakeButton());
+  document.querySelectorAll('[data-action="refresh-storage-status"]').forEach(node => {
+    node.disabled = !!storageMonitor.promise || storageNow() < storageMonitor.cooldown;
+    node.textContent = storageMonitor.promise ? '조회 중…' : '상태 확인';
+  });
+  const history = value.lastKnown && !['running', 'no_response'].includes(value.status)
+    ? `<p class="small muted">마지막 확인: ${escapeHtml(storageTime(value.lastKnown.reportedAt))} ${value.lastKnown.rawState === 'on' ? '작동 중' : '응답 없음'} · 현재 상태 미확인</p>` : '';
+  document.querySelectorAll('[data-storage-diagnostics]').forEach(node => {
+    const ha = value.ha, ssh = value.ssh;
+    const html = `<div class="storage-diagnostic-grid"><section class="storage-diagnostic"><h3>전원·호스트 <span class="small muted">(Home Assistant)</span></h3><p>${escapeHtml(({on:'작동 보고',off:'응답 없음 보고',stale:'보고 지연',error:'조회 오류',unknown:'상태 미확인',unconfigured:'미설정'})[ha?.status] || storageLabel(value))}</p><dl class="storage-times"><div><dt>최근 조회</dt><dd>${escapeHtml(storageTime(value.fetchedAt))}${value.cached ? ' · 캐시' : ''}</dd></div><div><dt>HA 보고</dt><dd>${escapeHtml(storageTime(value.reportedAt))}</dd></div><div><dt>상태 변경</dt><dd>${escapeHtml(storageTime(value.changedAt))}</dd></div></dl><p class="small muted">${escapeHtml(storageReasons[ha?.reasonCode || value.reasonCode] || (value.reasonCode ? '상태 진단을 확인하세요. 잠시 후 다시 조회할 수 있습니다.' : 'HA 센서의 응답입니다.'))}</p>${history}</section>
+      <section class="storage-diagnostic"><h3>아카이브 서버 <span class="small muted">(SSH / SFTP)</span></h3><p>${view.archive ? '인증 및 폴더 읽기 확인' : view.archiveBusy ? '아카이브 확인 중' : ssh?.status === 'reachable' ? `SSH 응답 확인${Number.isFinite(ssh.latencyMs) ? ` · ${ssh.latencyMs}ms` : ''}` : ssh?.configured ? 'SSH 응답 없음' : 'SSH 주소 미설정'}</p><p class="small muted">${escapeHtml(view.archiveError || '상태 조회는 인증 없이 SSH 배너만 확인합니다. 아카이브 연결에서 인증과 폴더 접근을 확인합니다.')}</p></section></div>`;
+    if (node.innerHTML !== html) node.innerHTML = html;
+  });
+  const key = `${model.tone}:${label}:${value.reasonCode || ''}`;
+  if (!document.hidden && key !== storageMonitor.announced) {
+    const live = document.querySelector?.('#storage-announcement');
+    if (live) live.textContent = `OMV 상태: ${label}`;
+    storageMonitor.announced = key;
+  }
+}
+function scheduleStorageStatus() {
+  clearTimeout(storageMonitor.timer);
+  if (document.hidden) return;
+  const now = storageNow();
+  if (storageMonitor.pendingManualRefresh && !storageMonitor.promise && (storageMonitor.pendingForce || now >= storageMonitor.cooldown)) {
+    const force = storageMonitor.pendingForce;
+    storageMonitor.pendingManualRefresh = false;
+    storageMonitor.pendingForce = false;
+    requestStorageStatus(true, { force });
+    return;
+  }
+  const deadlines = [storageMonitor.nextPoll];
+  if (storageMonitor.expiry > now && Number.isFinite(storageMonitor.expiry)) deadlines.push(storageMonitor.expiry);
+  if (storageMonitor.cooldown > now) deadlines.push(storageMonitor.cooldown);
+  storageMonitor.timer = setTimeout(() => {
+    patchStorageStatus();
+    if (!storageMonitor.promise && storageNow() >= storageMonitor.nextPoll) requestStorageStatus();
+    else scheduleStorageStatus();
+  }, Math.max(50, Math.min(...deadlines) - now));
+}
+// Accept only the public projection; never retain arbitrary response properties.
+function normalizeStorageStatus(value) {
+  const fail = () => { throw new Error('Invalid storage status'); };
+  const timestamp = text => {
+    if (typeof text !== 'string' || text.length > 128) return false;
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(text);
+    if (!m || !Number.isFinite(Date.parse(text))) return false;
+    const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+    const days = [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31,30,31,30,31,31,30,31,30,31];
+    return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1] && hour < 24 && minute < 60 && second < 60 && (!m[7] || (Number(m[8]) < 24 && Number(m[9]) < 60));
+  };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fail();
+  const { status, reasonCode, rawState, reportedAt, fetchedAt, checkedAt, reportedAtSource, cached, sourceRevision, freshForSeconds, nextPollInSeconds, refreshAvailableInSeconds, lastKnown } = value;
+  if (typeof sourceRevision !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(sourceRevision) ||
+      typeof cached !== 'boolean' || !timestamp(checkedAt) ||
+      ![null, 'on', 'off', 'unknown', 'unavailable'].includes(rawState) ||
+      !(fetchedAt === null || timestamp(fetchedAt)) || !(reportedAt === null || timestamp(reportedAt)) ||
+      (reportedAt === null ? reportedAtSource !== null : !['last_reported', 'last_updated'].includes(reportedAtSource)) ||
+      !(freshForSeconds === null || Number.isFinite(freshForSeconds) && freshForSeconds >= 0) ||
+      !Number.isFinite(nextPollInSeconds) || nextPollInSeconds < 1 || nextPollInSeconds > 60 || !Number.isFinite(refreshAvailableInSeconds) || refreshAvailableInSeconds < 0 || refreshAvailableInSeconds > 5) return fail();
+  const safeReason = reason => reason === null || typeof reason === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(reason);
+  if (!['running', 'booting', 'no_response', 'stale', 'unknown', 'unconfigured'].includes(status) || !safeReason(reasonCode)) return fail();
+  let ha, ssh;
+  const changedAt = value.changedAt ?? null;
+  if (changedAt !== null && !timestamp(changedAt)) return fail();
+  if (value.ha !== undefined) {
+    const h = value.ha;
+    if (!h || typeof h.configured !== 'boolean' || !['on', 'off', 'stale', 'unknown', 'error', 'unconfigured'].includes(h.status) ||
+        !safeReason(h.reasonCode) || !(h.reportedAt === null || timestamp(h.reportedAt)) || !(h.changedAt === null || timestamp(h.changedAt))) return fail();
+    ha = { configured: h.configured, status: h.status, reasonCode: h.reasonCode, reportedAt: h.reportedAt, changedAt: h.changedAt };
+  }
+  if (value.ssh !== undefined) {
+    const s = value.ssh;
+    if (!s || typeof s.configured !== 'boolean' || !['reachable', 'unreachable', 'unconfigured'].includes(s.status) ||
+        !(s.latencyMs === null || Number.isFinite(s.latencyMs) && s.latencyMs >= 0)) return fail();
+    ssh = { configured: s.configured, status: s.status, latencyMs: s.latencyMs };
+  }
+  let history = null;
+  if (lastKnown !== null) {
+    if (!lastKnown || !['on', 'off'].includes(lastKnown.rawState) || !timestamp(lastKnown.reportedAt) || !timestamp(lastKnown.fetchedAt)) return fail();
+    history = { rawState: lastKnown.rawState, reportedAt: lastKnown.reportedAt, fetchedAt: lastKnown.fetchedAt };
+  }
+  return { status, reasonCode, rawState, reportedAt, fetchedAt, checkedAt, reportedAtSource, cached, sourceRevision, freshForSeconds, nextPollInSeconds, refreshAvailableInSeconds, lastKnown: history, changedAt, ha, ssh };
+}
+function revealStorageStatus() {
+  if (view.page !== 'archive' || !storageMonitor.reveal) return;
+  storageMonitor.reveal = false;
+  const trigger = page.querySelector('[data-action="storage-disclosure"]');
+  trigger?.focus({ preventScroll: true });
+  trigger?.scrollIntoView?.({ block: 'nearest' });
+}
+function requestStorageStatus(refresh = false, { force = false } = {}) {
+  if (storageMonitor.promise) {
+    if (refresh && (!storageMonitor.refreshing || force)) storageMonitor.pendingManualRefresh = true;
+    storageMonitor.pendingForce ||= force;
+    return storageMonitor.promise;
+  }
+  if (document.hidden) {
+    if (force) { storageMonitor.pendingManualRefresh = true; storageMonitor.pendingForce = true; }
+    return Promise.resolve();
+  }
+  if (refresh && !force && storageNow() < storageMonitor.cooldown) return Promise.resolve();
+  storageMonitor.refreshing = refresh;
+  const sequence = ++storageMonitor.sequence;
+  const started = storageNow();
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timeout;
+  const request = Promise.race([
+    fetch(`/api/storage/status${refresh ? '?refresh=true' : ''}`, { method: 'GET', cache: 'no-store', signal: controller?.signal }).then(async response => {
+      if (!response.ok) throw new Error();
+      return response.json();
+    }),
+    new Promise((_, reject) => { timeout = setTimeout(() => { controller?.abort(); reject(new Error()); }, 6500); }),
+  ]).then(value => {
+    if (sequence !== storageMonitor.sequence) return;
+    value = normalizeStorageStatus(value);
+    storageMonitor.snapshot = value;
+    storageMonitor.expiry = value.freshForSeconds === null ? Infinity : storageNow() + Math.max(0, value.freshForSeconds * 1000 - (storageNow() - started));
+    storageMonitor.cooldown = storageNow() + Math.max(0, Math.min(5, value.refreshAvailableInSeconds)) * 1000;
+    storageMonitor.nextPoll = storageNow() + Math.max(1000, Math.min(60000, value.nextPollInSeconds * 1000));
+  }).catch(() => {
+    if (sequence !== storageMonitor.sequence) return;
+    const previous = storageMonitor.snapshot;
+    storageMonitor.snapshot = { status: 'unknown', reasonCode: 'api_unreachable', sourceRevision: previous.sourceRevision,
+      lastKnown: ['running', 'no_response'].includes(previous.status) && ['on', 'off'].includes(previous.rawState) && previous.reportedAt
+        ? { rawState: previous.rawState, reportedAt: previous.reportedAt, fetchedAt: previous.fetchedAt } : previous.lastKnown };
+    storageMonitor.expiry = Infinity;
+    storageMonitor.nextPoll = storageNow() + 30000;
+    storageMonitor.cooldown = storageNow() + 5000;
+  }).finally(() => {
+    clearTimeout(timeout);
+    if (storageMonitor.promise !== request) return;
+    storageMonitor.promise = null;
+    storageMonitor.completed = storageNow();
+    if (storageMonitor.pendingManualRefresh && (storageMonitor.pendingForce || storageNow() >= storageMonitor.cooldown)) {
+      const force = storageMonitor.pendingForce;
+      storageMonitor.pendingManualRefresh = storageMonitor.pendingForce = false;
+      return requestStorageStatus(true, { force });
+    }
+    patchStorageStatus(); scheduleStorageStatus();
+  });
+  storageMonitor.promise = request;
+  // While this request waits, the shared timer still expires old sensor evidence.
+  storageMonitor.nextPoll = started + 30000;
+  patchStorageStatus(); scheduleStorageStatus();
+  return request;
+}
+function resumeStorageStatus() {
+  patchStorageStatus();
+  if (document.hidden) {
+    storageMonitor.hiddenAt ??= storageNow(); clearTimeout(storageMonitor.timer); return;
+  }
+  const hiddenFor = storageMonitor.hiddenAt === null ? 0 : storageNow() - storageMonitor.hiddenAt;
+  storageMonitor.hiddenAt = null;
+  if (storageNow() >= storageMonitor.nextPoll || hiddenFor >= 10000) requestStorageStatus();
+  else scheduleStorageStatus();
+}
+
+function storageWakeStatus(settings = false) {
+  const job = storageWakeJob();
+  const active = isJobActive(job);
+  const config = view.settings?.storageWake;
+  return `<div class="wake-status">
+    ${!config?.available ? `<p class="small muted">${settings ? escapeHtml(config?.message || 'Home Assistant 시작 설정을 확인 중입니다.') : '원격 시작 설정이 필요합니다. <a href="#settings">설정 열기</a>'}</p>` : ''}
+    ${view.wakePending && (!job || view.wakeUncertain) ? '<p role="status">요청 결과 확인 중 · 자동으로 다시 보내지 않습니다.</p>' : ''}
+    ${job ? `<p><strong>${active ? '진행 중인 기동 작업' : `최근 기동 작업 · ${escapeHtml(catalogTime(job.createdAt))}`}</strong></p>${!active ? '<p class="small muted">이전 작업 기록이며 현재 상태를 뜻하지 않습니다.</p>' : ''}<p>${escapeHtml(active ? job.result?.phase || '서버 상태 확인 중' : jobMessage(job))}</p>
+      ${active ? `<p class="small muted">${wakeElapsed(job)}</p>` : ''}${wakeFacts(job)}
+      ${active ? '<p class="small muted">대기만 중지합니다. 이미 보낸 켜기 요청은 취소되지 않습니다.</p>' : ''}
+      ${job.result?.archiveState !== 'ready' ? '<a class="small" href="#settings">스토리지 설정 확인</a>' : ''}` : ''}
+    </div>`;
+}
+async function reconcileWakeRequest() {
+  if (!view.wakePending || view.wakeLookupBusy || view.wakeStarting) return;
+  view.wakeLookupBusy = true;
+  const pending = view.wakePending;
+  try {
+    const result = await api(`storage/wake?request_id=${encodeURIComponent(pending.requestId)}`);
+    if (view.wakePending !== pending) return;
+    if (result.job) {
+      state.latestStorageWake = result.job;
+      if (isJobActive(result.job)) setOptimisticJob(result.job);
+      view.wakeUncertain = false; view.wakeError = '';
+      saveWakePending(null);
+    } else view.wakeUncertain = true;
+  } catch { view.wakeUncertain = true; }
+  finally { view.wakeLookupBusy = false; }
+}
+async function startStorageWake() {
+  if (view.wakeStarting || remoteBusy()) return;
+  view.wakeStarting = true; view.wakeError = ''; render();
+  try {
+    const settings = await api('settings');
+    adoptWakeSettings(settings);
+    if (!settings.storageWake?.available) throw new Error(settings.storageWake?.message || 'Home Assistant 시작 설정이 필요합니다.');
+    const pending = view.wakePending || { requestId: wakeRequestId(), targetRevision: settings.storageWake.targetRevision };
+    saveWakePending(pending);
+    let result;
+    try { result = await api('storage/wake', 'POST', pending); }
+    catch (error) {
+      if (error.status && error.status < 500) { saveWakePending(null); throw error; }
+      view.wakeUncertain = true;
+      return;
+    }
+    state.latestStorageWake = { ...result, createdAt: result.requestedAt, result: { ...result, phase: '서버 상태 확인 중', attemptState: 'not_started' } };
+    if (isJobActive(state.latestStorageWake)) setOptimisticJob(state.latestStorageWake);
+    saveWakePending(null); view.wakeUncertain = false;
+  } catch (error) { view.wakeError = error.message; }
+  finally {
+    view.wakeStarting = false;
+    await reconcileWakeRequest();
+    await syncState(); render();
+  }
+}
+function adoptWakeSettings(settings) {
+  const oldRevision = view.settings?.storageWake?.targetRevision;
+  if (oldRevision && settings.storageWake?.targetRevision && oldRevision !== settings.storageWake.targetRevision) resetArchiveConnection();
+  view.settings = settings;
+}
+function wakeRefreshIdentity(job) {
+  return `${job.id}:${job.createdAt}:${job.result.targetRevision}`;
+}
+async function flushWakeArchiveRefresh() {
+  const pending = wakeRefreshPending;
+  if (!pending || view.page !== 'archive' || view.archiveBusy || exclusiveActive()) return;
+  if (pending.version !== archiveConnectionVersion || pending.revision !== view.settings?.storageWake?.targetRevision) { wakeRefreshPending = null; return; }
+  wakeRefreshPending = null;
+  wakeRefreshDone.add(`${pending.key}:${pending.version}`);
+  await browseArchive('');
+  if (view.page === 'archive') render();
+}
+async function reconcileWakeArchive({ fresh = false } = {}) {
+  const job = state.latestStorageWake;
+  if (!job || isJobActive(job) || job.result?.archiveState !== 'ready' || job.result?.outcome !== 'archive_ready') return;
+  const key = wakeRefreshIdentity(job);
+  if (wakeRefreshDone.has(`${key}:${archiveConnectionVersion}`) || wakeRefreshChecking) return;
+  if (wakeRefreshPending?.key === key && !fresh) return flushWakeArchiveRefresh();
+  wakeRefreshChecking = true;
+  const version = archiveConnectionVersion;
+  try {
+    const settings = await api('settings');
+    if (version !== archiveConnectionVersion || state.latestStorageWake?.id !== job.id) return;
+    adoptWakeSettings(settings);
+    if (settings.storageWake?.targetRevision !== job.result.targetRevision) { wakeRefreshPending = null; return; }
+    wakeRefreshPending = { key, version: archiveConnectionVersion, revision: job.result.targetRevision };
+  } catch { /* Next state reconciliation may retry the read-only settings check. */ }
+  finally { wakeRefreshChecking = false; }
+  await flushWakeArchiveRefresh();
+}
+
 function resetArchiveConnection() {
   ++archiveConnectionVersion;
+  wakeRefreshPending = null;
   view.archive = null;
   view.archivePath = '';
   view.archiveError = '';
@@ -1817,7 +2229,8 @@ async function maybeAutoConnectArchive() {
   try {
     const settings = view.settings || await api('settings');
     if (version !== archiveConnectionVersion) return;
-    view.settings = settings;
+    adoptWakeSettings(settings);
+    if (view.page === 'archive') render();
     if (!isStorageConfigured(settings)) {
       if (view.page === 'archive') render();
       return;
@@ -2271,6 +2684,7 @@ async function loadCatalog({ soft = false } = {}) {
 }
 
 function historyResultDetails(job) {
+  if (job.kind === 'storage-wake') return wakeFacts(job);
   const result = job.result || {}, meta = job.resultMeta || {};
   const list = (name, title) => {
     const values = result[name];
@@ -2291,6 +2705,7 @@ function resultBanner(job, title, followup = '') {
 function jobHistoryKey(job) { return `${job.source === 'device' ? 'device' : 'server'}:${jobDismissKey(job)}`; }
 function mergedJobEntries() {
   const entries = new Map(view.jobs.items.map(job => [job.id, job]));
+  if (state.latestStorageWake) entries.set(state.latestStorageWake.id, state.latestStorageWake);
   for (const lane of lanes) {
     const latest = laneJob(lane);
     if (latest && entries.has(latest.id)) entries.set(latest.id, { ...entries.get(latest.id), ...latest });
@@ -2354,8 +2769,8 @@ function mountJobsPage() {
 function jobHistoryActions(job) {
   const result = job.result || {};
   if (isJobActive(job)) {
-    const cancel = { upload: 'cancel-archive-upload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
-    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
+    const cancel = { 'storage-wake': 'cancel-storage-wake', upload: 'cancel-archive-upload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
+    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
   }
   if (job.kind === 'upload') return button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` });
   if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
@@ -2365,14 +2780,16 @@ function jobHistoryActions(job) {
   return '';
 }
 function patchJobCard(node, job) {
-  const kinds = { "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
   const statuses = { queued: '대기 중', running: '진행 중', done: '완료', failed: '실패', cancelled: '중지됨' };
   const result = job.result || {}, active = isJobActive(job), key = jobHistoryKey(job);
   setSlotHtml(node.querySelector('[data-slot="head"]'), `<div><strong>${escapeHtml(kinds[job.kind] || job.kind)}</strong> ${badge(active ? 'draft' : jobHasAttention(job) ? 'review' : 'ready', statuses[job.status] || job.status)}${job.source === 'device' ? '<span class="job-source-tag">이 브라우저 기록</span>' : `<span class="small muted">#${job.id}</span>`}</div><time class="small muted">${catalogTime(job.createdAt)}</time>`);
   const completed = result.completedFiles ?? result.processedFiles ?? 0;
   const percent = result.totalBytes ? Math.min(100, Math.round((result.transferredBytes || 0) / result.totalBytes * 100)) : Math.min(100, Math.round(completed / (result.totalFiles || 1) * 100));
   const message = active ? result.phase || '작업 진행 중' : job.kind === 'device-upload' ? `업로드 ${result.uploaded || 0}개 · 실패 ${result.failed || 0}개 · 확인 필요 ${result.review || 0}개` : jobMessage(job) || '작업 종료';
-  setSlotHtml(node.querySelector('[data-slot="body"]'), `<p>${escapeHtml(message)}</p>${active ? `<p class="small muted">${completed} / ${result.totalFiles || 0}개${result.totalBytes ? ` · ${deviceUploadBytes(result.transferredBytes || 0)} / ${deviceUploadBytes(result.totalBytes)}` : ''}</p><progress max="100" value="${percent}" aria-label="${escapeHtml(kinds[job.kind] || job.kind)} 진행률"></progress>${result.current ? `<p class="small job-current">${escapeHtml(result.current)}</p>` : ''}` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`);
+  setSlotHtml(node.querySelector('[data-slot="body"]'), job.kind === 'storage-wake'
+    ? `<p role="status">${escapeHtml(message)}</p>${active ? `<p class="small muted">${wakeElapsed(job)}</p>` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`
+    : `<p>${escapeHtml(message)}</p>${active ? `<p class="small muted">${completed} / ${result.totalFiles || 0}개${result.totalBytes ? ` · ${deviceUploadBytes(result.transferredBytes || 0)} / ${deviceUploadBytes(result.totalBytes)}` : ''}</p><progress max="100" value="${percent}" aria-label="${escapeHtml(kinds[job.kind] || job.kind)} 진행률"></progress>${result.current ? `<p class="small job-current">${escapeHtml(result.current)}</p>` : ''}` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`);
   const detailSlot = node.querySelector('[data-slot="details"]'), previous = detailSlot.querySelector('details');
   if (previous) { if (previous.open) view.jobsExpanded.add(key); else view.jobsExpanded.delete(key); }
   const details = historyResultDetails(job);
@@ -2521,6 +2938,9 @@ function settingsPage() {
     </section>
     <section class="surface settings-section" aria-label="스토리지 연결">
       <div class="surface-head"><h2>${icon('disk')} 스토리지 연결</h2></div>
+      <div class="storage-settings-card"><div class="storage-detail-head"><strong>OMV <span class="storage-pill" data-storage-label></span></strong><div>${button('refresh-storage-status', '상태 확인')} <span data-storage-settings-actions>${isJobActive(storageWakeJob()) ? '' : storageWakeButton()}</span></div></div>
+        <p class="small muted">Home Assistant로 서버를 켜고 SSH / SFTP로 아카이브 연결을 확인합니다. 파일 업로드는 연결 후 시작하세요.</p>
+        <div id="archive-wake-banner">${storageWakeActivity()}</div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(true)}</div></div>
       ${settingRow('스토리지 IP 주소', '연결할 스토리지의 IPv4 또는 IPv6 주소',
         visibleSetting(settings?.address) +
         button('edit-storage-address', settings?.addressConfigured ? 'IP 변경' : 'IP 등록', { disabled: !settings || view.sshTestBusy }))}
@@ -2566,7 +2986,7 @@ async function loadSettings() {
   await loadThumbnailStats({ silent: true });
   await loadDevices();
   try {
-    view.settings = await api('settings');
+    adoptWakeSettings(await api('settings'));
     view.settingsError = '';
     if (view.keyCopiedLocally && !view.settings.keyCopied) {
       view.settings = await api('settings/ssh-key/copied', 'POST');
@@ -2765,6 +3185,8 @@ function resetStatus() {
 }
 
 function clearCatalogViews() {
+  saveWakePending(null); view.wakeUncertain = false; view.wakeError = '';
+  state.latestStorageWake = null; wakeRefreshPending = null; wakeRefreshDone.clear();
   view.thumbnailStats = null; view.thumbnailStatsError = ''; view.thumbnailGeneratingShas.clear();
   cancelCatalogSearchDebounce(); clearDismissedResults(); clearDeviceUploadHistory();
   ++jobsRequest;
@@ -3072,6 +3494,16 @@ function renderNavigation() {
     return `<a class="nav-link" href="#${item.id}"${item.id === view.page ? ' aria-current="page"' : ''}>${item.step ? `<span class="nav-step" aria-hidden="true">${item.step}</span>` : icon(item.icon)}<span class="nav-label">${item.title}</span>${badge?.count > 0 ? `<span class="nav-badge${badge.muted ? ' nav-badge-muted' : ''}" aria-label="${badge.label} ${badge.count}건" title="${badge.count}건">${badge.count > 99 ? '99+' : badge.count}</span>` : ''}</a>`;
   }).join('')}</div>`).join(''));
 }
+let storagePageStructure = null;
+function storageStructureKey() {
+  return JSON.stringify([view.page, view.archive, view.archivePath, view.archiveBusy, view.archiveError,
+    view.sourcePath, [...view.sourceSelection], view.settings, view.uploadStarting, view.loadError,
+    view.sshTestBusy, view.sshTestResult, view.devices, view.devicesError, view.publicKeyToCopy,
+    view.thumbnailStats, view.thumbnailStatsError, view.thumbnailOpBusy, view.settingsError,
+    view.catalogOpBusy, view.keyCopiedLocally, view.restoreFile?.name, anyJobActive(), remoteBusy(),
+    state.managed, state.events, state.incoming, state.pendingXmp,
+    lanes.map(lane => { const job = laneJob(lane); return job?.kind === 'storage-wake' ? null : job; })]);
+}
 function render() {
   const windowScroll = window.scrollY || 0;
   const catalogScroll = page.querySelector('.catalog-table-wrap, .catalog-cards');
@@ -3086,6 +3518,7 @@ function render() {
   if (pageChanged) view.eventMenuOpen = false;
   const views = { archive: archivePage, catalog: catalogPage, settings: settingsPage };
   view.page = current.id;
+  const storageKey = ['archive', 'settings'].includes(view.page) ? storageStructureKey() : null;
   renderNavigation();
   const status = view.loadError ? `<p class="scan-strip" role="alert">${escapeHtml(view.loadError)}</p>` : '';
   const existingMain = page.querySelector('main');
@@ -3099,15 +3532,20 @@ function render() {
   } else if (view.page === 'jobs') {
     if (view.jobsTab === 'archives') page.innerHTML = `<main data-page="jobs-archives">${jobsTabs()}<div id="jobs-panel" role="tabpanel" aria-labelledby="jobs-tab-archives">${catalogPage()}</div></main>`;
     else { if (!inPlace || !page.querySelector('#jobs-list')) mountJobsPage(); patchJobsPage(); }
+  } else if (storageKey && !pageChanged && storagePageStructure === storageKey && existingMain?.dataset.page === view.page) {
+    setSlotHtml(page.querySelector('#page-active-jobs'), activeJobsBar());
   } else {
-    page.innerHTML = `<main aria-labelledby="page-title">${activeJobsBar()}${status}${views[view.page]()}</main>`;
+    page.innerHTML = `<main data-page="${view.page}" aria-labelledby="page-title"><div id="page-active-jobs">${activeJobsBar()}</div>${status}${views[view.page]()}</main>`;
   }
+  storagePageStructure = storageKey;
   document.title = `${current.title} · Photo Saver`;
   if (view.page === 'archive') syncSourceSelection();
+  patchStorageStatus();
   syncStickyActionBar();
   if (pageChanged) {
     pendingPreviewFocus = null;
     window.scrollTo(0, 0);
+    revealStorageStatus();
     return;
   }
   if (recordBrowserVisible()) window.scrollTo(0, windowScroll);
@@ -3139,6 +3577,7 @@ function render() {
       restorePreviewFocus({ source: 'incoming', returnFocus: { source: 'incoming', id: active.dataset.value, eventId: null } });
     }
   }
+  revealStorageStatus();
 }
 
 function toggleSelection(selection, ids, checked) {
@@ -3804,6 +4243,8 @@ function confirmOffload() {
 }
 
 const actions = {
+  'storage-disclosure'() { storageMonitor.open = !storageMonitor.open; patchStorageStatus(); },
+  'refresh-storage-status'() { return requestStorageStatus(true); },
   'catalog-view'(value) { view.catalogView = value === 'cards' ? 'cards' : 'table'; storePreference('photo-saver-catalog-view', view.catalogView); render(); },
   'preview-catalog': openCatalogPreview,
   'open-catalog-detail-dialog': openCatalogDetailDialog,
@@ -3940,6 +4381,15 @@ const actions = {
     await syncState();
   },
   'open-remote-index': openRemoteIndexDialog,
+  'start-storage-wake': startStorageWake,
+  async 'cancel-storage-wake'(value) {
+    const jobId = Number(value);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return;
+    const result = await api(`storage/wake/${jobId}/cancel`, 'POST');
+    state.latestStorageWake = result.job;
+    if (isJobActive(result.job)) setOptimisticJob(result.job);
+    await syncState();
+  },
   async 'cancel-remote-index'(value) {
     const jobId = Number(value) || activeLaneJob('remote')?.id;
     if (!jobId) return;
@@ -4185,6 +4635,11 @@ document.body.addEventListener('keydown', event => {
 });
 
 page.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && storageMonitor.open && !view.preview) {
+    storageMonitor.open = false;
+    patchStorageStatus();
+    page.querySelector('[data-action="storage-disclosure"]')?.focus({ preventScroll: true });
+  }
   const menuTrigger = event.target.closest('#event-menu-toggle');
   const menuItem = event.target.closest('#event-menu-panel [role="menuitem"]');
   if (menuTrigger && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
@@ -4352,7 +4807,13 @@ function loadRoute() {
   render();
   if (recordBrowserVisible()) loadCatalog();
   if (view.page === 'jobs' && view.jobsTab === 'list') loadJobs({ reset: true });
-  if (view.page === 'archive') maybeAutoConnectArchive();
+  if (view.page === 'archive') {
+    if (view.wakePending || state.latestStorageWake?.result?.archiveState === 'ready') {
+      reconcileWakeRequest().then(() => reconcileWakeArchive({ fresh: true })).then(() => maybeAutoConnectArchive()).then(() => {
+        if (view.page === 'archive') render();
+      });
+    } else maybeAutoConnectArchive();
+  }
   if (view.page === 'settings') loadSettings().then(() => {
     if (view.page === 'settings') render();
   });
@@ -4362,4 +4823,13 @@ page.addEventListener('error', event => {
   if (event.target.tagName === 'IMG') event.target.remove();
 }, true);
 loadRoute();
+document.querySelector?.('#storage-summary')?.addEventListener('click', () => {
+  storageMonitor.open = true;
+  storageMonitor.reveal = true;
+  if (location.hash !== '#archive') location.hash = '#archive';
+  else { patchStorageStatus(); revealStorageStatus(); }
+});
+document.addEventListener?.('visibilitychange', resumeStorageStatus);
+window.addEventListener('focus', resumeStorageStatus);
+requestStorageStatus();
 syncState().then(render);

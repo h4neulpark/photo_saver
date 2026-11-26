@@ -1,5 +1,41 @@
 # API
 
+## OMV 원격 시작
+
+세 API 모두 `Cache-Control: no-store`다. `/api/settings`, `/api/state`, 작업 내역과 아래 wake GET은 HA/SSH 요청이나 작업 등록을 하지 않는다. 화면의 독립 상태 모니터는 아래 `/api/storage/status`로 HA 상태와 비인증 SSH 도달성을 읽는다.
+
+| 메서드 | 경로 | 계약 |
+| --- | --- | --- |
+| POST | `/api/storage/wake` | 필수 JSON `{"requestId":"UUID","targetRevision":"64자리 소문자 hex"}`. 추가 필드 거부(422). SSH 미설정도 허용 |
+| GET | `/api/storage/wake?request_id=UUID` | `{"job":공개작업 또는 null}`. query 생략 시 최근 wake |
+| POST | `/api/storage/wake/{id}/cancel` | `{"job":공개작업}`. 없는 ID/다른 종류 404. 종료 작업 반복 취소는 200 |
+
+POST의 202 응답은 `id,kind:"storage-wake",lane:"remote",status,reused,targetRevision,requestedAt,deadlineAt`이다. 접수는 HA 전송이나 서버 기동 완료를 뜻하지 않는다. 동일 UUID·revision은 종료 후에도 같은 작업을 반환하며 다른 revision으로 UUID 재사용은 409 `wake_request_mismatch`다. 같은 설정의 진행 중 wake에 다른 UUID로 합류해도 동일 ID를 반환하고 별칭을 보존한다(작업당 최대 128개, 초과 429 `wake_request_limit`). 새로운 명시적 재시도에는 새 UUID를 사용한다. 브라우저는 응답 유실 시 UUID를 sessionStorage에 보존하고 GET으로 확인한다. 사용자 재시도 전 자동 POST는 없다.
+
+새 요청의 설정 revision 불일치는 409 `wake_target_changed`, 다른 remote/exclusive 활동은 409 `remote_busy`, HA 누락/잘못된 설정은 503 `ha_not_configured`/`ha_config_invalid`, 설정 잠금 경합은 409 `settings_busy`다. 초기화 중에는 기존 middleware의 409가 우선한다. 로컬 작업은 함께 진행할 수 있다. GET `/api/state`의 `latestStorageWake`는 나중 원격 작업과 독립적으로 최근 wake를 유지하고 `/api/jobs?kind=storage-wake`로 이력을 조회한다. payload·UUID 별칭·HA URL/토큰은 공개하지 않는다.
+
+공개 result는 schemaVersion 1, phaseCode/phase, targetRevision, requestedAt/deadlineAt/timeoutSeconds/elapsedSeconds, attemptState/attemptCount/intentAt/receiptAt, serverState/serverObservedAt/serverEvidenceAt, haState/haStateStale, archiveState/archiveObservedAt/archiveConnectionVersion, cancelRequested, outcome/message/code/review 및 실패·취소 시 error를 사용한다. 파일 수·바이트·진행률은 없다. `attemptState`는 `not_started|not_needed|observing_existing|intent|accepted|rejected|unknown`, attemptCount는 0/1이다. `serverState`는 `unknown|ha_reported_on|ssh_responding|archive_ready`, `haState`는 `on|off|unknown|unavailable|missing|unreachable`이다. `archiveState`는 `settings_required|checking|ready|unreachable|auth_failed|host_key_error|path_missing|permission_denied|not_directory|sftp_error`이다.
+
+성공/주의 outcome은 `archive_ready`, `server_responding_settings_required`, `archive_blocked`, `archive_unconfirmed`(done), 실패 outcome은 `expired`, `startup_timeout`, `request_unknown`, `response_unconfirmed`, `ha_error`, `invalid_operation`(failed), 중지는 `config_changed`, `cancelled`(cancelled)다. HA 접수와 실제 접근 준비는 독립적이므로 unknown 접수 상태에서도 SFTP ready가 가능하다. queued 취소는 즉시 종료하고 running 취소는 flag를 저장한 뒤 I/O 프로세스를 종료·회수한 후 종료한다. 이미 보낸 기동 요청은 취소되지 않는다.
+
+## OMV 현재 상태
+
+`GET /api/storage/status`는 HA 센서 GET과, 저장된 IP가 있으면 TCP 22의 SSH 배너 확인을 병행한다. SSH는 인증·SFTP·디스크 접근 없이 최대 256바이트만 읽으며 HA 미설정이어도 수행한다. `?refresh=true`는 5초 재조회 간격이 허용할 때 새 조회를 수행한다. 센서 갱신·서비스·기동은 실행하지 않으며 작업/DB/설정 잠금/워커에 의존하지 않는다. 예상 오류도 HTTP200, 잘못된 bool query는 422, 모든 응답은 `Cache-Control: no-store`다.
+
+기존 응답 필드 `status`, `reasonCode`, `rawState`, `fetchedAt`, `checkedAt`, `reportedAt`, `reportedAtSource`, `cached`, `sourceRevision`, `freshForSeconds`, `nextPollInSeconds`, `refreshAvailableInSeconds`, `lastKnown`을 유지한다. `changedAt`, `ha:{configured,status,reasonCode,reportedAt,changedAt}`, `ssh:{configured,status,latencyMs}`를 추가한다. HA status는 `on|off|stale|unknown|error|unconfigured`, SSH status는 `reachable|unreachable|unconfigured`, latencyMs는 숫자 또는 null이다. 최상위 status는 `running|booting|no_response|unknown|stale|unconfigured`, rawState는 `on|off|unknown|unavailable|null`이다. sourceRevision은 불투명 임의 값이며 HA 구성·SSH 주소·신선도 정책 변경 시 캐시와 이력을 폐기한다. lastKnown은 같은 구성의 과거 HA 사실 `{rawState,reportedAt,fetchedAt}` 또는 null이다.
+
+HA `last_reported`가 있으면 그것만 사용하며 필드가 없을 때만 `last_updated`를 사용한다. `last_changed`는 진단용 changedAt이며 신선도의 근거가 아니다. 보고 시각 파싱 실패는 `report_time_invalid`, 30초 넘는 미래는 `report_time_future`다. 기본 `PHOTO_SAVER_HA_STALE_SECONDS=0`은 나이 제한을 끄므로 24시간 같은 상태여도 정상이다. 양수일 때만 그 초수를 넘으면 `report_stale`이다. freshForSeconds는 기본 null, 양수 정책에서는 남은 초(0..설정값)다. unknown/unavailable는 `sensor_unknown|sensor_unavailable`, 401/403은 `ha_auth_error`, 404는 `sensor_missing`, 3xx는 `ha_redirect_blocked`, 5xx는 `ha_http_5xx`, TLS/DNS/timeout은 `ha_tls_error|ha_dns_error|ha_timeout`, 연결 실패는 `ha_unreachable`, 스키마 오류는 `ha_response_invalid`다.
+
+| HA | SSH 도달 | SSH 응답 없음 / 미설정 |
+| --- | --- | --- |
+| on | running | booting(`ssh_unreachable`) / running |
+| off | running(`ha_lagging`) | no_response |
+| unconfigured | running | no_response / unconfigured(`ha_not_configured`) |
+| stale | running | stale(HA 사유) |
+| unknown / error | running(HA 사유) | unknown(HA 사유) |
+
+nextPollInSeconds와 캐시는 config_changed 1초, booting 5초, running/no_response 15초, unknown/stale 30초, unconfigured 60초다. 진행 중 조회 합류는 cached=false이며 기존 레코드를 반환할 때만 true다. HA I/O는 4.5초, SSH 배너는 2.5초 예산으로 병행하고 대기자는 5.5초 제한을 가진다. fetchedAt은 실제 조회 완료 시각, checkedAt은 판정 시각이다. 브라우저는 양수 신선도에서 왕복 시간을 빼 단조 시계로 만료시킨다. URL/token/헤더/속성/상위 오류 본문은 응답하지 않는다. wake의 인증된 SSH/SFTP 검증은 최대 12초이며 설정 잠금 밖에서 실행한다. 기동 후 path_missing/sftp_error는 waiting_mount로 최대 30초 기다리고, 인증·권한 오류는 즉시 archive_blocked로 종료한다. 기동 중 HA on 증거는 래치하여 나중 timeout을 archive_unconfirmed로 구별하며 wake result.code에 ha_http_401/403/404 등 상세 원인을 보존한다.
+
 ## 기기 → Incoming 청크 업로드
 
 사진 JPG·JPEG·PNG·WEBP·HEIC·HEIF, 영상 MP4·MOV, 동반 파일 XMP·THM·LRV를 허용한다. 모든 업로드 응답(오류 포함)에 Cache-Control: no-store와 X-Content-Type-Options: nosniff를 적용한다. 워커 작업을 생성하지 않으며 기존 reset-all 쓰기 차단(409)을 따른다.
