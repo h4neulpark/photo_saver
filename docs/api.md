@@ -1,5 +1,23 @@
 # API
 
+## OMV 원격 종료
+
+종료 API는 오류·검증 실패를 포함해 `Cache-Control: no-store`를 반환한다. 접수 중 HA/SSH 네트워크 호출은 없으며, POST는 완료가 아닌 작업 접수를 뜻한다.
+
+| 메서드 | 경로 | 계약 |
+| --- | --- | --- |
+| POST | `/api/storage/shutdown` | 필수 JSON `{"requestId":"UUID","targetRevision":"64자리 소문자 hex"}`; 추가 필드 거부(422). 202 `{"job":공개작업}` |
+| GET | `/api/storage/shutdown?request_id=UUID` | 200 `{"job":공개작업 또는 null}`; 원본 UUID·별칭 모두 조회. query 생략 시 최근 종료 작업 |
+| POST | `/api/storage/shutdown/{id}/cancel` | 200 `{"job":공개작업}`; 미존재·다른 kind는 404. 이미 종료된 작업의 취소도 멱등 |
+
+새 요청의 revision 불일치는 409 `target_changed`, remote/exclusive 충돌은 409 `remote_busy`, 원격 keeper를 가진 활성 중복 정리는 409 `remote_cleanup_busy`다. 반대로 원격 keeper 중복 정리 접수는 종료 작업 중 409 `storage_shutdown_active`다. 설정 문제는 409 `ha_not_configured|ha_shutdown_not_configured|ha_config_invalid|settings_busy`다. 동일 UUID는 종료 후에도 같은 작업을 반환하며 같은 대상의 활성 종료에 다른 UUID로 합류하면 별칭을 저장한다(별칭 128개 상한, 초과 429 `shutdown_request_limit`). 같은 UUID를 다른 revision에 재사용할 수 없다.
+
+`GET /api/settings.storageShutdown`은 `{available,reasonCode,message,timeoutSeconds,targetRevision}`를 제공하며 `/api/state.latestStorageShutdown`은 다른 원격 작업 이후에도 최근 종료 작업을 보존한다. `/api/jobs?kind=storage-shutdown`과 `status=attention`으로 이력을 확인한다. payload·별칭·HA 토큰은 공개하지 않는다. `/api/storage/status`의 스키마·읽기 전용 성격은 바뀌지 않는다.
+
+공개 result는 `phaseCode/phase/message/outcome/code/detailCode/error/review/cancelRequested`, `attemptState/attemptCount/intentAt/receiptAt`, `haState/haFresh/haScriptState`, `sshState/sshConfigured/everSshStoppedAfterAttempt`, `startedAt/requestedAt/deadlineAt/checkedAt/elapsedSeconds/timeoutSeconds/targetRevision`를 사용한다. 단계는 `queued → checking_server → requesting → waiting_shutdown → waiting_power_off → complete`다. 파일 진행률은 없다.
+
+성공은 `powered_off|already_off`(done, review=0), 부분 확인은 `ssh_stopped_ha_unconfirmed`(done, review=1)다. 실패는 `ha_request_failed|server_not_ready|response_unconfirmed|remote_cleanup_busy|shutdown_timeout|request_unknown|config_changed|interrupted|invalid_operation`(failed, review=1), 사용자 중지는 `cancelled`(cancelled, review=1)다. HA 인증·권한·엔티티·리다이렉트 오류 등은 detailCode에 보존한다. 취소는 확인 대기만 중단하며 이미 전송된 종료 스크립트는 계속 진행될 수 있다.
+
 ## OMV 원격 시작
 
 세 API 모두 `Cache-Control: no-store`다. `/api/settings`, `/api/state`, 작업 내역과 아래 wake GET은 HA/SSH 요청이나 작업 등록을 하지 않는다. 화면의 독립 상태 모니터는 아래 `/api/storage/status`로 HA 상태와 비인증 SSH 도달성을 읽는다.

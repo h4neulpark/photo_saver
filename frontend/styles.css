@@ -213,6 +213,19 @@ svg { width: 18px; height: 18px; flex: 0 0 auto; vertical-align: middle; }
 .wake-stepper-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
 .wake-stepper-foot p { margin: 4px 0 0; }
 .wake-stepper .button { min-height: 44px; }
+[data-storage-label][data-tone="shutting_down"] { color: #875300; background-color: #fff1d6; }
+[data-storage-label][data-tone="shutting_down"]::before { animation: storage-pulse 1.6s ease-in-out infinite; }
+.storage-summary [data-tone="shutting_down"] { color: #ffcf80; background-color: transparent; }
+.wake-stepper.is-shutdown { background: #fff1d6; }
+.wake-stepper.is-shutdown li { color: #705025; }
+.wake-stepper.is-shutdown li[aria-current="step"] { color: #875300; }
+[data-storage-settings-actions] { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.archive-actions .button, [data-storage-settings-actions] .button { white-space: nowrap; }
+@media (max-width: 480px) {
+  .storage-detail-head { flex-wrap: wrap; gap: 12px; }
+  [data-storage-settings-actions] { margin-top: 8px; }
+}
+@media (prefers-reduced-motion: reduce) { [data-storage-label][data-tone="shutting_down"]::before { animation: none; } }
 .storage-detail .wake-status { border: 0; border-top: 1px solid var(--line); margin: 14px 0 0; padding: 12px 0 0; }
 .storage-detail .wake-facts { grid-template-columns: 1fr; gap: 6px; }
 .storage-settings-row { padding: 14px 20px; border-bottom: 1px solid var(--line); }

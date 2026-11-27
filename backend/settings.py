@@ -154,12 +154,14 @@ def ensure_storage_id():
 
 def settings_state():
     from storage_wake import public_configuration
+    from storage_shutdown import public_configuration as shutdown_configuration
     address = read_setting(ADDRESS_FILE).strip()
     storage_root = read_setting(STORAGE_ROOT_FILE)
     generated = KEY_FILE.is_file() and PUBLIC_KEY.is_file()
     return {
         "localRetention": read_local_retention(),
         "storageWake": public_configuration(),
+        "storageShutdown": shutdown_configuration(),
         "address": address, "storageRoot": storage_root, "account": "***", "publicKey": "***",
         "addressConfigured": bool(address),
         "storageRootConfigured": bool(storage_root),
@@ -391,7 +393,7 @@ def trust_and_test_host(request: HostKeyConfirmation):
 def reset_host_key():
     with database() as db:
         if has_active_jobs(db, (LANE_REMOTE, LANE_EXCLUSIVE)):
-            fail(409, "업로드·로컬 비우기·원격 인덱싱·OMV 시작 확인이 끝난 뒤 호스트 키를 초기화하세요.")
+            fail(409, "업로드·로컬 비우기·원격 인덱싱·OMV 시작·종료 확인이 끝난 뒤 호스트 키를 초기화하세요.")
     with settings_lock():
         address = read_setting(ADDRESS_FILE).strip()
         if not address:

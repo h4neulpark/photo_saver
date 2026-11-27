@@ -1,5 +1,37 @@
 # 실행과 운영
 
+## OMV 원격 종료 (선택 설정)
+
+기존 `PHOTO_SAVER_HA_URL`, `PHOTO_SAVER_HA_TOKEN`, `PHOTO_SAVER_HA_RUNNING_ENTITY`를 공유한다. Home Assistant에 안전하게 OMV를 종료하는 별도 스크립트를 먼저 만들고 `.env`에 아래 값을 등록한다. 앱은 OMV SSH 셸의 poweroff 명령을 직접 실행하지 않는다.
+
+```dotenv
+# 기본 빈 값: 명시적으로 설정해야 활성화
+PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY=script.shutdown_omv
+# 정수 30..600초, 기본 180초
+PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS=180
+```
+
+종료 엔티티는 `script.[a-z0-9_]+` 형식이며 `PHOTO_SAVER_HA_SCRIPT_ENTITY`(기본 `script.wake_omv`)와 같으면 거부한다. 적용은 `docker compose up -d --force-recreate api worker`로 한다. wake와 shutdown의 스크립트·타임아웃 검증은 서로 독립적이며 상태 조회에도 영향을 주지 않는다. HA 토큰은 DB payload·리비전·공개 API에 포함하지 않는다. 토큰 교체 후에도 주소·엔티티가 같다면 진행 중 종료 대상은 유지된다.
+
+오류를 확인할 때 401은 토큰, 403은 권한, 404는 스크립트/센서, redirect는 최종 HA URL을 점검한다. SSH만 중단되고 HA가 꺼짐을 확인하지 못하면 서버 전원을 직접 확인한다. HTTP 아카이브 탐색·다운로드는 Job이 아니므로 종료 확인창의 경고를 확인한다.
+
+검증 명령(HA·OMV 실서버 호출 없음):
+
+```sh
+node --check frontend/app.js
+node --test frontend/test_*.cjs
+shasum -a 256 frontend/styles.css frontend/app.js
+grep -E 'styles\.css|app\.js' frontend/index.html
+docker compose config --quiet
+docker compose build api worker
+printf 'FROM photo-saver-backend\nRUN pip install --no-cache-dir httpx==0.28.1\n' | docker build -t photo-saver-backend-tests -
+docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid -v "$PWD/backend:/work:ro" -w /work photo-saver-backend-tests python -m unittest -v test_storage_shutdown.py test_storage_wake.py test_storage_status.py test_jobs_api.py test_concurrency.py
+docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid -v "$PWD/backend:/work:ro" -w /work photo-saver-backend-tests python -m unittest discover -s /work -p 'test_*.py'
+git diff --check
+```
+
+[개발·검증 절차](development.md#테스트-실행)와 같이 FastAPI TestClient의 `httpx==0.28.1`은 테스트 전용 이미지 `photo-saver-backend-tests`에만 설치한다. 운영 이미지와 실행 중인 서비스에는 추가 의존성을 설치하지 않는다. 정적 파일을 변경하면 index.html의 각 `?v=`를 SHA-256 앞 12자리와 일치시킨다.
+
 ## OMV 원격 시작 선택 설정
 
 기존 Home Assistant 스크립트를 그대로 사용한다. 앱의 기본 HA 대상은 `script.wake_omv`와 `binary_sensor.omv_running`이다. HA 스크립트·자동화·플러그를 수정하거나 직접 WOL·종료를 추가하지 않는다. SSH 설정 전에도 선택 기능을 사용할 수 있고 HA 미설정은 일반 API health/아카이브 기능에 영향을 주지 않는다.

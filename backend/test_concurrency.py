@@ -36,6 +36,18 @@ class ConcurrencyTests(unittest.TestCase):
         with catalog.database(write=True) as db:
             return catalog.queue_job(db, kind, payload or {})
 
+    def test_shutdown_lane_excludes_remote_and_allows_local(self):
+        self.assertEqual(catalog.lane_for_kind('storage-shutdown'), 'remote')
+        shutdown = self.queue('storage-shutdown')
+        for kind in ('upload', 'offload', 'remote-index', 'thumbnails-remote', 'storage-wake', 'reset-all'):
+            with self.subTest(kind=kind), self.assertRaises(catalog.JobConflictError):
+                self.queue(kind)
+        for kind in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'thumbnails-local'):
+            local = self.queue(kind)
+            self.assertEqual(self.status(shutdown), 'queued')
+            self.complete(local)
+        self.complete(shutdown)
+
     def complete(self, job_id):
         with catalog.database(write=True) as db:
             worker.finish(db, job_id, {})

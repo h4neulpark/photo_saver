@@ -86,7 +86,7 @@ function savedEventView() {
   }
 }
 
-const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, latestStorageWake: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
+const state = { incoming: [], managed: [], events: [], pendingXmp: [], scan: null, latestIncomingResult: null, latestStorageWake: null, latestStorageShutdown: null, job: null, jobs: { local: null, remote: null, exclusive: null }, activeJobs: { local: null, remote: null, exclusive: null }, timezone: 'Asia/Seoul' };
 const view = {
   catalogView: savedPreference('photo-saver-catalog-view', 'table') === 'cards' ? 'cards' : 'table', thumbnailGeneratingShas: new Set(),
   thumbnailStats: null, thumbnailStatsError: '', thumbnailOpBusy: false,
@@ -103,6 +103,7 @@ const view = {
   catalogOpBusy: false, sshTestBusy: false, sshTestResult: null,
   archive: null, archivePath: '', archiveBusy: false, archiveError: '', archiveAutoAttempted: false, archiveAutoConnecting: false,
   wakeStarting: false, wakePending: loadWakePending(), wakeUncertain: false, wakeError: '', wakeLookupBusy: false,
+  shutdownStarting: false, shutdownPending: loadShutdownPending(), shutdownUncertain: false, shutdownError: '', shutdownLookupBusy: false,
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
   sourceFilter: 'all', uploadOffloadAfter: savedPreference('photo-saver-upload-offload-after', '0') === '1',
   retentionBusy: false, retentionError: '', retentionDraftMode: null, retentionDraftDays: '',
@@ -232,7 +233,7 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-const jobLanes = { "storage-wake": "remote", "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const jobLanes = { "storage-wake": "remote", "storage-shutdown": "remote", "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
 const MAX_DISMISSED_RESULTS = 100;
@@ -358,17 +359,18 @@ function activeJobsBar() {
 function laneJobsBar() {
   if (!anyJobActive()) return '';
   const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
-  const kinds = { "storage-wake": "OMV 시작 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
   return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
     const job = activeLaneJob(lane);
     if (!job) return '';
     const result = job.result || {};
-    const cancel = job.kind === 'storage-wake' ? 'cancel-storage-wake' : job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'offload' ? 'cancel-offload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
-    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? (job.kind === 'offload' ? '중지 요청됨' : '중지 중…') : job.kind === 'offload' ? '중지' : job.kind === 'storage-wake' ? '대기 중지' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
+    const cancel = job.kind === 'storage-shutdown' ? 'cancel-storage-shutdown' : job.kind === 'storage-wake' ? 'cancel-storage-wake' : job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'offload' ? 'cancel-offload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
+    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? (job.kind === 'offload' ? '중지 요청됨' : '중지 중…') : job.kind === 'offload' ? '중지' : ['storage-wake', 'storage-shutdown'].includes(job.kind) ? '대기 중지' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
   }).join('')}</div>`;
 }
 
 function jobMessage(job) {
+  if (job.kind === 'storage-shutdown') return job.result?.message || job.result?.phase || 'OMV 종료 확인 중';
   if (job.kind === 'storage-wake') return job.result?.message || job.result?.phase || 'OMV 시작 확인 중';
   if (job.status === 'cancelled') return job.result.error || '작업을 중지했습니다.';
   if (job.status === 'failed') return job.result.error;
@@ -393,7 +395,12 @@ async function syncState() {
     Object.assign(state, snapshot, normalizeJobs(snapshot));
     if (Object.values(previousJobs).some(job => job?.kind === 'storage-wake' && isJobActive(job) &&
         !isJobActive(storageWakeJob()))) requestStorageStatus(true, { force: true });
+    await reconcileShutdownRequest();
     await reconcileWakeRequest();
+    const previousShutdown = Object.values(previousJobs).find(job => job?.kind === 'storage-shutdown' && isJobActive(job));
+    if (previousShutdown && state.latestStorageShutdown?.id === previousShutdown.id && !isJobActive(state.latestStorageShutdown)) {
+      applyShutdownJob(state.latestStorageShutdown); saveShutdownPending(null);
+    }
     await reconcileWakeArchive();
     view.loadError = '';
     const messages = [];
@@ -428,7 +435,7 @@ async function syncState() {
   } finally {
     if (request === stateRequest) {
       view.connecting = false;
-      if (anyJobActive() || view.loadError || view.wakePending) refreshTimer = window.setTimeout(async () => {
+      if (anyJobActive() || view.loadError || view.wakePending || view.shutdownPending) refreshTimer = window.setTimeout(async () => {
         await syncState();
         render();
       }, view.loadError ? 2500 : 650);
@@ -1904,6 +1911,141 @@ function storageWakeJob() {
   const active = activeLaneJob('remote');
   return active?.kind === 'storage-wake' ? active : state.latestStorageWake;
 }
+function loadShutdownPending() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem('photoSaver.storageShutdownPending'));
+    return value && /^[0-9a-f-]{36}$/i.test(value.requestId) && /^[0-9a-f]{64}$/.test(value.targetRevision) ? value : null;
+  } catch { return null; }
+}
+function saveShutdownPending(value) {
+  view.shutdownPending = value;
+  try {
+    if (value) sessionStorage.setItem('photoSaver.storageShutdownPending', JSON.stringify(value));
+    else sessionStorage.removeItem('photoSaver.storageShutdownPending');
+  } catch { /* Keep the UUID in memory when browser storage is unavailable. */ }
+}
+function storageShutdownJob() {
+  const active = activeLaneJob('remote');
+  return active?.kind === 'storage-shutdown' ? active : state.latestStorageShutdown;
+}
+function storageShutdownButton() {
+  const job = storageShutdownJob(), cfg = view.settings?.storageShutdown;
+  if (isJobActive(job)) return button('cancel-storage-shutdown', job.result?.cancelRequested ? '중지 중…' : '대기 중지',
+    { disabled: job.result?.cancelRequested, extra: `data-value="${job.id}"` });
+  const current = storageCurrent();
+  const ready = view.archive !== null || current.status === 'running';
+  const reason = !cfg?.available ? cfg?.message || 'Home Assistant 종료 설정이 필요합니다.' : remoteBusy()
+    ? '원격 작업이 진행 중일 때는 OMV를 끌 수 없습니다.' : !ready && !view.shutdownPending
+      ? ({ no_response: '이미 응답이 없습니다', booting: '부팅 중에는 종료할 수 없습니다' })[current.status] || '현재 상태를 확인한 뒤 종료할 수 있습니다' : '';
+  return button('confirm-storage-shutdown', view.shutdownStarting ? '요청 중…' : view.shutdownPending ? '같은 요청 다시 확인' : 'OMV 끄기',
+    { danger: true, disabled: view.shutdownStarting || !!reason, extra: `title="${escapeHtml(reason)}"` });
+}
+function storageSettingsActions() {
+  return `${isJobActive(storageWakeJob()) ? '' : storageWakeButton()} ${isJobActive(storageShutdownJob()) ? '' : storageShutdownButton()}`;
+}
+function shutdownFacts(job) {
+  const r = job?.result || {};
+  const attempts = { not_started: '보내지 않음', not_needed: '이미 꺼져 있어 생략', observing_existing: '기존 종료 관찰', intent: '처리 여부 확인 중', accepted: 'HA 요청 수신 확인', rejected: 'HA 요청 거부', unknown: '처리 여부 알 수 없음' };
+  const ssh = r.sshConfigured === false ? '주소 미설정 · HA만 확인' : ({ reachable: 'SSH 응답 중', unreachable: 'SSH 응답 중단' })[r.sshState] || '미확인';
+  return `<dl class="wake-facts"><div><dt>종료 요청</dt><dd>${escapeHtml(attempts[r.attemptState] || '미확인')}</dd></div><div><dt>HA 전원 센서</dt><dd>${escapeHtml(({ on: '켜짐', off: '꺼짐' })[r.haState] || '미확인')}${r.haFresh ? '' : ' · 보고 미확인'}</dd></div><div><dt>SSH 응답</dt><dd>${escapeHtml(ssh)}</dd></div><div><dt>소요 시간</dt><dd>${Math.max(0, Number(r.elapsedSeconds) || 0)}초</dd></div></dl>`;
+}
+function shutdownStep(r) {
+  if (r.outcome === 'powered_off' || r.outcome === 'already_off') return 3;
+  if (r.phaseCode === 'checking_server' || r.phaseCode === 'requesting' || !r.attemptState || r.attemptState === 'not_started') return 0;
+  return r.phaseCode === 'waiting_power_off' || r.sshState === 'unreachable' || r.sshConfigured === false ? 2 : 1;
+}
+function shutdownElapsed(job) {
+  const r = job?.result || {};
+  const elapsed = Math.max(0, Math.min(r.timeoutSeconds || 180, Math.floor((Date.now()-Date.parse(r.requestedAt || job?.createdAt))/1000) || 0));
+  return `경과 ${String(Math.floor(elapsed/60)).padStart(2, '0')}:${String(elapsed%60).padStart(2, '0')}`;
+}
+function storageShutdownActivity() {
+  const job = storageShutdownJob(), r = job?.result || {}, active = isJobActive(job), step = shutdownStep(r);
+  return `<section class="wake-stepper is-shutdown" aria-label="OMV 종료 진행"${job?.status === 'failed' ? ' role="alert"' : ''}><ol>${['종료 요청', '서비스 종료 (SSH)', '전원 차단 확인 (HA)'].map((label, i) => `<li${active && step === i ? ' aria-current="step"' : ''} class="${i < step ? 'complete' : ''}"><span>${i+1}</span>${label}</li>`).join('')}</ol>
+    ${job ? `<div class="wake-stepper-foot"><div><strong data-wake-phase>${escapeHtml(active ? r.phase || '서버 상태 확인 중' : jobMessage(job))}</strong><p class="small muted" data-wake-elapsed>${active ? shutdownElapsed(job) : escapeHtml(catalogTime(job.createdAt))}</p></div>${active ? storageShutdownButton() : ''}</div>` : ''}
+    ${view.shutdownPending ? '<p class="small muted">요청 결과 확인 중 · 자동 재전송 없음</p>' : ''}
+    ${view.shutdownError ? `<p class="form-error" role="alert">${escapeHtml(view.shutdownError)}</p>` : ''}
+    ${active ? '<p class="small muted">대기 중지는 상태 확인만 중단합니다. 이미 전달된 종료 요청은 취소되지 않습니다.</p>' : ''}</section>`;
+}
+function patchShutdownActivity(node) {
+  const job = storageShutdownJob(), r = job?.result || {}, active = isJobActive(job);
+  const identity = JSON.stringify(['shutdown', job?.id, active, r.outcome, view.shutdownError, !!view.shutdownPending]);
+  if (node.dataset.wakeIdentity !== identity) {
+    setSlotHtml(node, storageShutdownActivity()); node.dataset.wakeIdentity = identity; return;
+  }
+  if (!active) return;
+  const phase = node.querySelector('[data-wake-phase]'), elapsed = node.querySelector('[data-wake-elapsed]');
+  if (phase) phase.textContent = active ? r.phase || '서버 상태 확인 중' : jobMessage(job);
+  if (elapsed) elapsed.textContent = shutdownElapsed(job);
+  const step = shutdownStep(r);
+  node.querySelectorAll('li').forEach((item, i) => {
+    setClass(item, 'complete', i < step);
+    if (active && i === step) item.setAttribute('aria-current', 'step'); else item.removeAttribute('aria-current');
+  });
+  const stop = node.querySelector('[data-action="cancel-storage-shutdown"]');
+  if (stop) { stop.disabled = !!r.cancelRequested; stop.textContent = r.cancelRequested ? '중지 중…' : '대기 중지'; }
+}
+function storageShutdownStatus(inSettings = false) {
+  const job = storageShutdownJob();
+  const warning = activeLaneJob('local')?.kind === 'duplicate-cleanup' ? '<p class="small muted">중복 정리에서 원격 사본을 검증 중이면 OMV 종료가 차단됩니다.</p>' : '';
+  return warning + (job ? `<div class="wake-status"><p><strong>${isJobActive(job) ? '진행 중인 종료 작업' : `최근 종료 작업 · ${escapeHtml(catalogTime(job.createdAt))}`}</strong></p><p>${escapeHtml(jobMessage(job))}</p>${shutdownFacts(job)}${inSettings ? '<a href="#archive">아카이브에서 상태 확인</a>' : ''}</div>` : '');
+}
+function confirmStorageShutdown() {
+  if (view.shutdownStarting || remoteBusy() || !view.settings?.storageShutdown?.available) return;
+  showDialog('OMV 서버를 끄시겠습니까?', `<p>Home Assistant 종료 스크립트를 실행해 OMV 서버 전원을 끕니다. 실행 후에는 되돌릴 수 없습니다.</p>
+    <p>현재 열려 있는 아카이브 연결이 끊기며, 진행 중인 파일 다운로드가 있으면 중단될 수 있습니다.</p>
+    ${view.archiveBusy ? '<p class="form-error">현재 아카이브 목록을 불러오는 중입니다. 잠시 후 종료하는 것을 권장합니다.</p>' : ''}
+    <p>종료가 시작된 뒤 '대기 중지'를 눌러도 이미 전달된 종료 요청은 취소되지 않으며 상태 확인만 중단됩니다.</p>`, 'OMV 끄기', startStorageShutdown, { danger: true });
+}
+function applyShutdownJob(job) {
+  state.latestStorageShutdown = job;
+  if (isJobActive(job)) setOptimisticJob(job);
+  else if (job) {
+    if (['powered_off', 'already_off', 'ssh_stopped_ha_unconfirmed'].includes(job.result?.outcome)) {
+      resetArchiveConnection(); view.sourceSelection.clear();
+    }
+    requestStorageStatus(true, { force: true });
+  }
+}
+async function reconcileShutdownRequest() {
+  if (!view.shutdownPending || view.shutdownLookupBusy || view.shutdownStarting) return;
+  view.shutdownLookupBusy = true;
+  const pending = view.shutdownPending;
+  try {
+    const result = await api(`storage/shutdown?request_id=${encodeURIComponent(pending.requestId)}`);
+    if (view.shutdownPending !== pending) return;
+    if (result.job) { applyShutdownJob(result.job); saveShutdownPending(null); view.shutdownUncertain = false; view.shutdownError = ''; }
+    else view.shutdownUncertain = true;
+  } catch { view.shutdownUncertain = true; }
+  finally { view.shutdownLookupBusy = false; }
+}
+async function startStorageShutdown() {
+  if (view.shutdownStarting || remoteBusy()) return;
+  view.shutdownStarting = true; view.shutdownError = ''; view.wakeError = ''; patchStorageStatus();
+  try {
+    const settings = await api('settings'); adoptWakeSettings(settings);
+    if (!settings.storageShutdown?.available) throw new Error(settings.storageShutdown?.message || 'Home Assistant 종료 설정이 필요합니다.');
+    const pending = view.shutdownPending || { requestId: wakeRequestId(), targetRevision: settings.storageShutdown.targetRevision };
+    saveShutdownPending(pending);
+    let response;
+    try { response = await api('storage/shutdown', 'POST', pending); }
+    catch (error) {
+      if (error.status && error.status < 500) { saveShutdownPending(null); throw error; }
+      view.shutdownUncertain = true; return;
+    }
+    applyShutdownJob(response.job); saveShutdownPending(null); view.shutdownUncertain = false;
+  } catch (error) {
+    view.shutdownError = ({ remote_cleanup_busy: '원격 사본을 검증하는 중복 정리가 진행 중입니다. 완료 후 다시 시도하세요.', remote_busy: '원격 작업이 진행 중일 때는 OMV를 끌 수 없습니다.', target_changed: '설정이 변경되었습니다. 상태를 확인한 뒤 다시 시도하세요.' })[error.message] || error.message;
+  } finally {
+    view.shutdownStarting = false; await reconcileShutdownRequest(); await syncState(); render();
+  }
+}
+async function cancelStorageShutdown(value) {
+  const jobId = Number(value);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0) return;
+  const result = await api(`storage/shutdown/${jobId}/cancel`, 'POST');
+  applyShutdownJob(result.job); await syncState();
+}
 function storageWakeButton() {
   const job = storageWakeJob();
   if (isJobActive(job)) return button('cancel-storage-wake', job.result?.cancelRequested ? '중지 중…' : '대기 중지',
@@ -1913,6 +2055,7 @@ function storageWakeButton() {
 }
 function archiveStorageActions() {
   return `${isJobActive(storageWakeJob()) ? '' : storageWakeButton()}
+    ${isJobActive(storageShutdownJob()) ? '' : storageShutdownButton()}
     ${view.archive ? button('open-remote-index', '원격 인덱싱', { glyph: 'search', disabled: remoteBusy() || view.archiveBusy }) : ''}
     ${button('connect-archive', view.archiveBusy ? '조회 중…' : view.archiveError ? '다시 연결' : view.archive ? '새로 고침' : '아카이브 연결',
       { glyph: 'refresh', primary: !view.archive && storageCurrent().status !== 'no_response', disabled: view.archiveBusy })}`;
@@ -1960,6 +2103,8 @@ function storageLabel(value = storageCurrent()) {
 }
 function deriveStorageViewModel() {
   const snapshot = storageCurrent(), job = storageWakeJob();
+  const shutdown = storageShutdownJob();
+  if (isJobActive(shutdown)) return { tone: 'shutting_down', label: shutdown.result?.phaseCode === 'waiting_power_off' ? '전원 차단 확인 중' : '끄는 중' };
   if (isJobActive(job)) return { tone: 'waking', label: job.result?.phaseCode === 'waiting_mount' ? '마운트 대기 중' :
     job.result?.phaseCode === 'checking_archive' && job.result?.serverState && job.result.serverState !== 'unknown' ? '아카이브 확인 중' : '켜는 중' };
   if (view.archive !== null) return { tone: 'connected', label: '연결됨' };
@@ -1984,9 +2129,25 @@ function storageWakeActivity() {
     ${view.wakePending && (!job || view.wakeUncertain) ? '<p class="small muted">요청 결과 확인 중 · 자동 재전송 없음</p>' : ''}
     ${view.wakeError ? `<p class="form-error" role="alert">${escapeHtml(view.wakeError)}</p>` : ''}</section>`;
 }
-function patchWakeActivity() {
+function patchStoragePowerActivity() {
   const node = page.querySelector('#archive-wake-banner');
   if (!node) return;
+  const shutdown = storageShutdownJob(), wake = storageWakeJob();
+  if (isJobActive(shutdown)) {
+    patchShutdownActivity(node);
+    return;
+  }
+  if (!isJobActive(wake)) {
+    if (view.shutdownError || view.shutdownPending) {
+      patchShutdownActivity(node);
+      return;
+    }
+    if (shutdown && shutdown.id > (wake?.id || 0) && !view.wakeError && !view.wakePending) {
+      if (jobHasAttention(shutdown)) patchShutdownActivity(node);
+      else { setSlotHtml(node, ''); node.dataset.wakeIdentity = ''; }
+      return;
+    }
+  }
   const job = storageWakeJob(), active = isJobActive(job), r = job?.result || {};
   const identity = JSON.stringify([job?.id, active, r.outcome, view.wakeError, !!view.wakePending, view.wakeUncertain]);
   if (node.dataset.wakeIdentity !== identity) {
@@ -2020,11 +2181,11 @@ function patchStorageStatus() {
   if (detail) detail.hidden = !storageMonitor.open;
   const summary = document.querySelector?.('#storage-summary');
   summary?.setAttribute('aria-label', `OMV 상태: ${label}. 자세히 보기`);
-  patchWakeActivity();
+  patchStoragePowerActivity();
   setSlotHtml(page.querySelector('.archive-actions'), archiveStorageActions());
   if (view.archive === null) setSlotHtml(page.querySelector('#archive-destination-content'), archiveDestination());
-  setSlotHtml(page.querySelector('[data-storage-history]'), storageWakeStatus(view.page === 'settings'));
-  setSlotHtml(page.querySelector('[data-storage-settings-actions]'), isJobActive(storageWakeJob()) ? '' : storageWakeButton());
+  setSlotHtml(page.querySelector('[data-storage-history]'), storageWakeStatus(view.page === 'settings') + storageShutdownStatus(view.page === 'settings'));
+  setSlotHtml(page.querySelector('[data-storage-settings-actions]'), storageSettingsActions());
   page.querySelectorAll('[data-retention-banner]').forEach(node => setSlotHtml(node, retentionBanner(node.dataset.retentionBanner)));
   page.querySelectorAll('[data-action="offload-source"], [data-action="offload-latest-upload"]').forEach(node => {
     node.disabled = !isOmvReadyForOffload() || remoteBusy() || (node.dataset.action === 'offload-source' && !sourceOffloadFiles().length);
@@ -2217,7 +2378,7 @@ async function reconcileWakeRequest() {
 }
 async function startStorageWake() {
   if (view.wakeStarting || remoteBusy()) return;
-  view.wakeStarting = true; view.wakeError = ''; render();
+  view.wakeStarting = true; view.wakeError = ''; view.shutdownError = ''; render();
   try {
     const settings = await api('settings');
     adoptWakeSettings(settings);
@@ -2260,6 +2421,7 @@ async function flushWakeArchiveRefresh() {
 }
 async function reconcileWakeArchive({ fresh = false } = {}) {
   const job = state.latestStorageWake;
+  if (state.latestStorageShutdown && state.latestStorageShutdown.id > (job?.id || 0)) return;
   if (!job || isJobActive(job) || job.result?.archiveState !== 'ready' || job.result?.outcome !== 'archive_ready') return;
   const key = wakeRefreshIdentity(job);
   if (wakeRefreshDone.has(`${key}:${archiveConnectionVersion}`) || wakeRefreshChecking) return;
@@ -2751,6 +2913,7 @@ async function loadCatalog({ soft = false } = {}) {
 }
 
 function historyResultDetails(job) {
+  if (job.kind === 'storage-shutdown') return shutdownFacts(job);
   if (job.kind === 'storage-wake') return wakeFacts(job);
   const result = job.result || {}, meta = job.resultMeta || {};
   const list = (name, title) => {
@@ -2772,6 +2935,7 @@ function resultBanner(job, title, followup = '') {
 function jobHistoryKey(job) { return `${job.source === 'device' ? 'device' : 'server'}:${jobDismissKey(job)}`; }
 function mergedJobEntries() {
   const entries = new Map(view.jobs.items.map(job => [job.id, job]));
+  if (state.latestStorageShutdown) entries.set(state.latestStorageShutdown.id, state.latestStorageShutdown);
   if (state.latestStorageWake) entries.set(state.latestStorageWake.id, state.latestStorageWake);
   for (const lane of lanes) {
     const latest = laneJob(lane);
@@ -2836,9 +3000,10 @@ function mountJobsPage() {
 function jobHistoryActions(job) {
   const result = job.result || {};
   if (isJobActive(job)) {
-    const cancel = { 'storage-wake': 'cancel-storage-wake', upload: 'cancel-archive-upload', offload: 'cancel-offload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
-    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? job.kind === 'offload' ? '중지 요청됨' : '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
+    const cancel = { 'storage-shutdown': 'cancel-storage-shutdown', 'storage-wake': 'cancel-storage-wake', upload: 'cancel-archive-upload', offload: 'cancel-offload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
+    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? job.kind === 'offload' ? '중지 요청됨' : '중지 중…' : ['storage-wake', 'storage-shutdown'].includes(job.kind) ? '대기 중지' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
   }
+  if (job.kind === 'storage-shutdown') return '<a class="button" href="#archive">아카이브에서 상태 확인</a>';
   if (job.kind === 'upload') return button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` });
   if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
   if (job.kind === 'offload') return button('open-events', '이벤트 분류 열기');
@@ -2847,14 +3012,14 @@ function jobHistoryActions(job) {
   return '';
 }
 function patchJobCard(node, job) {
-  const kinds = { "storage-wake": "OMV 시작 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
   const statuses = { queued: '대기 중', running: '진행 중', done: '완료', failed: '실패', cancelled: '중지됨' };
   const result = job.result || {}, active = isJobActive(job), key = jobHistoryKey(job);
   setSlotHtml(node.querySelector('[data-slot="head"]'), `<div><strong>${escapeHtml(kinds[job.kind] || job.kind)}</strong> ${badge(active ? 'draft' : jobHasAttention(job) ? 'review' : 'ready', statuses[job.status] || job.status)}${job.source === 'device' ? '<span class="job-source-tag">이 브라우저 기록</span>' : `<span class="small muted">#${job.id}</span>`}</div><time class="small muted">${catalogTime(job.createdAt)}</time>`);
   const completed = result.completedFiles ?? result.processedFiles ?? 0;
   const percent = result.totalBytes ? Math.min(100, Math.round((result.transferredBytes || 0) / result.totalBytes * 100)) : Math.min(100, Math.round(completed / (result.totalFiles || 1) * 100));
   const message = active ? result.phase || '작업 진행 중' : job.kind === 'device-upload' ? `업로드 ${result.uploaded || 0}개 · 실패 ${result.failed || 0}개 · 확인 필요 ${result.review || 0}개` : jobMessage(job) || '작업 종료';
-  setSlotHtml(node.querySelector('[data-slot="body"]'), job.kind === 'storage-wake'
+  setSlotHtml(node.querySelector('[data-slot="body"]'), ['storage-wake', 'storage-shutdown'].includes(job.kind)
     ? `<p role="status">${escapeHtml(message)}</p>${active ? `<p class="small muted">${wakeElapsed(job)}</p>` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`
     : `<p>${escapeHtml(message)}</p>${active ? `<p class="small muted">${completed} / ${result.totalFiles || 0}개${result.totalBytes ? ` · ${deviceUploadBytes(result.transferredBytes || 0)} / ${deviceUploadBytes(result.totalBytes)}` : ''}</p><progress max="100" value="${percent}" aria-label="${escapeHtml(kinds[job.kind] || job.kind)} 진행률"></progress>${result.current ? `<p class="small job-current">${escapeHtml(result.current)}</p>` : ''}` : ''}<div class="job-actions">${jobHistoryActions(job)}</div>`);
   const detailSlot = node.querySelector('[data-slot="details"]'), previous = detailSlot.querySelector('details');
@@ -3005,9 +3170,9 @@ function settingsPage() {
     </section>
     <section class="surface settings-section" aria-label="스토리지 연결">
       <div class="surface-head"><h2>${icon('disk')} 스토리지 연결</h2></div>
-      <div class="storage-settings-card"><div class="storage-detail-head"><strong>OMV <span class="storage-pill" data-storage-label></span></strong><div>${button('refresh-storage-status', '상태 확인')} <span data-storage-settings-actions>${isJobActive(storageWakeJob()) ? '' : storageWakeButton()}</span></div></div>
+      <div class="storage-settings-card"><div class="storage-detail-head"><strong>OMV <span class="storage-pill" data-storage-label></span></strong><div>${button('refresh-storage-status', '상태 확인')} <span data-storage-settings-actions>${storageSettingsActions()}</span></div></div>
         <p class="small muted">Home Assistant로 서버를 켜고 SSH / SFTP로 아카이브 연결을 확인합니다. 파일 업로드는 연결 후 시작하세요.</p>
-        <div id="archive-wake-banner">${storageWakeActivity()}</div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(true)}</div></div>
+        <div id="archive-wake-banner">${storageWakeActivity()}</div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(true) + storageShutdownStatus(true)}</div></div>
       ${settingRow('스토리지 IP 주소', '연결할 스토리지의 IPv4 또는 IPv6 주소',
         visibleSetting(settings?.address) +
         button('edit-storage-address', settings?.addressConfigured ? 'IP 변경' : 'IP 등록', { disabled: !settings || view.sshTestBusy }))}
@@ -3257,6 +3422,8 @@ function clearCatalogViews() {
   storePreference('photo-saver-upload-offload-after', '0');
   view.retentionDraftMode = null; view.retentionDraftDays = ''; view.retentionError = ''; view.missingXmpMediaIds = [];
   saveWakePending(null); view.wakeUncertain = false; view.wakeError = '';
+  saveShutdownPending(null); view.shutdownStarting = false; view.shutdownUncertain = false; view.shutdownError = '';
+  state.latestStorageShutdown = null;
   state.latestStorageWake = null; wakeRefreshPending = null; wakeRefreshDone.clear();
   view.thumbnailStats = null; view.thumbnailStatsError = ''; view.thumbnailGeneratingShas.clear();
   cancelCatalogSearchDebounce(); clearDismissedResults(); clearDeviceUploadHistory();
@@ -3575,7 +3742,7 @@ function storageStructureKey() {
     state.managed, state.events, state.incoming, state.pendingXmp, state.retention, state.latestUploadOffload,
     view.sourceFilter, view.uploadOffloadAfter, view.missingXmpMediaIds, view.retentionBusy, view.retentionError,
     view.retentionDraftMode, view.retentionDraftDays, isOmvReadyForOffload(),
-    lanes.map(lane => { const job = laneJob(lane); return job?.kind === 'storage-wake' ? null : job; })]);
+    lanes.map(lane => { const job = laneJob(lane); return ['storage-wake', 'storage-shutdown'].includes(job?.kind) ? null : job; })]);
 }
 function render() {
   const windowScroll = window.scrollY || 0;
@@ -4519,6 +4686,8 @@ const actions = {
     await syncState();
   },
   'open-remote-index': openRemoteIndexDialog,
+  'confirm-storage-shutdown': confirmStorageShutdown,
+  'cancel-storage-shutdown': cancelStorageShutdown,
   'start-storage-wake': startStorageWake,
   async 'cancel-storage-wake'(value) {
     const jobId = Number(value);
@@ -4953,6 +5122,7 @@ function loadRoute() {
   if (recordBrowserVisible()) loadCatalog();
   if (view.page === 'jobs' && view.jobsTab === 'list') loadJobs({ reset: true });
   if (view.page === 'archive') {
+    if (view.shutdownPending) reconcileShutdownRequest().then(() => { if (view.page === 'archive') render(); });
     if (view.wakePending || state.latestStorageWake?.result?.archiveState === 'ready') {
       reconcileWakeRequest().then(() => reconcileWakeArchive({ fresh: true })).then(() => maybeAutoConnectArchive()).then(() => {
         if (view.page === 'archive') render();

@@ -1,5 +1,13 @@
 # 시스템 구조
 
+## OMV 종료 제어
+
+[storage_shutdown.py](../backend/storage_shutdown.py)는 wake의 bounded DB/settings 잠금, 기본 HA 설정, 격리 I/O와 control budget을 재사용한다. API 접수는 로컬 스냅샷과 SQLite만 사용하고 202로 공개 작업을 반환한다. 워커는 remote 레인에서 실행하며 network helper의 `ssh_banner/get/post`만 사용한다. [storage_status.py](../backend/storage_status.py)와 [storage_wake_io.py](../backend/storage_wake_io.py)는 변경하지 않아 상태 캐시의 DB·작업·제어 설정 독립성을 유지한다.
+
+POST 직전 intent commit으로 작업당 최대 1회 전송을 보장하고, 크래시 후 intent는 unknown으로 관찰한다. SSH 응답 중단과 fresh HA off를 함께 확인하며 주소 미설정일 때만 HA 단독 검증한다. 초기 HA on·SSH 미응답 또는 실행 상태 미확인은 15초 유예 후 POST 없이 종료한다. 2초 폴링(일시 HA 오류 시 3초·4초 cap) 중 0.25초마다 취소·기한·워커 종료·대상 변경을 감시한다. 원격 keeper 중복 정리는 admission과 intent commit에 재검사하며 반대 방향 큐 등록도 차단한다.
+
+프론트엔드는 기존 `#archive-wake-banner` 슬롯에 세 단계 종료 스테퍼를 표시하고 페이지 전체를 다시 만들지 않고 패치한다. 종료 성공·부분 확인은 아카이브 연결 세대를 갱신해 이전 진행 중 조회 결과도 무효화한다. sessionStorage의 `photoSaver.storageShutdownPending`은 응답 유실 복구를 위한 UUID 바인딩이며 자동 POST를 하지 않는다. 작업 초기화 시 함께 삭제한다.
+
 ## 선택적 OMV 시작 경로
 
 `storage_wake.py`가 설정 snapshot/불투명 revision, SQLite admission·UUID 별칭·취소, 단일 시도 ledger와 워커 상태 기계를 담당한다. API는 설정 공유 잠금을 해제한 뒤 DB admission을 수행하고 네트워크를 호출하지 않는다. worker는 기존 remote 슬롯에서만 실행하며 기존 local 슬롯과 병행한다. 모든 설정/DB/catalog 잠금 획득은 비차단 재시도와 짧은 control tick으로 제한한다. 설정·취소·shutdown·원래 deadline을 반복 확인하고 네트워크 중 DB 트랜잭션을 유지하지 않는다.

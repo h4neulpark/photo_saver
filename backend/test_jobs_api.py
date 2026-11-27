@@ -51,6 +51,17 @@ class JobsApiTests(unittest.TestCase):
     def test_empty_summary_and_cursor(self):
         self.assertEqual(self.query(), {'jobs': [], 'summary': {'total': 0, 'active': 0, 'attention': 0, 'done': 0}, 'nextBeforeId': None, 'hasMore': False})
 
+    def test_shutdown_kind_and_attention(self):
+        self.add('storage-wake', 'remote')
+        complete = self.add('storage-shutdown', 'remote', result={'outcome': 'powered_off', 'review': 0})
+        review = self.add('storage-shutdown', 'remote', result={'outcome': 'ssh_stopped_ha_unconfirmed', 'review': 1})
+        failed = self.add('storage-shutdown', 'remote', 'failed')
+        cancelled = self.add('storage-shutdown', 'remote', 'cancelled')
+        self.assertEqual([j['id'] for j in self.query(kind='storage-shutdown')['jobs']], [cancelled, failed, review, complete])
+        attention = self.query(kind='storage-shutdown', status='attention')['jobs']
+        self.assertEqual([j['id'] for j in attention], [cancelled, failed, review])
+        self.assertTrue(all(j['hasAttention'] for j in attention))
+
     def test_thumbnail_kind_filters_and_incoming_result_isolation(self):
         original = self.add('move', result={'moved': 1})
         for kind, lane in [('thumbnails-local', 'local'), ('thumbnails-remote', 'remote')]:

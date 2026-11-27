@@ -23,6 +23,17 @@ from catalog import now, queue_job
 _control_budget = ContextVar('wake_control_budget', default=None)
 
 
+@contextmanager
+def control_budget(stop_event, deadline, job_id):
+    """Share bounded lock acquisition with other storage power operations."""
+    token = _control_budget.set((stop_event, deadline,
+                                 time.monotonic() + max(0, deadline - time.time()), job_id))
+    try:
+        yield
+    finally:
+        _control_budget.reset(token)
+
+
 def lock_tick(deadline):
     budget = _control_budget.get()
     if budget:

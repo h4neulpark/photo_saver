@@ -97,6 +97,9 @@ def plan_duplicate_cleanup(db, ids):
 
 
 def queue_duplicate_cleanup(db, items):
+    from catalog import has_active_storage_shutdown
+    if any(item['keeperKind'] == 'remote' for item in items) and has_active_storage_shutdown(db):
+        fail(409, 'storage_shutdown_active')
     chosen = {}
     for item in items:
         file_id, kind, keeper_id = item["id"], item["keeperKind"], item["keeperId"]

@@ -6,4 +6,4 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY storage_status.py storage_wake.py storage_wake_io.py resets.py devices.py catalog.py media.py companions.py settings.py archive.py transfers.py offload.py remote_index.py incoming_cleanup.py uploads.py records.py thumbnails.py api.py worker.py ./
+COPY storage_shutdown.py storage_status.py storage_wake.py storage_wake_io.py resets.py devices.py catalog.py media.py companions.py settings.py archive.py transfers.py offload.py remote_index.py incoming_cleanup.py uploads.py records.py thumbnails.py api.py worker.py ./

@@ -1,5 +1,13 @@
 # 데이터 모델
 
+## OMV 종료 작업
+
+`storage-shutdown`은 기존 jobs의 remote 레인을 사용한다. 신규 테이블은 없다. payload는 `requestId`, `aliases`(최대 128개), `requestedAt/deadlineAt/timeoutSeconds`, `targetRevision/configRevision/storageRevision`, `sshConfiguredAtAdmission`, `attempt:{state,count,intentAt,receiptAt}`를 보존한다. count는 0/1이고 `not_started → intent → accepted|rejected|unknown`이며 관찰만 하는 `not_needed|observing_existing`도 가능하다. 크래시로 intent가 남으면 unknown으로 복구하고 재전송하지 않는다.
+
+storageRevision은 `digest({address})`, configRevision은 `digest({url,sensor,script,timeout,storage:storageRevision})`, targetRevision은 `digest({kind:'storage-shutdown',config:configRevision})`다. 토큰은 어떤 리비전에도 포함하지 않는다. deadline은 재시작·별칭 합류로 연장하지 않는다. 공개 result의 `everSshStoppedAfterAttempt`는 accepted/unknown/observing_existing 이후 SSH 중단을 래치해 타임아웃의 부분 확인을 구별하며 `review=1`은 attention 이력에 포함된다.
+
+local 레인의 duplicate-cleanup payload.files[].keeper.kind에 remote가 있으면 종료 접수 및 전송 직전 모두 충돌을 검사한다. 반대 방향의 큐 등록도 동일 write transaction에서 활성 종료를 차단한다. 순수 로컬 keeper 정리는 병행할 수 있다. 초기화·복원 이후 과거 UUID 보존 규칙은 wake와 동일하다.
+
 ## OMV 시작 작업 추가
 
 `storage-wake`는 기존 `jobs`의 `remote` 레인을 사용한다. 테이블이나 일반 대기열을 추가하지 않는다. 같은 UUID와 진행 중 동일 설정의 별칭은 하나의 작업 ID에 원자적으로 결합하고 다른 remote/exclusive 작업과 충돌한다. 로컬 scan은 병행 가능하다.

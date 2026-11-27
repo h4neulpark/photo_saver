@@ -6,6 +6,7 @@ import os
 import signal
 import threading
 from storage_wake import run_storage_wake
+from storage_shutdown import run_storage_shutdown
 import time
 from collections import defaultdict
 from functools import partial
@@ -725,6 +726,7 @@ class WorkerCoordinator:
         self.stop_event = threading.Event()
         self.handlers = handlers if handlers is not None else {
             "storage-wake": partial(run_storage_wake, stop_event=self.stop_event),
+            "storage-shutdown": partial(run_storage_shutdown, stop_event=self.stop_event),
             "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
             "duplicate-cleanup": partial(cleanup_duplicates, refresh_group=refresh_deleted_group),
             "xmp-link": link_xmp_selection, "upload": upload_selection,

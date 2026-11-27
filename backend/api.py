@@ -8,6 +8,7 @@ import unicodedata
 import uploads
 import thumbnails
 import storage_wake
+import storage_shutdown
 import storage_status
 import offload
 from contextlib import ExitStack, asynccontextmanager
@@ -84,6 +85,23 @@ def cancel_storage_wake(job_id: int):
     return JSONResponse({'job': view_job(storage_wake.cancel(job_id))}, headers=NO_STORE)
 
 
+@app.post('/api/storage/shutdown', status_code=202)
+def start_storage_shutdown(request: storage_shutdown.ShutdownRequest):
+    return JSONResponse({'job': view_job(storage_shutdown.admit(request))}, status_code=202, headers=NO_STORE)
+
+
+@app.get('/api/storage/shutdown')
+def get_storage_shutdown(request_id: storage_shutdown.UUID | None = None):
+    with storage_shutdown.database() as db:
+        row = storage_shutdown.get_job_by_request_id(db, request_id) if request_id is not None else storage_shutdown.latest_job(db)
+        return JSONResponse({'job': view_job(row)}, headers=NO_STORE)
+
+
+@app.post('/api/storage/shutdown/{job_id}/cancel')
+def cancel_storage_shutdown(job_id: int):
+    return JSONResponse({'job': view_job(storage_shutdown.cancel(job_id))}, headers=NO_STORE)
+
+
 @app.exception_handler(RemoteDuplicateError)
 async def handle_remote_duplicate(_request, exc):
     return JSONResponse(
@@ -108,12 +126,14 @@ def reset_in_progress():
 
 @app.middleware("http")
 async def guard_reset(request, call_next):
-    if request.method not in {"GET", "HEAD", "OPTIONS"} and await run_in_threadpool(reset_in_progress):
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not request.url.path.startswith('/api/storage/shutdown') and await run_in_threadpool(reset_in_progress):
         response = JSONResponse({"detail": "데이터 초기화 중입니다. 완료 후 다시 시도하세요."}, status_code=409)
     else:
         response = await call_next(request)
     if request.url.path.startswith("/api/incoming/uploads"):
         response.headers.update(uploads.UPLOAD_HEADERS)
+    if request.url.path.startswith('/api/storage/shutdown'):
+        response.headers.update(NO_STORE)
     return response
 
 
@@ -471,7 +491,7 @@ def job_history(
     before_id: int | None = Query(default=None, ge=1),
     lane: Literal["all", "local", "remote", "exclusive"] = "all",
     status: Literal["all", "active", "attention", "done", "failed", "cancelled"] = "all",
-    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote", "storage-wake"] = "all",
+    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote", "storage-wake", "storage-shutdown"] = "all",
 ):
     clauses, params = [], []
     if before_id is not None:
@@ -831,6 +851,7 @@ def state():
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
             "latestIncomingResult": view_job(latest_incoming_result),
             "latestStorageWake": view_job(storage_wake.latest(db)),
+            "latestStorageShutdown": view_job(storage_shutdown.latest_job(db)),
             "job": view_job(compat_job),
             "jobs": {lane: view_job(row) for lane, row in jobs.items()},
             "activeJobs": {lane: view_job(row) for lane, row in active.items()},

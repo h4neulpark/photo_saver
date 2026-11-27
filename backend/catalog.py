@@ -18,7 +18,7 @@ JOB_LANES = {
     "scan": LANE_LOCAL, "move": LANE_LOCAL, "delete": LANE_LOCAL, "xmp-link": LANE_LOCAL,
     "duplicate-cleanup": LANE_LOCAL, "thumbnails-local": LANE_LOCAL,
     "upload": LANE_REMOTE, "offload": LANE_REMOTE, "remote-index": LANE_REMOTE,
-    "storage-wake": LANE_REMOTE, "thumbnails-remote": LANE_REMOTE, "reset-all": LANE_EXCLUSIVE,
+    "storage-wake": LANE_REMOTE, "storage-shutdown": LANE_REMOTE, "thumbnails-remote": LANE_REMOTE, "reset-all": LANE_EXCLUSIVE,
 }
 
 
@@ -377,6 +377,21 @@ def has_active_jobs(connection, lanes=None):
     return connection.execute(
         f"SELECT 1 FROM jobs WHERE status IN ('queued','running') AND lane IN ({placeholders}) LIMIT 1", lanes,
     ).fetchone() is not None
+
+
+def has_active_storage_shutdown(connection):
+    return connection.execute("SELECT 1 FROM jobs WHERE kind='storage-shutdown' AND status IN ('queued','running') LIMIT 1").fetchone() is not None
+
+
+def has_active_remote_duplicate_cleanup(connection):
+    for row in connection.execute("SELECT payload FROM jobs WHERE kind='duplicate-cleanup' AND status IN ('queued','running')"):
+        try:
+            if any(item['keeper']['kind'] == 'remote' for item in json.loads(row['payload'])['files']):
+                return True
+        except (ValueError, TypeError, KeyError):
+            # A damaged active cleanup cannot be proven to be local-only.
+            return True
+    return False
 
 
 def active_offload_media_ids(connection):
