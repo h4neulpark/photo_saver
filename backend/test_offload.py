@@ -77,6 +77,100 @@ class OffloadAndArchiveModelTests(unittest.TestCase):
             record = db.execute("SELECT * FROM jobs WHERE id=?", (queued["id"],)).fetchone()
         return record["status"], json.loads(record["result"])
 
+    def prepare_offload(self):
+        self.upload_all()
+        queued = api.offload_files(offload.OffloadRequest(ids=['one']))
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE jobs SET status='running' WHERE id=?", (queued['id'],))
+            return dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+
+    def test_cancel_queued_running_terminal_and_not_found(self):
+        self.upload_all()
+        job = api.offload_files(offload.OffloadRequest(ids=['one']))
+        with catalog.database(write=True) as db:
+            cancelled = dict(offload.cancel_offload_job(db, job['id']))
+            self.assertEqual(cancelled['status'], 'cancelled')
+            self.assertEqual(dict(offload.cancel_offload_job(db, job['id'])), cancelled)
+            with self.assertRaises(HTTPException) as error:
+                offload.cancel_offload_job(db, 999999)
+            self.assertEqual(error.exception.status_code, 404)
+            for status in ('done', 'failed'):
+                db.execute('UPDATE jobs SET status=? WHERE id=?', (status, job['id']))
+                before = dict(db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone())
+                self.assertEqual(dict(offload.cancel_offload_job(db, job['id'])), before)
+        job = self.prepare_offload()
+        with catalog.database(write=True) as db:
+            row = offload.cancel_offload_job(db, job['id'])
+            self.assertEqual((row['status'], json.loads(row['result'])['phase']), ('running', '중지 요청됨'))
+        offload.offload_selection(job, None, self.fixture.managed)
+        with catalog.database() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone()
+        self.assertEqual((row['status'], json.loads(row['result'])['completedFiles']), ('cancelled', 0))
+        self.assertTrue((self.fixture.managed / 'one/clip.MP4').exists())
+
+    def test_cancel_crash_rolls_back_existing_and_finishes_partial_deletion(self):
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                job = self.prepare_offload()
+                with catalog.database(write=True) as db:
+                    db.execute("UPDATE media SET status='offloading' WHERE id='one'")
+                    offload.cancel_offload_job(db, job['id'])
+                if deleted:
+                    (self.fixture.managed / 'one/clip.MP4').unlink()
+                offload.offload_selection(job, None, self.fixture.managed)
+                with catalog.database() as db:
+                    status = db.execute("SELECT status FROM media WHERE id='one'").fetchone()[0]
+                    result = db.execute('SELECT status,result FROM jobs WHERE id=?', (job['id'],)).fetchone()
+                self.assertEqual(result['status'], 'cancelled')
+                self.assertEqual(status, 'archived' if deleted else 'available')
+
+    def test_cancel_boundary_and_keeper_recheck_preserve_original(self):
+        job = self.prepare_offload()
+        item = json.loads(job['payload'])['files'][0]
+        def cancel():
+            raise offload.OffloadCancelled()
+        with self.assertRaises(offload.OffloadCancelled):
+            offload.offload_file(self.fixture.sftp, self.fixture.config, self.fixture.managed, item, cancel_check=cancel)
+        with catalog.database(write=True) as db:
+            catalog.queue_job(db, 'duplicate-cleanup', {'files': [{'keeper': {'kind': 'managed', 'id': 'one'}}]})
+        with self.assertRaises(HTTPException) as error:
+            offload.offload_file(self.fixture.sftp, self.fixture.config, self.fixture.managed, item)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertTrue((self.fixture.managed / item['local']).exists())
+
+    def test_cancel_after_atomic_boundary_finishes_file(self):
+        job = self.prepare_offload()
+        original_delete = offload.delete_verified_file
+        def cancel_during_delete(*args):
+            with catalog.database(write=True) as db:
+                offload.cancel_offload_job(db, job['id'])
+            return original_delete(*args)
+        with patch.object(offload, 'delete_verified_file', side_effect=cancel_during_delete):
+            offload.offload_selection(job, None, self.fixture.managed)
+        with catalog.database() as db:
+            self.assertEqual(db.execute("SELECT status FROM media WHERE id='one'").fetchone()[0], 'archived')
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone()
+        self.assertEqual((row['status'], json.loads(row['result'])['offloaded']), ('cancelled', 1))
+
+    def test_cancel_recovery_counts_previously_archived_files(self):
+        self.fixture.add_file('two', 'second.MP4', b'second video')
+        self.upload_all([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}, {'id': 'two'}])
+        queued = api.offload_files(offload.OffloadRequest(ids=['one', 'two']))
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE jobs SET status='running' WHERE id=?", (queued['id'],))
+            job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone())
+        first = json.loads(job['payload'])['files'][0]
+        offload.offload_file(self.fixture.sftp, self.fixture.config, self.fixture.managed, first)
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE media SET status='offloading' WHERE id='two'")
+            offload.cancel_offload_job(db, queued['id'])
+        offload.offload_selection(job, None, self.fixture.managed)
+        with catalog.database() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (queued['id'],)).fetchone()
+            self.assertEqual(db.execute("SELECT status FROM media WHERE id='two'").fetchone()[0], 'available')
+        result = json.loads(row['result'])
+        self.assertEqual((row['status'], result['offloaded'], result['completedFiles'], result['failed']), ('cancelled', 1, 1, 0))
+
     def test_stable_storage_id_persists_across_ip_and_key_changes(self):
         (self.settings_dir / "storage-id").unlink()
         first = settings.ensure_storage_id()

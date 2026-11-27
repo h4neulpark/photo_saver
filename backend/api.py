@@ -9,6 +9,7 @@ import uploads
 import thumbnails
 import storage_wake
 import storage_status
+import offload
 from contextlib import ExitStack, asynccontextmanager
 from datetime import date, datetime, timezone
 from io import BytesIO
@@ -26,9 +27,9 @@ from starlette.datastructures import Headers, MutableHeaders
 
 from catalog import LANE_LOCAL, active_jobs_by_lane, latest_jobs_by_lane, active_offload_media_ids, DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
 from media import VIDEOS, capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
-from settings import NO_STORE, ensure_storage_id, router as settings_router
+from settings import NO_STORE, ensure_storage_id, read_local_retention, router as settings_router
 from archive import active_storage_scope, router as archive_router
-from transfers import RemoteDuplicateError, TransferRequest, queue_transfer
+from transfers import MissingXmpOffloadError, RemoteDuplicateError, TransferRequest, queue_transfer
 from offload import OffloadRequest, queue_offload
 from remote_index import RemoteIndexRequest, queue_remote_index
 from incoming_cleanup import plan_duplicate_cleanup, queue_duplicate_cleanup
@@ -92,6 +93,12 @@ async def handle_remote_duplicate(_request, exc):
         },
         status_code=exc.status_code,
     )
+
+
+@app.exception_handler(MissingXmpOffloadError)
+async def handle_missing_xmp_offload(_request, exc):
+    return JSONResponse({"detail": exc.detail, "code": "missing_xmp_for_offload",
+                         "missingXmpMediaIds": exc.missing_xmp_media_ids}, status_code=409, headers=NO_STORE)
 
 
 def reset_in_progress():
@@ -286,7 +293,7 @@ def managed_media_type(path, kind):
     return None
 
 
-def view_media(row, periods, names=None, remote_index=None, active_scope=(None, None)):
+def view_media(row, periods, names=None, remote_index=None, active_scope=(None, None), policy=None, now_dt=None):
     device = effective_device(row, names or {})
     metadata = json.loads(row["metadata"])
     xmp = json.loads(row["xmp_metadata"] or "{}")
@@ -303,6 +310,7 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
     active_copies.sort(key=lambda item: (item["storage_id"] != active_storage_id,))
     xmp_copies = remote_index.get(row["xmp_sha"], []) if row["xmp_sha"] else []
     xmp_active = [item for item in xmp_copies if active_root and item["archive_root"] == active_root]
+    xmp_active.sort(key=lambda item: item["storage_id"] != active_storage_id)
     xmp_archived = True if not row["xmp_path"] else bool(xmp_active)
     can_preview = (
         row["status"] == "available"
@@ -310,6 +318,10 @@ def view_media(row, periods, names=None, remote_index=None, active_scope=(None, 
         and managed_media_type(row["path"], row["kind"]) is not None
     )
     return {
+        **{key: value for key, value in offload.compute_media_retention(
+            row, active_copies, xmp_active, policy or read_local_retention(), now_dt or datetime.now(timezone.utc),
+            active_storage_id=active_storage_id).items() if key != "missingVerifiedAt"},
+        "sizeBytes": row["size"], "xmpSizeBytes": xmp_active[0]["size"] if row["xmp_path"] and xmp_active else None,
         "id": row["id"], "name": row["name"], "path": row["path"], "kind": row["kind"],
         "status": row["status"],
         "size": display_size(row["size"]), "device": device, "deviceFolder": device_folder(device),
@@ -418,6 +430,7 @@ JOB_ATTENTION_SQL = """(
         json_valid(result) AND CASE WHEN json_valid(result) THEN (
             coalesce(json_extract(result, '$.error'), '') <> ''
             OR coalesce(CAST(json_extract(result, '$.failed') AS INTEGER), 0) > 0
+            OR coalesce(CAST(json_extract(result, '$.offload.failed') AS INTEGER), 0) > 0
             OR coalesce(CAST(json_extract(result, '$.review') AS INTEGER), 0) > 0
             OR coalesce(CAST(json_extract(result, '$.companionReview') AS INTEGER), 0) > 0
         ) ELSE 0 END
@@ -430,7 +443,7 @@ def job_has_attention(status, result):
         return False
     return (status in {"failed", "cancelled"} or bool(result.get("error"))
             or (result.get("failed") or 0) > 0 or (result.get("review") or 0) > 0
-            or (result.get("companionReview") or 0) > 0)
+            or (result.get("companionReview") or 0) > 0 or ((result.get("offload") or {}).get("failed") or 0) > 0)
 
 
 def job_history_entry(row):
@@ -786,10 +799,20 @@ def state():
         names = device_names(db)
         remote_index = remote_copies_by_sha(db)
         active_scope = active_storage_scope()
-        media = [view_media(row, periods, names, remote_index, active_scope) for row in managed]
+        policy = read_local_retention()
+        stamp = datetime.now(timezone.utc)
+        media = [view_media(row, periods, names, remote_index, active_scope, policy, stamp) for row in managed]
         media.sort(key=lambda item: (item["time"] or "", item["name"]))
         active = active_jobs_by_lane(db)
         jobs = latest_jobs_by_lane(db)
+        candidates = offload.retention_candidates(db, policy=policy, now_dt=stamp)
+        latest_upload_offload = None
+        remote = jobs.get("remote")
+        if remote and remote["kind"] == "upload" and remote["status"] in {"done", "failed", "cancelled"}:
+            upload_candidates = offload.upload_offload_candidates(db, remote["id"])
+            if upload_candidates["totalEligibleCount"] or upload_candidates["blockedByKeeperCount"] or upload_candidates["excludedMissingXmp"]:
+                latest_upload_offload = {"jobId": remote["id"], "count": upload_candidates["totalEligibleCount"],
+                                         **{key: upload_candidates[key] for key in ("totalBytes", "blockedByKeeperCount", "excludedMissingXmp")}}
         latest_incoming_result = db.execute(
             """SELECT * FROM jobs WHERE kind IN ('move','delete','duplicate-cleanup','xmp-link')
                AND status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 1"""
@@ -801,6 +824,10 @@ def state():
             compat_job = db.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
         return {
             "timezone": DEFAULT_ZONE,
+            "retention": {**policy, "storageConfigured": candidates["storageConfigured"],
+                          "eligibleCount": candidates["totalEligibleCount"], "eligibleBytes": candidates["totalBytes"],
+                          "blockedByKeeperCount": candidates["blockedByKeeperCount"], "missingVerifiedAtCount": candidates["missingVerifiedAtCount"]},
+            "latestUploadOffload": latest_upload_offload,
             "scan": view_job(scan), "incoming": [view_scan_file(row) for row in incoming],
             "latestIncomingResult": view_job(latest_incoming_result),
             "latestStorageWake": view_job(storage_wake.latest(db)),
@@ -940,6 +967,24 @@ def clean_incoming_duplicates(selection: DuplicateCleanupSelection):
 def offload_files(request: OffloadRequest):
     with database(write=True) as db:
         return queue_offload(db, request)
+
+
+@app.post("/api/jobs/offload/{job_id}/cancel")
+def cancel_offload(job_id: int):
+    with database(write=True) as db:
+        return JSONResponse(view_job(offload.cancel_offload_job(db, job_id)), headers=NO_STORE)
+
+
+@app.get("/api/archive/transfers/{job_id}/offload-candidates")
+def upload_offload_candidates(job_id: int):
+    with database() as db:
+        return JSONResponse(offload.upload_offload_candidates(db, job_id), headers=NO_STORE)
+
+
+@app.get("/api/offload/retention-candidates")
+def retention_candidates():
+    with database() as db:
+        return JSONResponse(offload.retention_candidates(db), headers=NO_STORE)
 
 
 @app.post("/api/jobs/xmp-link", status_code=202)

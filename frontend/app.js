@@ -104,6 +104,9 @@ const view = {
   archive: null, archivePath: '', archiveBusy: false, archiveError: '', archiveAutoAttempted: false, archiveAutoConnecting: false,
   wakeStarting: false, wakePending: loadWakePending(), wakeUncertain: false, wakeError: '', wakeLookupBusy: false,
   sourceSelection: new Set(), uploadStarting: false, dragSource: null,
+  sourceFilter: 'all', uploadOffloadAfter: savedPreference('photo-saver-upload-offload-after', '0') === '1',
+  retentionBusy: false, retentionError: '', retentionDraftMode: null, retentionDraftDays: '',
+  missingXmpMediaIds: [],
   catalogEvent: 'all', catalogDevice: '', catalogExpanded: new Set(),
   catalogRemoteFolder: '', catalogRemoteExpanded: new Set(),
   catalogExpandedRows: new Set(),
@@ -265,7 +268,7 @@ function clearDismissedResults() {
 function jobHasAttention(job) {
   const result = job?.result || {};
   return job?.status === 'failed' || job?.status === 'cancelled' || Boolean(result.error) ||
-    (result.failed || 0) > 0 || (result.review || 0) > 0 || (result.companionReview || 0) > 0;
+    (result.failed || 0) > 0 || (result.review || 0) > 0 || (result.companionReview || 0) > 0 || (result.offload?.failed || 0) > 0;
 }
 function resultTone(job) { return job.status === 'failed' ? 'danger' : jobHasAttention(job) ? 'warn' : 'ok'; }
 function resultBannerActions(job, title, followup = '') {
@@ -360,8 +363,8 @@ function laneJobsBar() {
     const job = activeLaneJob(lane);
     if (!job) return '';
     const result = job.result || {};
-    const cancel = job.kind === 'storage-wake' ? 'cancel-storage-wake' : job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
-    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
+    const cancel = job.kind === 'storage-wake' ? 'cancel-storage-wake' : job.kind.startsWith("thumbnails-") ? "cancel-thumbnail-job" : job.kind === 'upload' ? 'cancel-archive-upload' : job.kind === 'offload' ? 'cancel-offload' : job.kind === 'remote-index' ? 'cancel-remote-index' : null;
+    return `<div class="active-job-pill"><span role="status">${labels[lane]} · ${kinds[job.kind] || job.kind} #${job.id} · ${escapeHtml(result.phase || (job.status === 'queued' ? '대기 중' : '진행 중'))}${result.totalFiles ? ` · ${result.completedFiles ?? result.processedFiles ?? 0}/${result.totalFiles}` : ''}</span>${cancel ? button(cancel, result.cancelRequested ? (job.kind === 'offload' ? '중지 요청됨' : '중지 중…') : job.kind === 'offload' ? '중지' : job.kind === 'storage-wake' ? '대기 중지' : job.kind.startsWith("thumbnails-") ? "생성 중지" : job.kind === 'upload' ? '업로드 중지' : '인덱싱 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>`;
   }).join('')}</div>`;
 }
 
@@ -1224,6 +1227,7 @@ function eventDateForFile(file) {
 
 function matchesEventLifecycle(file, filter = view.eventLifecycle) {
   if (filter === 'all') return true;
+  if (filter === 'offloadable') return Boolean(file.canOffload);
   if (filter === 'archived') return file.status === 'archived';
   if (file.status === 'archived') return false;
   return filter === 'confirmed' ? Boolean(file.confirmed) : !file.confirmed;
@@ -1253,6 +1257,7 @@ function offloadStatus() {
   return `<section class="surface upload-status" aria-label="NAS 보관 후 로컬 비우기 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? 'NAS 보관 후 로컬 비우기 대기 중' : result.phase || 'NAS 보관 후 로컬 비우기 중' : job.status === 'done' ? 'NAS 보관 후 로컬 비우기 완료' : 'NAS 보관 후 로컬 비우기 실패'}</strong>
       <span class="small muted">${result.completedFiles || 0} / ${result.totalFiles || 0}개 처리 · 완료 ${result.offloaded || 0}개 · 실패 ${result.failed || 0}개${result.freedBytes ? ` · 확보 ${sizeLabel(result.freedBytes / 1_000_000)}` : ''}</span></div>
+    ${button('cancel-offload', result.cancelRequested ? '중지 요청됨' : '중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` })}
     ${active ? `<progress max="100" value="${percent}" aria-label="NAS 보관 후 로컬 비우기 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '원격 아카이브를 확인하고 있습니다.')}</p>` : ''}
     ${result.error ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
     ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
@@ -1265,7 +1270,7 @@ function eventFileStatus(file) {
   }
   const primary = file.reviewReason ? badge('review', escapeHtml(file.reviewReason)) :
     badge(file.confirmed ? 'ready' : 'draft', file.confirmed ? '분류 확정' : file.eventId ? '초안' : '미배정');
-  return `${primary}${file.archived ? '<div class="file-reason small muted">아카이브 사본 있음</div>' : ''}`;
+  return `${primary}${file.archived ? `<div class="file-reason small muted">아카이브 사본 있음${!file.canOffload ? ` · ${file.canDownload && file.xmp && !file.xmpArchived ? 'XMP 미업로드' : '다른 경로 보관됨'}` : ''}</div>` : ''}`;
 }
 
 function eventCardCaption(file, footageDate) {
@@ -1298,14 +1303,17 @@ function eventLifecycleSummary(files) {
   return { total: files.length, draft, confirmed, archived, localArchivedCopy };
 }
 
+function eventOffloadableCount(files) { return files.filter(file => file.canOffload).length; }
+
 function eventLifecycleMarkup(files) {
   const summary = eventLifecycleSummary(files);
   if (!summary.total) return '';
   return `<div class="event-lifecycle" id="event-lifecycle" aria-label="파일 상태 요약 및 필터">
     <div class="event-lifecycle-counts small numbers" role="group" aria-label="분류 상태 필터">
       ${[['all', '전체'], ['draft', '초안'], ['confirmed', '분류 확정'], ['archived', '아카이브 보관']].map(([key, label]) => `<button type="button" class="lifecycle-chip lifecycle-${key}" data-action="event-lifecycle" data-value="${key}" aria-pressed="${view.eventLifecycle === key}">${key !== 'all' ? '<i aria-hidden="true"></i>' : ''}${label} <span>${key === 'all' ? summary.total : summary[key]}</span></button>`).join('')}
-      ${summary.localArchivedCopy ? `<span class="lifecycle-note muted">· NAS 사본 보유 ${summary.localArchivedCopy}</span>` : ''}</div>
-    <div class="event-lifecycle-bar" aria-hidden="true">${['archived', 'confirmed', 'draft'].map(key => summary[key] ? `<span class="bar-${key}${view.eventLifecycle !== 'all' && view.eventLifecycle !== key ? ' is-dimmed' : ''}" style="flex:${summary[key]}"></span>` : '').join('')}</div></div>`;
+      <span class="lifecycle-note muted">· NAS 사본 보유 ${summary.localArchivedCopy}</span>
+      <button type="button" class="lifecycle-chip" data-action="event-lifecycle" data-value="offloadable" aria-pressed="${view.eventLifecycle === 'offloadable'}">로컬 비우기 가능 ${eventOffloadableCount(files)}</button></div>
+    <div class="event-lifecycle-bar" aria-hidden="true">${['archived', 'confirmed', 'draft'].map(key => summary[key] ? `<span class="bar-${key}${['draft', 'confirmed', 'archived'].includes(view.eventLifecycle) && view.eventLifecycle !== key ? ' is-dimmed' : ''}" style="flex:${summary[key]}"></span>` : '').join('')}</div></div>`;
 }
 
 function mountEventsPage() {
@@ -1428,7 +1436,7 @@ function patchEventsPage() {
   patchPageStatus();
   setSlotHtml(page.querySelector('#events-header'), header('이벤트 분류', '촬영 기간으로 사진과 영상을 모으고, 필요한 파일을 소분류로 배정하세요.', ''));
   setSlotHtml(page.querySelector('#event-create-slot'), button('new-event', '생성', { glyph: 'plus', primary: state.events.length === 0, extra: 'aria-label="이벤트 생성" title="이벤트 생성"' }));
-  setSlotHtml(page.querySelector('#events-offload-slot'), offloadStatus());
+  setSlotHtml(page.querySelector('#events-offload-slot'), `<div data-retention-banner="events">${retentionBanner('events')}</div>` + offloadStatus());
   setSlotHtml(page.querySelector('#event-list'), `${eventLink('all', '전체 파일', state.managed.length)}${eventLink('unassigned', '미배정', footageForEvent('unassigned').length)}${state.events.filter(item => !item.parent).map(item => {
     const children = childEvents(item.id);
     const total = footageForEvent(item.id).length + children.reduce((sum, child) => sum + footageForEvent(child.id).length, 0);
@@ -1495,6 +1503,30 @@ function sourceFiles() {
   return state.managed.filter(file => file.status === 'available' && file.confirmed && eventById(file.eventId));
 }
 
+function matchesSourceFilter(file) {
+  return view.sourceFilter === 'all' || (view.sourceFilter === 'archived' ? Boolean(file.canOffload) : !file.canOffload);
+}
+
+function pruneSourceSelection() {
+  const visible = new Set(sourceEntries().flatMap(entry => entry.assets));
+  for (const key of view.sourceSelection) if (!visible.has(key)) view.sourceSelection.delete(key);
+  view.missingXmpMediaIds = [];
+}
+
+function sourceOffloadFiles() {
+  return sourceFiles().filter(file => file.canOffload && view.sourceSelection.has(`${file.id}:media`));
+}
+
+function sourceArchiveBadge(file) {
+  const label = file.kind === 'xmp' ? file.xmpArchived ? 'NAS 보관됨' : 'XMP 미업로드' : file.canOffload ? 'NAS 보관됨' : file.canDownload && file.xmp && !file.xmpArchived ? 'XMP 미업로드' : file.archived ? '다른 경로 보관됨' : '미업로드';
+  return `<span class="source-archive-badge">${label}${file.retentionEligible ? ' · 보존 만료' : ''}</span>`;
+}
+
+function missingUploadXmpIds(keys = [...view.sourceSelection]) {
+  const selected = new Set(keys);
+  return sourceFiles().filter(file => selected.has(`${file.id}:media`) && file.xmp && (!file.xmpArchived || view.missingXmpMediaIds.includes(file.id)) && !selected.has(`${file.id}:xmp`)).map(file => file.id);
+}
+
 function sourceAssetKeys(file) {
   return [`${file.id}:media`, ...(file.xmp ? [`${file.id}:xmp`] : [])];
 }
@@ -1503,12 +1535,13 @@ function sourceEntries() {
   const folders = new Map();
   const files = [];
   for (const file of sourceFiles()) {
+    if (!matchesSourceFilter(file)) continue;
     const path = sourceFolders(file);
     if (view.sourcePath.some((value, index) => path[index] !== value)) continue;
     const nextFolder = path[view.sourcePath.length];
     if (!nextFolder) {
       files.push(file);
-      if (file.xmp) files.push({ id: file.id, name: file.xmp.name, kind: 'xmp', size: null });
+      if (file.xmp) files.push({ id: file.id, name: file.xmp.name, kind: 'xmp', size: null, xmpArchived: file.xmpArchived });
       continue;
     }
     if (!folders.has(nextFolder)) folders.set(nextFolder, []);
@@ -1572,7 +1605,9 @@ function archivePreviewPanel() {
     <ul class="archive-preview-paths mono">${preview.samples.map(path => `<li>${escapeHtml(path)}</li>`).join('')}${preview.remainingCount ? `<li class="muted">외 ${preview.remainingCount}개 파일</li>` : ''}</ul>
     ${view.sourcePath.length ? `<p class="small muted">현재 열린 위치(${escapeHtml(view.sourcePath.join(' / '))}) 아래의 상대 구조만 유지됩니다.</p>` : ''}
     ${preview.invalidCount ? `<p class="small form-error">현재 열린 위치에 속하지 않는 ${preview.invalidCount}개 항목은 미리보기에서 제외했습니다.</p>` : ''}
-    ${!view.archive && view.settings && !isStorageConfigured(view.settings) ? '<a class="button" href="#settings">스토리지 설정 열기</a>' : ''}`;
+    ${!view.archive && view.settings && !isStorageConfigured(view.settings) ? '<a class="button" href="#settings">스토리지 설정 열기</a>' : ''}
+    ${view.uploadOffloadAfter && missingUploadXmpIds().length ? `<p class="form-error" role="alert">연결된 XMP도 검증되어야 로컬 원본을 비울 수 있습니다.</p>${button('include-missing-xmp', `누락된 XMP ${missingUploadXmpIds().length}개 함께 선택`)}` : ''}
+    ${button('offload-source', `로컬 비우기 (${sourceOffloadFiles().length})`, { disabled: !sourceOffloadFiles().length || !isOmvReadyForOffload() || remoteBusy(), danger: true })}`;
 }
 
 function archivePage() {
@@ -1580,28 +1615,30 @@ function archivePage() {
   const allAssets = entries.flatMap(entry => entry.assets);
   const busy = remoteBusy() || view.uploadStarting;
   return `${header('아카이브 전송', '보낼 항목 (로컬)을 선택하고 원격 아카이브 (NAS) 대상 폴더로 이동한 뒤 업로드를 누르세요. 데스크톱에서는 드래그로도 전송할 수 있습니다.', '')}
-    ${uploadStatus()}${remoteIndexStatus()}
+    <div data-retention-banner="archive">${retentionBanner('archive')}</div>${uploadStatus()}${offloadStatus()}${remoteIndexStatus()}
     <div class="split">
       <section class="surface browser" aria-labelledby="source-title">
         <div class="surface-head archive-heading"><div><h2 id="source-title">${icon('folder')} 보낼 항목 (로컬)</h2><p class="small muted">분류 확정된 로컬 파일</p></div>
-          ${button('upload-archive', view.uploadStarting ? '예약 중…' : '업로드', { glyph: 'upload', primary: true, disabled: busy || !view.archive || view.archiveBusy || !view.sourceSelection.size })}</div>
+          ${button('upload-archive', view.uploadStarting ? '예약 중…' : view.uploadOffloadAfter ? '업로드 후 로컬 비우기' : '업로드', { glyph: 'upload', primary: true, disabled: busy || !view.archive || view.archiveBusy || !view.sourceSelection.size })}</div>
+        <div class="source-filters" role="group" aria-label="보낼 항목 필터">${[['all', '전체'], ['unarchived', '미업로드'], ['archived', 'NAS 보관됨']].map(([key, label]) => `<button type="button" class="button" data-action="source-filter" data-value="${key}" aria-pressed="${view.sourceFilter === key}">${label} ${sourceFiles().filter(file => key === 'all' || (key === 'archived' ? file.canOffload : !file.canOffload)).length}</button>`).join('')}</div>
+        <label class="upload-offload-option"><input type="checkbox" data-action="toggle-upload-offload" ${view.uploadOffloadAfter ? 'checked' : ''} ${busy ? 'disabled' : ''}> 업로드 검증 완료 후 로컬 원본 바로 비우기</label>
         <div class="location">
           ${view.sourcePath.length ? smallButton('source-up', '상위 폴더', 'up') : icon('folder')}
           ${archiveBreadcrumb()}
         </div>
         <div class="source-selection"><label>${checkbox('source-all', 'all', '표시된 보낼 항목 (로컬) 모두 선택', new Set(allAssets.length && allAssets.every(key => view.sourceSelection.has(key)) ? ['all'] : []))} 모두 선택</label>
-          <span class="small muted" id="source-selection-count" role="status">${view.sourceSelection.size}개 파일 선택</span></div>
+          <span class="small muted" id="source-selection-count" role="status">${view.sourceSelection.size}개 파일 선택</span>${button('offload-source', `로컬 비우기 (${sourceOffloadFiles().length})`, { disabled: !sourceOffloadFiles().length || !isOmvReadyForOffload() || remoteBusy(), danger: true })}</div>
         ${entries.length ? `<ul class="tree">${entries.map((entry, index) => {
           const name = escapeHtml(entry.name);
           const selected = entry.assets.every(key => view.sourceSelection.has(key));
           const selection = checkbox('source', String(index), `${entry.name} 업로드 선택`, new Set(selected ? [String(index)] : []));
           const attributes = `draggable="${!busy}" data-source-index="${index}" class="tree-row${selected ? ' source-selected' : ''}"`;
           if (entry.file) return `<li ${attributes}>${checkHit(selection)}
-            <span class="tree-file">${icon(entry.file.kind === 'xmp' ? 'file' : entry.file.kind)}${name}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
+            <span class="tree-file">${icon(entry.file.kind === 'xmp' ? 'file' : entry.file.kind)}${name}${sourceArchiveBadge(entry.file)}</span><span class="meta numbers">${sizeLabel(entry.file.size)}</span>
           </li>`;
           return `<li ${attributes}>${checkHit(selection)}
             <button type="button" class="tree-button" data-action="open-source" data-value="${index}">${icon('folder')}<span>${name}</span>${icon('right')}</button>
-            <span class="meta">${entry.members.length}개</span>
+            <span class="meta">${entry.members.length}개 · NAS 보관 ${eventOffloadableCount(entry.members)} · 미업로드 ${entry.members.length - eventOffloadableCount(entry.members)}</span>
           </li>`;
         }).join('')}</ul>` : emptyState('folder', '표시할 파일이 없습니다.', '이벤트 분류에서 분류를 확정하세요.')}
       </section>
@@ -1647,16 +1684,28 @@ function uploadStatus() {
   if (job?.kind !== 'upload') return '';
   const result = job.result || {};
   const active = jobActive(job);
-  if (!active) return resultBanner(job, '아카이브 업로드 결과', button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` }));
+  if (!active) {
+    const latest = state.latestUploadOffload?.jobId === job.id ? state.latestUploadOffload : null;
+    return resultBanner(job, '아카이브 업로드 결과', button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` }) +
+      (latest?.count > 0 ? button('offload-latest-upload', `방금 검증된 ${latest.count}개 로컬 비우기 (${sizeLabel(latest.totalBytes / 1e6)})`, { disabled: !isOmvReadyForOffload() || remoteBusy(), extra: `data-value="${job.id}"` }) : '') +
+      (latest?.excludedMissingXmp ? `<p class="small muted">XMP 미업로드 ${latest.excludedMissingXmp}개는 로컬에 유지합니다.</p>` : '') + uploadOffloadSummary(result));
+  }
   const percent = Math.min(100, Math.round((result.transferredBytes || 0) / (result.totalBytes || 1) * 100));
   return `<section class="surface upload-status" aria-label="아카이브 업로드 상태">
     <div class="upload-summary"><strong role="status">${active ? job.status === 'queued' ? '업로드 대기 중' : result.phase || '업로드 중' : job.status === 'done' ? '업로드 완료' : job.status === 'cancelled' ? '업로드 중지됨' : '업로드 실패'}</strong>
       <span class="small muted">${result.completedFiles || 0} / ${result.totalFiles || 0}개 처리 · 업로드 ${result.uploaded || 0}개 · 건너뜀 ${result.skipped || 0}개 · 실패 ${result.failed || 0}개</span>
       ${active ? button('cancel-archive-upload', result.cancelRequested ? '중지 중…' : '업로드 중지', { disabled: result.cancelRequested, extra: `data-value="${job.id}"` }) : ''}</div>
+    ${uploadOffloadSummary(result)}
     ${active ? `<progress max="100" value="${percent}" aria-label="업로드 진행률">${percent}%</progress><p class="small muted archive-path">${escapeHtml(result.current || '서버에 연결하고 있습니다.')} · ${sizeLabel((result.transferredBytes || 0) / 1_000_000)} / ${sizeLabel((result.totalBytes || 0) / 1_000_000)}</p>` : ''}
     ${result.error && job.status !== 'cancelled' ? `<p class="form-error" role="alert">${escapeHtml(result.error)}</p>` : ''}
     ${result.errors?.length ? `<details><summary>실패한 파일 ${result.failed}개${result.failed > result.errors.length ? ` 중 ${result.errors.length}개 표시` : ''}</summary><ul>${result.errors.map(error => `<li><span class="archive-path">${escapeHtml(error.path)}</span>: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}
   </section>`;
+}
+
+function uploadOffloadSummary(result) {
+  const off = result.offload;
+  if (!off?.enabled) return '';
+  return `<p class="upload-offload-summary" role="status">로컬 비우기 · ${escapeHtml(off.phase || '대기 중')} · ${off.completedFiles || 0}/${off.totalFiles || 0}개 · 비움 ${off.offloaded || 0} · 건너뜀 ${off.skipped || 0} · 실패 ${off.failed || 0} · 확보 ${sizeLabel((off.freedBytes || 0) / 1e6)}</p>${off.errors?.length ? `<details><summary>로컬 비우기 확인 사항</summary><ul>${off.errors.map(error => `<li>${escapeHtml(error.path)}: ${escapeHtml(error.message)}</li>`).join('')}</ul></details>` : ''}`;
 }
 
 function remoteIndexStatus() {
@@ -1709,7 +1758,7 @@ function openRemoteIndexDialog() {
   });
 }
 
-function confirmDuplicateUpload(keys, source, destination, data) {
+function confirmDuplicateUpload(keys, source, destination, data, offloadAfter = view.uploadOffloadAfter) {
   const duplicates = data.duplicates || [];
   const duplicateIds = new Set(data.duplicateIds || duplicates.map(item => item.id));
   const filteredKeys = keys.filter(key => !duplicateIds.has(key.split(':')[0]));
@@ -1721,13 +1770,17 @@ function confirmDuplicateUpload(keys, source, destination, data) {
     : '<p>선택한 파일이 모두 원격 아카이브의 다른 경로에 이미 보관되어 있습니다. 정말 별도 사본을 만들려면 아래에서 진행하세요.</p>';
   showDialog(
     '원격 중복 파일 감지',
-    `<p>${escapeHtml(data.detail || '원격 아카이브의 다른 경로에 동일한 파일이 있습니다.')}</p>${note}${list}`,
+    `<p>${escapeHtml(data.detail || '원격 아카이브의 다른 경로에 동일한 파일이 있습니다.')}</p>${note}${offloadAfter ? '<p class="form-error">업로드 검증이 완료된 원본과 연결된 XMP는 로컬에서 비웁니다.</p>' : ''}${list}`,
     filteredKeys.length ? `중복 제외하고 신규 ${filteredKeys.length}개만 업로드` : '별도 사본으로 모두 업로드',
     async () => {
       if (filteredKeys.length) {
-        await startArchiveUpload(filteredKeys, source, destination, false);
+        if (offloadAfter && !filteredKeys.some(key => key.endsWith(':media'))) {
+          view.uploadOffloadAfter = false;
+          storePreference('photo-saver-upload-offload-after', '0');
+        }
+        await startArchiveUpload(filteredKeys, source, destination, false, offloadAfter && filteredKeys.some(key => key.endsWith(':media')));
       } else {
-        await startArchiveUpload(keys, source, destination, true);
+        await startArchiveUpload(keys, source, destination, true, offloadAfter);
       }
     },
     { danger: !filteredKeys.length },
@@ -1743,7 +1796,7 @@ function confirmDuplicateUpload(keys, source, destination, data) {
       const errorMessage = dialog.querySelector('#dialog-error');
       errorMessage.hidden = true;
       try {
-        await startArchiveUpload(keys, source, destination, true);
+        await startArchiveUpload(keys, source, destination, true, offloadAfter);
         dialog.close();
         render();
       } catch (error) {
@@ -1756,7 +1809,13 @@ function confirmDuplicateUpload(keys, source, destination, data) {
   }
 }
 
-async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath, allowDuplicates = false) {
+function requestArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath) {
+  const offloadAfter = view.uploadOffloadAfter && keys.some(key => key.endsWith(':media'));
+  if (!offloadAfter) return startArchiveUpload(keys, source, destination, false, false);
+  showDialog('업로드 후 로컬 비우기', `<p>선택한 파일을 업로드하고 원격 검증이 완료된 사진·영상 및 연결된 XMP의 로컬 원본을 바로 비웁니다. 업로드나 검증에 실패한 원본은 유지됩니다.</p><p>썸네일과 파일 정보는 보관하며 원격 사본을 다시 다운로드할 수 있습니다.</p>`, '업로드 후 로컬 비우기', () => startArchiveUpload(keys, source, destination, false, true), { danger: true });
+}
+
+async function startArchiveUpload(keys = [...view.sourceSelection], source = [...view.sourcePath], destination = view.archivePath, allowDuplicates = false, offloadAfter = view.uploadOffloadAfter) {
   if (remoteBusy() || view.uploadStarting || view.archiveBusy || !view.archive || !keys.length) return;
   if (keys.length > 10000) throw new Error('한 번에 최대 10,000개 파일을 업로드할 수 있습니다. 나누어 선택하세요.');
   view.uploadStarting = true;
@@ -1766,6 +1825,7 @@ async function startArchiveUpload(keys = [...view.sourceSelection], source = [..
     const items = keys.map(key => { const [id, kind] = key.split(':'); return { id, kind }; });
     const result = await api('archive/transfers', 'POST', {
       items, source, destination, connection: view.archive.connectionVersion, allow_duplicates: allowDuplicates,
+      offload_after_upload: Boolean(offloadAfter && items.some(item => item.kind === 'media')),
     });
     setOptimisticJob({ id: result.id, kind: 'upload', status: 'queued', result: { totalFiles: result.count } });
     await syncState();
@@ -1773,6 +1833,9 @@ async function startArchiveUpload(keys = [...view.sourceSelection], source = [..
   } catch (error) {
     if (!allowDuplicates && error.data?.code === 'remote_duplicate') {
       duplicateData = error.data;
+    } else if (error.data?.code === 'missing_xmp_for_offload') {
+      view.missingXmpMediaIds = error.data.missingXmpMediaIds || [];
+      announce(error.message);
     } else {
       throw error;
     }
@@ -1781,7 +1844,7 @@ async function startArchiveUpload(keys = [...view.sourceSelection], source = [..
   }
   if (duplicateData) {
     render();
-    confirmDuplicateUpload(keys, source, destination, duplicateData);
+    confirmDuplicateUpload(keys, source, destination, duplicateData, offloadAfter);
   }
 }
 
@@ -1962,6 +2025,10 @@ function patchStorageStatus() {
   if (view.archive === null) setSlotHtml(page.querySelector('#archive-destination-content'), archiveDestination());
   setSlotHtml(page.querySelector('[data-storage-history]'), storageWakeStatus(view.page === 'settings'));
   setSlotHtml(page.querySelector('[data-storage-settings-actions]'), isJobActive(storageWakeJob()) ? '' : storageWakeButton());
+  page.querySelectorAll('[data-retention-banner]').forEach(node => setSlotHtml(node, retentionBanner(node.dataset.retentionBanner)));
+  page.querySelectorAll('[data-action="offload-source"], [data-action="offload-latest-upload"]').forEach(node => {
+    node.disabled = !isOmvReadyForOffload() || remoteBusy() || (node.dataset.action === 'offload-source' && !sourceOffloadFiles().length);
+  });
   document.querySelectorAll('[data-action="refresh-storage-status"]').forEach(node => {
     node.disabled = !!storageMonitor.promise || storageNow() < storageMonitor.cooldown;
     node.textContent = storageMonitor.promise ? '조회 중…' : '상태 확인';
@@ -2769,8 +2836,8 @@ function mountJobsPage() {
 function jobHistoryActions(job) {
   const result = job.result || {};
   if (isJobActive(job)) {
-    const cancel = { 'storage-wake': 'cancel-storage-wake', upload: 'cancel-archive-upload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
-    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
+    const cancel = { 'storage-wake': 'cancel-storage-wake', upload: 'cancel-archive-upload', offload: 'cancel-offload', 'remote-index': 'cancel-remote-index', 'device-upload': 'cancel-incoming-upload' }[job.kind];
+    return `${job.kind === 'upload' ? button('open-job-archives', '아카이브 기록 보기', {extra: `data-value="${job.id}"`}) : ''}${cancel ? button(cancel, result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling) ? job.kind === 'offload' ? '중지 요청됨' : '중지 중…' : job.kind === 'storage-wake' ? '대기 중지' : '중지', { disabled: result.cancelRequested || (job.source === 'device' && view.deviceUpload.cancelling), extra: `data-value="${escapeHtml(job.id)}"` }) : ''}`;
   }
   if (job.kind === 'upload') return button('open-job-archives', '아카이브 기록 보기', { extra: `data-value="${job.id}"` });
   if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
@@ -2974,6 +3041,7 @@ function settingsPage() {
         button('restore-catalog', '복원', { glyph: 'upload', danger: true, disabled: !view.restoreFile || anyJobActive() || view.catalogOpBusy }))}
     </section>
     ${thumbnailSettingsSection()}
+    ${retentionSettingsSection()}
     <section class="surface settings-section settings-danger" aria-label="데이터 초기화">
       <div class="surface-head"><h2>${icon('trash')} 데이터 초기화</h2><span class="settings-danger-badge">위험 구역</span></div>
       ${settingRow('managed 및 기록 초기화', 'managed 원본과 부가 파일, 썸네일, 카탈로그·작업 기록을 영구 삭제합니다. incoming과 SSH 연결 설정은 유지합니다.',
@@ -3185,6 +3253,9 @@ function resetStatus() {
 }
 
 function clearCatalogViews() {
+  view.sourceFilter = 'all'; view.uploadOffloadAfter = false;
+  storePreference('photo-saver-upload-offload-after', '0');
+  view.retentionDraftMode = null; view.retentionDraftDays = ''; view.retentionError = ''; view.missingXmpMediaIds = [];
   saveWakePending(null); view.wakeUncertain = false; view.wakeError = '';
   state.latestStorageWake = null; wakeRefreshPending = null; wakeRefreshDone.clear();
   view.thumbnailStats = null; view.thumbnailStatsError = ''; view.thumbnailGeneratingShas.clear();
@@ -3268,7 +3339,7 @@ function showDialog(title, content, submitLabel, handler, { danger = false, scro
       submit.disabled = false;
     }
   });
-  dialog.showModal();
+  if (!dialog.open) dialog.showModal();
   if (scrollBody) dialog.querySelector('.dialog-body').scrollTop = 0;
 }
 
@@ -3501,7 +3572,9 @@ function storageStructureKey() {
     view.sshTestBusy, view.sshTestResult, view.devices, view.devicesError, view.publicKeyToCopy,
     view.thumbnailStats, view.thumbnailStatsError, view.thumbnailOpBusy, view.settingsError,
     view.catalogOpBusy, view.keyCopiedLocally, view.restoreFile?.name, anyJobActive(), remoteBusy(),
-    state.managed, state.events, state.incoming, state.pendingXmp,
+    state.managed, state.events, state.incoming, state.pendingXmp, state.retention, state.latestUploadOffload,
+    view.sourceFilter, view.uploadOffloadAfter, view.missingXmpMediaIds, view.retentionBusy, view.retentionError,
+    view.retentionDraftMode, view.retentionDraftDays, isOmvReadyForOffload(),
     lanes.map(lane => { const job = laneJob(lane); return job?.kind === 'storage-wake' ? null : job; })]);
 }
 function render() {
@@ -3617,6 +3690,10 @@ function syncSourceSelection() {
   if (count && count.textContent !== label) count.textContent = label;
   setDisabled(page.querySelector('[data-action="upload-archive"]'), busy || !view.archive || view.archiveBusy || !view.sourceSelection.size);
   setSlotHtml(page.querySelector('#archive-preview-slot'), archivePreviewPanel());
+  page.querySelectorAll('[data-action="offload-source"]').forEach(node => {
+    node.textContent = `로컬 비우기 (${sourceOffloadFiles().length})`;
+    node.disabled = !sourceOffloadFiles().length || !isOmvReadyForOffload() || remoteBusy();
+  });
 }
 
 function handleSelection(control) {
@@ -4227,22 +4304,83 @@ function confirmEvent() {
   });
 }
 
-function confirmOffload() {
-  const files = filteredEventFiles(footageForEvent(view.eventId)).filter(file => view.eventSelection.has(file.id) && file.canOffload);
-  if (!files.length) return;
-  showDialog('NAS 보관 후 로컬 비우기', `<p>원격 아카이브에 파일 존재·크기를 실시간 확인한 뒤 아래 ${files.length}개 파일의 로컬 <code>managed</code> 원본(및 연결된 XMP)을 삭제합니다.</p>
+function isOmvReadyForOffload() {
+  return Boolean(view.archive) || (storageCurrent().status === 'running' && Boolean(state.retention?.storageConfigured));
+}
+
+function confirmOffloadFiles(files, options = {}) {
+  const ids = options.ids || files.map(file => file.id);
+  const totalBytes = options.totalBytes ?? files.reduce((total, file) => total + (file.sizeBytes ?? (file.size || 0) * 1e6) + (file.xmpSizeBytes || 0), 0);
+  if (!ids.length || (options.requireOmvReady !== false && !isOmvReadyForOffload()) || remoteBusy()) return;
+  showDialog('NAS 보관 후 로컬 비우기', `<p>원격 아카이브에 파일 존재·크기를 실시간 확인한 뒤 ${ids.length}개 파일의 로컬 원본(및 연결된 XMP)을 삭제합니다. 대상 용량 ${sizeLabel(totalBytes / 1e6)}.</p>
     <p>썸네일, 메타데이터, XMP 정보, 이벤트 배정은 DB에 그대로 유지되며 언제든 다시 다운로드할 수 있습니다. 원격에 없거나 크기가 다르면 삭제하지 않고 유지합니다.</p>
-    <ul class="preview-paths mono">${files.map(file => `<li>${escapeHtml(file.name)}${file.xmp ? ` (+ ${escapeHtml(file.xmp.name)})` : ''} → ${escapeHtml(file.remotePaths[0] || '')}</li>`).join('')}</ul>`,
-  `NAS 보관 후 로컬 비우기 (${files.length})`, async () => {
-    const result = await api('jobs/offload', 'POST', { ids: files.map(file => file.id) });
+    ${options.truncated ? '<p>한 번에 최대 10,000개를 처리합니다. 완료 후 남은 대상을 다시 확인하세요.</p>' : ''}
+    <ul class="preview-paths mono">${files.slice(0, 50).map(file => `<li>${escapeHtml(file.name)}${file.xmp ? ` (+ ${escapeHtml(file.xmp.name)})` : ''}</li>`).join('')}</ul>`,
+  `NAS 보관 후 로컬 비우기 (${ids.length})`, async () => {
+    const result = await api('jobs/offload', 'POST', { ids });
     setOptimisticJob({ id: result.id, kind: 'offload', status: 'queued', result: {} });
     view.eventSelection.clear();
+    view.sourceSelection.clear();
     await syncState();
     announce(`${result.count}개 파일의 원격 확인 및 NAS 보관 후 로컬 비우기를 시작합니다.`);
   }, { danger: true });
 }
 
+function confirmOffload() {
+  return confirmOffloadFiles(filteredEventFiles(footageForEvent(view.eventId)).filter(file => view.eventSelection.has(file.id) && file.canOffload), { requireOmvReady: false });
+}
+
+async function offloadCandidates(path) {
+  if (!isOmvReadyForOffload() || remoteBusy()) return;
+  const candidates = await api(path);
+  if (!candidates.ids.length) { announce('지금 비울 수 있는 로컬 원본이 없습니다.'); await syncState(); return; }
+  const byId = new Map(state.managed.map(file => [file.id, file]));
+  confirmOffloadFiles(candidates.ids.map(id => byId.get(id)).filter(Boolean), candidates);
+}
+
+function retentionBanner(place) {
+  const policy = state.retention;
+  if (policy?.mode !== 'days' || !policy.eligibleCount) return '';
+  const ready = isOmvReadyForOffload();
+  return `<section class="retention-banner" aria-label="보존 기간 만료 제안"><div><strong>보존 기간이 만료된 로컬 원본 ${policy.eligibleCount}개</strong><p class="small muted">업로드·검증 후 ${policy.days}일 경과 · ${sizeLabel((policy.eligibleBytes || 0) / 1e6)} · 원격 사본을 확인한 뒤 비웁니다.</p></div>${button('offload-retention', `만료된 ${policy.eligibleCount}개 로컬 비우기`, { disabled: !ready || remoteBusy() })}${!ready ? place === 'archive' ? '<p class="small muted">위에서 아카이브 연결 또는 OMV 켜기 후 실행할 수 있습니다.</p>' : '<a class="button" href="#archive">아카이브에서 연결하기</a>' : ''}</section>`;
+}
+
+function retentionSettingsSection() {
+  const policy = view.settings?.localRetention || { mode: 'manual', days: null };
+  const mode = view.retentionDraftMode ?? policy.mode;
+  const days = view.retentionDraftMode === null ? policy.days ?? 7 : view.retentionDraftDays;
+  return `<section class="surface settings-section" aria-label="로컬 보존 정책"><div class="surface-head"><h2>로컬 보존 정책</h2></div>
+    <div class="retention-form"><label for="retention-mode">로컬 원본 보관 방식<select id="retention-mode" ${view.retentionBusy ? 'disabled' : ''}><option value="manual" ${mode === 'manual' ? 'selected' : ''}>수동 유지</option><option value="days" ${mode === 'days' ? 'selected' : ''}>업로드·검증 후 기간 보관</option></select></label>
+    ${mode === 'days' ? `<div class="retention-presets" role="group" aria-label="보존 기간 프리셋">${[0, 7, 14, 30, 90].map(value => button('retention-preset', value === 0 ? '직후 (0일)' : `${value}일`, { disabled: view.retentionBusy, extra: `data-value="${value}" aria-pressed="${String(days).trim() !== '' && Number(days) === value}"` })).join('')}</div><label for="retention-days">보존 기간 (일)<input id="retention-days" type="number" min="0" max="3650" step="1" value="${escapeHtml(String(days))}" ${view.retentionBusy ? 'disabled' : ''}></label>` : ''}
+    <p class="small muted">촬영일이 아닌 원격 업로드·검증 완료 시각부터 계산합니다. 0일은 검증 직후 비우기 대상으로 제안합니다. 정책 저장만으로 파일을 삭제하지 않으며, 직접 확인 후 실행합니다. 연결된 XMP도 보관되어야 합니다.</p>
+    ${view.retentionError ? `<p class="form-error" role="alert">${escapeHtml(view.retentionError)}</p>` : ''}${button('save-retention', view.retentionBusy ? '저장 중…' : '정책 저장', { primary: true, disabled: !view.settings || view.retentionBusy })}
+    <p class="small muted">현재 만료 대상 ${state.retention?.eligibleCount || 0}개 · 보존 중인 중복 원본 제외 ${state.retention?.blockedByKeeperCount || 0}개 · 검증 시각 확인 필요 ${state.retention?.missingVerifiedAtCount || 0}개</p><div data-retention-banner="settings">${retentionBanner('settings')}</div>${!state.retention?.eligibleCount && !isOmvReadyForOffload() ? '<a class="button" href="#archive">아카이브에서 연결하기</a>' : ''}</div></section>`;
+}
+
 const actions = {
+  'source-filter'(value) { if (!['all', 'unarchived', 'archived'].includes(value)) return; view.sourceFilter = value; pruneSourceSelection(); },
+  'toggle-upload-offload'() { view.uploadOffloadAfter = !view.uploadOffloadAfter; storePreference('photo-saver-upload-offload-after', view.uploadOffloadAfter ? '1' : '0'); },
+  'include-missing-xmp'() { for (const id of new Set([...missingUploadXmpIds(), ...view.missingXmpMediaIds])) view.sourceSelection.add(`${id}:xmp`); view.missingXmpMediaIds = []; },
+  'offload-source'() { return confirmOffloadFiles(sourceOffloadFiles()); },
+  'offload-latest-upload'(id) { return offloadCandidates(`archive/transfers/${Number(id)}/offload-candidates`); },
+  'offload-retention'() { return offloadCandidates('offload/retention-candidates'); },
+  async 'cancel-offload'(value) {
+    const id = Number(value) || activeLaneJob('remote')?.id;
+    if (!id) return;
+    setOptimisticJob(await api(`jobs/offload/${id}/cancel`, 'POST')); await syncState();
+  },
+  'retention-preset'(value) { view.retentionDraftMode = 'days'; view.retentionDraftDays = String(value); view.retentionError = ''; },
+  async 'save-retention'() {
+    if (view.retentionBusy) return;
+    const mode = view.retentionDraftMode ?? view.settings?.localRetention?.mode ?? 'manual';
+    const raw = view.retentionDraftMode === null ? view.settings?.localRetention?.days ?? 7 : view.retentionDraftDays;
+    const days = mode === 'days' ? Number(raw) : null;
+    if (mode === 'days' && (String(raw).trim() === '' || !Number.isInteger(days) || days < 0 || days > 3650)) { view.retentionError = '보존 기간은 0에서 3650 사이의 정수로 입력하세요.'; return; }
+    view.retentionBusy = true; view.retentionError = ''; render();
+    try { view.settings = await api('settings/retention', 'PUT', { mode, days }); view.retentionDraftMode = null; view.retentionDraftDays = ''; await syncState(); announce('로컬 보존 정책을 저장했습니다.'); }
+    catch (error) { view.retentionError = error.message; }
+    finally { view.retentionBusy = false; render(); }
+  },
   'storage-disclosure'() { storageMonitor.open = !storageMonitor.open; patchStorageStatus(); },
   'refresh-storage-status'() { return requestStorageStatus(true); },
   'catalog-view'(value) { view.catalogView = value === 'cards' ? 'cards' : 'table'; storePreference('photo-saver-catalog-view', view.catalogView); render(); },
@@ -4335,7 +4473,7 @@ const actions = {
   'reset-catalog': confirmCatalogReset,
   'choose-event': chooseEvent,
   'event-lifecycle'(value) {
-    if (!['all', 'draft', 'confirmed', 'archived'].includes(value)) return;
+    if (!['all', 'draft', 'confirmed', 'archived', 'offloadable'].includes(value)) return;
     const next = value !== 'all' && view.eventLifecycle === value ? 'all' : value;
     if (next === view.eventLifecycle) return;
     view.eventLifecycle = next;
@@ -4373,7 +4511,7 @@ const actions = {
   'confirm-event': confirmEvent,
   'open-source'(value) { view.sourcePath.push(sourceEntries()[Number(value)].name); view.sourceSelection.clear(); },
   'source-up'() { view.sourcePath.pop(); view.sourceSelection.clear(); },
-  'upload-archive'() { return startArchiveUpload(); },
+  'upload-archive'() { return requestArchiveUpload(); },
   async 'cancel-archive-upload'(value) {
     const jobId = Number(value) || activeLaneJob('remote')?.id;
     if (!jobId) return;
@@ -4527,7 +4665,7 @@ page.addEventListener('drop', async event => {
   const destination = target.dataset.archiveDrop;
   clearArchiveDrag();
   try {
-    await startArchiveUpload(drag.keys, drag.source, destination);
+    await requestArchiveUpload(drag.keys, drag.source, destination);
   } catch (error) {
     announce(error.message);
   } finally {
@@ -4547,6 +4685,12 @@ page.addEventListener('submit', event => {
 
 page.addEventListener('change', event => {
   const control = event.target;
+  if (control.dataset.action === 'toggle-upload-offload') {
+    view.uploadOffloadAfter = control.checked; storePreference('photo-saver-upload-offload-after', control.checked ? '1' : '0'); render(); return;
+  }
+  if (control.id === 'retention-mode') {
+    view.retentionDraftMode = control.value; view.retentionDraftDays = String(view.settings?.localRetention?.days ?? 7); view.retentionError = ''; render(); return;
+  }
   if (control.id === 'incoming-upload-input') {
     const files = Array.from(control.files || []);
     control.value = '';
@@ -4605,6 +4749,7 @@ page.addEventListener('compositionend', event => {
 });
 
 page.addEventListener('input', event => {
+  if (event.target.id === 'retention-days') { view.retentionDraftDays = event.target.value; view.retentionDraftMode = 'days'; view.retentionError = ''; return; }
   if (event.target.id === 'incoming-upload-folder') view.deviceUpload.folder = event.target.value;
 });
 

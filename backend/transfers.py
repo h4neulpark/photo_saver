@@ -16,15 +16,15 @@ import paramiko
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
-from archive import archive_config, archive_connection, archive_revision as config_identity, relative_path, storage_id_for
-from catalog import LANE_REMOTE, database, now, queue_job, upsert_remote_file
+from archive import CONNECTION_ERRORS, sftp_disconnected, archive_config, archive_connection, archive_revision as config_identity, relative_path, storage_id_for
+from catalog import LANE_REMOTE, active_duplicate_keeper_ids, database, now, queue_job, upsert_remote_file
+import offload
 from media import fingerprint, inspect, regular_file
 from settings import fail
 
 from devices import device_names, effective_device
 
 CHUNK = 1024 * 1024
-CONNECTION_ERRORS = (paramiko.SSHException, EOFError, BrokenPipeError, ConnectionError, TimeoutError, socket.timeout)
 HEX_SHA = re.compile(r"^\\?([0-9a-fA-F]{64}) [ *]")
 REMOTE_HASH_SCRIPT = (
     'if command -v sha256sum >/dev/null 2>&1; then exec sha256sum -- "$1"; '
@@ -41,14 +41,10 @@ class RemoteDuplicateError(HTTPException):
         self.new_count = new_count
 
 
-def sftp_disconnected(sftp, error=None):
-    if isinstance(error, CONNECTION_ERRORS):
-        return True
-    if hasattr(sftp, "get_channel"):
-        channel = sftp.get_channel()
-        if channel is not None and not channel.active:
-            return True
-    return False
+class MissingXmpOffloadError(HTTPException):
+    def __init__(self, missing_xmp_media_ids):
+        super().__init__(status_code=409, detail="연결된 XMP를 함께 업로드한 뒤 로컬 원본을 비울 수 있습니다.")
+        self.missing_xmp_media_ids = missing_xmp_media_ids
 
 
 def stat_mtime_ns(info):
@@ -72,6 +68,7 @@ class TransferRequest(BaseModel):
     source: list[str] = Field(default_factory=list, max_length=3)
     destination: str = ""
     allow_duplicates: bool = False
+    offload_after_upload: bool = False
 
 
 def components(parts):
@@ -131,6 +128,23 @@ def queue_transfer(db, request, device_folder):
         files.append({"id": row["id"], "kind": selection.kind, "local": local, "target": target, "sha": sha,
                       "fingerprint": row["fingerprint"] if selection.kind == "media" else None,
                       "size": row["size"] if selection.kind == "media" else None})
+    offload_media_ids = []
+    if request.offload_after_upload:
+        offload_media_ids = list(dict.fromkeys(item["id"] for item in files if item["kind"] == "media"))
+        if not offload_media_ids:
+            fail(400, "로컬 비우기는 사진·영상 원본이 포함된 업로드에서만 사용할 수 있습니다.")
+        missing_xmp_ids = []
+        for media_id in offload_media_ids:
+            row = db.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+            if row["xmp_path"]:
+                if not row["xmp_sha"]:
+                    fail(409, "연결된 XMP의 해시 정보를 확인할 수 없습니다. 먼저 새로 고침하세요.")
+                if (media_id, "xmp") not in seen and offload.find_remote_copy(db, row["xmp_sha"], storage_id, config["root"]) is None:
+                    missing_xmp_ids.append(media_id)
+        if missing_xmp_ids:
+            raise MissingXmpOffloadError(missing_xmp_ids)
+        if active_duplicate_keeper_ids(db).intersection(offload_media_ids):
+            fail(409, "Incoming 중복 정리에서 보존할 로컬 원본입니다. 정리 완료 후 다시 시도하세요.")
     if duplicates:
         duplicate_ids = {item["id"] for item in duplicates}
         new_count = sum(1 for item in files if item["id"] not in duplicate_ids)
@@ -140,13 +154,16 @@ def queue_transfer(db, request, device_folder):
             sorted(duplicate_ids),
             new_count,
         )
-    payload = {"config": config_identity(config), "files": files, "token": uuid4().hex}
+    payload = {"config": config_identity(config), "files": files, "token": uuid4().hex,
+               "offloadAfterUpload": bool(request.offload_after_upload), "offloadMediaIds": offload_media_ids}
     try:
         job_id = queue_job(db, "upload", payload)
     except ValueError as exc:
         fail(409, str(exc))
     result = {"totalFiles": len(files), "completedFiles": 0, "uploaded": 0, "skipped": 0, "failed": 0,
               "totalBytes": sum(item["size"] or 0 for item in files), "transferredBytes": 0, "errors": []}
+    if request.offload_after_upload:
+        result["offload"] = new_upload_offload_result(offload_media_ids)
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id))
     return {"id": job_id, "lane": LANE_REMOTE, "count": len(files)}
 
@@ -377,17 +394,36 @@ def record_archive(job_id, index, item, config, outcome, size=None, error=None, 
             )
 
 
+def new_upload_offload_result(ids):
+    return {"enabled": True, "totalFiles": len(ids), "completedFiles": 0, "offloaded": 0,
+            "skipped": 0, "failed": 0, "freedBytes": 0, "errors": [], "phase": "대기 중"}
+
+
 def upload_selection(job, _incoming, managed):
     payload = json.loads(job["payload"])
+    offload_after = bool(payload.get("offloadAfterUpload"))
+    offload_media_ids = list(payload.get("offloadMediaIds") or [])
+    asset_outcomes = {}
+    media_assets = {}
+    for item in payload["files"]:
+        media_assets.setdefault(item["id"], []).append(item)
+    in_offload_phase = False
     result = {"totalFiles": len(payload["files"]), "completedFiles": 0, "uploaded": 0, "skipped": 0, "failed": 0,
               "totalBytes": 0, "transferredBytes": 0, "errors": [], "current": "", "phase": "연결 중"}
-    for item in payload["files"]:
+    if offload_after:
+        result["offload"] = new_upload_offload_result(offload_media_ids)
+    for index, item in enumerate(payload["files"]):
         size = item["size"]
         if size is None:
             try:
                 size = inspect(managed, item["local"]).st_size
             except OSError:
                 size = 0
+                if offload_after:
+                    with database() as db:
+                        saved_asset = db.execute("SELECT size FROM archive_entries WHERE job_id=? AND item_index=? AND outcome IN ('uploaded','skipped')", (job["id"], index)).fetchone()
+                    if saved_asset:
+                        size = saved_asset["size"] or 0
         result["totalBytes"] += size
     last_update = 0
     completed_bytes = 0
@@ -408,8 +444,49 @@ def upload_selection(job, _incoming, managed):
         result["phase"] = phase
         save()
 
+    def check_upload_cancel():
+        with database() as db:
+            row = db.execute("SELECT result FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        if row and json.loads(row["result"] or "{}").get("cancelRequested"):
+            raise UploadCancelled()
+
     status = "done"
     try:
+        # Cancellation can survive a worker crash inside the atomic deletion
+        # boundary. Settle that boundary before stopping, without starting any
+        # new file deletion or re-uploading a removed source.
+        try:
+            check_upload_cancel()
+        except UploadCancelled:
+            recovery = []
+            if offload_after:
+                with database(write=True) as db:
+                    for media_id in offload_media_ids:
+                        row = db.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+                        if row and row["status"] == "archived":
+                            in_offload_phase = True
+                            result["offload"]["offloaded"] += 1
+                            result["offload"]["completedFiles"] += 1
+                        if not row or row["status"] != "offloading":
+                            continue
+                        in_offload_phase = True
+                        paths = [row["path"]] + ([row["xmp_path"]] if row["xmp_path"] else [])
+                        if all((managed / path).is_file() for path in paths):
+                            db.execute("UPDATE media SET status='available' WHERE id=? AND status='offloading'", (media_id,))
+                        else:
+                            recovery.append(media_id)
+                if recovery:
+                    config = archive_config()
+                    if config_identity(config) != payload["config"]:
+                        fail(409, "전송 예약 후 SSH 설정이 변경되었습니다. 다시 업로드하세요.")
+                    with archive_connection(config) as (sftp, config):
+                        for media_id in recovery:
+                            with database() as db:
+                                item = offload.build_offload_item(db, media_id, storage_id_for(config), config["root"], allow_offloading=True)
+                            result["offload"]["freedBytes"] += offload.offload_file(sftp, config, managed, item)
+                            result["offload"]["offloaded"] += 1
+                            result["offload"]["completedFiles"] += 1
+            raise
         save(True)
         config = archive_config()
         if config_identity(config) != payload["config"]:
@@ -422,11 +499,21 @@ def upload_selection(job, _incoming, managed):
                 result["current"] = item["target"]
                 save(True)
                 try:
-                    outcome, size, mtime_ns = send_file(
-                        sftp, base, managed, item, f".photo-saver-{payload['token']}-{index}.part", progress,
-                        storage_id=storage_id, archive_root=config["root"], ssh_state=ssh_state,
-                    )
-                    record_archive(job["id"], index, item, config, outcome, size, mtime_ns=mtime_ns)
+                    restored = None
+                    if offload_after:
+                        with database() as db:
+                            restored = db.execute("""SELECT a.outcome,a.size FROM archive_entries a JOIN media m ON m.id=a.media_id
+                                WHERE a.job_id=? AND a.item_index=? AND a.outcome IN ('uploaded','skipped')
+                                AND m.status IN ('offloading','archived')""", (job["id"], index)).fetchone()
+                    if restored:
+                        outcome, size = restored["outcome"], restored["size"] or 0
+                    else:
+                        outcome, size, mtime_ns = send_file(
+                            sftp, base, managed, item, f".photo-saver-{payload['token']}-{index}.part", progress,
+                            storage_id=storage_id, archive_root=config["root"], ssh_state=ssh_state,
+                        )
+                        record_archive(job["id"], index, item, config, outcome, size, mtime_ns=mtime_ns)
+                    asset_outcomes[(item["id"], item["kind"])] = outcome
                     result[outcome] += 1
                     completed_bytes += size
                 except UploadCancelled:
@@ -435,6 +522,7 @@ def upload_selection(job, _incoming, managed):
                     if sftp_disconnected(sftp, error):
                         raise
                     result["failed"] += 1
+                    asset_outcomes[(item["id"], item["kind"])] = "failed"
                     message = error.detail if isinstance(error, HTTPException) else "파일을 읽거나 업로드하지 못했습니다. 연결 및 파일 권한을 확인하세요."
                     record_archive(job["id"], index, item, config, "failed", error=message)
                     if len(result["errors"]) < 100:
@@ -442,15 +530,70 @@ def upload_selection(job, _incoming, managed):
                 result["completedFiles"] += 1
                 result["transferredBytes"] = completed_bytes
                 save(True)
+            if offload_after:
+                in_offload_phase = True
+                follow = result["offload"]
+                follow["phase"] = "로컬 원본 비우기 중"
+                result["phase"] = follow["phase"]
+                for media_id in offload_media_ids:
+                    save(True)
+                    assets = media_assets.get(media_id, [])
+                    if any(asset_outcomes.get((item["id"], item["kind"])) not in {"uploaded", "skipped"} for item in assets):
+                        follow["skipped"] += 1
+                        follow["completedFiles"] += 1
+                        continue
+                    try:
+                        with database() as db:
+                            row = db.execute("SELECT * FROM media WHERE id=?", (media_id,)).fetchone()
+                            if row and row["status"] == "archived":
+                                follow["offloaded"] += 1
+                                follow["completedFiles"] += 1
+                                continue
+                            if media_id in active_duplicate_keeper_ids(db):
+                                follow["skipped"] += 1
+                                follow["completedFiles"] += 1
+                                if len(follow["errors"]) < 100:
+                                    follow["errors"].append({"path": row["path"] if row else media_id, "message": "Incoming 중복 정리에서 보존할 로컬 원본입니다. 정리 완료 후 다시 시도하세요."})
+                                continue
+                            offload_item = offload.build_offload_item(db, media_id, storage_id, config["root"], allow_offloading=True)
+                        result["current"] = offload_item["name"]
+                        freed = offload.offload_file(sftp, config, managed, offload_item, cancel_check=check_upload_cancel)
+                        follow["offloaded"] += 1
+                        follow["freedBytes"] += freed
+                    except UploadCancelled:
+                        raise
+                    except (OSError, ValueError, HTTPException) as error:
+                        if sftp_disconnected(sftp, error):
+                            raise
+                        follow["failed"] += 1
+                        if len(follow["errors"]) < 100:
+                            follow["errors"].append({"path": row["path"] if row else media_id, "message": error.detail if isinstance(error, HTTPException) else "로컬 원본을 비우지 못했습니다."})
+                    follow["completedFiles"] += 1
+                    save(True)
+                follow["phase"] = "실패" if follow["failed"] else "완료"
         if result["failed"]:
             status = "failed"
             result["error"] = f"{result['failed']}개 파일을 업로드하지 못했습니다. 실패 목록을 확인하고 다시 업로드하세요."
+        if offload_after and result["offload"]["failed"]:
+            status = "failed"
+            result["error"] = (f"업로드 {result['failed']}개 실패, " if result["failed"] else "업로드 검증은 완료했으나 ") + f"로컬 비우기 {result['offload']['failed']}개 실패했습니다. 실패 목록을 확인하세요."
     except UploadCancelled:
         status = "cancelled"
         result["error"] = "업로드를 중지했습니다. 완료된 파일은 아카이브에 유지됩니다."
+        result["cancelRequested"] = True
+        if offload_after:
+            result["offload"]["phase"] = "중지됨" if in_offload_phase else "건너뜀"
+            result["error"] = f"로컬 원본 비우기를 중지했습니다. 이미 비운 {result['offload']['offloaded']}개 외 나머지 로컬 원본은 유지됩니다." if in_offload_phase else "업로드를 중지했습니다. 완료된 파일은 아카이브에 유지되며 로컬 원본은 비우지 않았습니다."
     except Exception as error:
         status = "failed"
         result["error"] = error.detail if isinstance(error, HTTPException) else "아카이브 전송에 실패했습니다. 연결 상태를 확인하고 다시 업로드하세요."
+        if offload_after:
+            follow = result["offload"]
+            follow["phase"] = "실패" if in_offload_phase else "건너뜀"
+            if in_offload_phase:
+                follow["failed"] += follow["totalFiles"] - follow["completedFiles"]
+                follow["completedFiles"] = follow["totalFiles"]
+                result["error"] = "로컬 원본 비우기 중 연결 또는 검증에 실패했습니다. 남은 원본은 유지됩니다."
         pending = payload["files"][result["completedFiles"]:]
         result["failed"] += len(pending)
         result["completedFiles"] = result["totalFiles"]

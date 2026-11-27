@@ -234,6 +234,6 @@ test('13 Archive connection survives revisit, bounds failed attempts and invalid
 test('14 Settings orders daily names, connection, backup and marked danger area', () => {
   const h = createHarness(); h.view.settings = configured(); h.view.devices = []; route(h, 'settings');
   const sections = h.page.querySelectorAll('.settings-section');
-  assert.deepEqual(plain(sections.map(section => section.getAttribute('aria-label'))), ['촬영도구 이름', '스토리지 연결', 'DB 백업 및 복원', '썸네일 캐시', '데이터 초기화']);
-  assert.equal(sections[4].classList.contains('settings-danger'), true); assert.equal(sections[4].querySelector('.settings-danger-badge').textContent, '위험 구역');
+  assert.deepEqual(plain(sections.map(section => section.getAttribute('aria-label'))), ['촬영도구 이름', '스토리지 연결', 'DB 백업 및 복원', '썸네일 캐시', '로컬 보존 정책', '데이터 초기화']);
+  assert.equal(sections[5].classList.contains('settings-danger'), true); assert.equal(sections[5].querySelector('.settings-danger-badge').textContent, '위험 구역');
 });

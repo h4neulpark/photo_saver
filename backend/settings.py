@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from starlette.background import BackgroundTask
 
 from catalog import (DATA, DEFAULT_ZONE, JobConflictError, LANE_EXCLUSIVE, LANE_REMOTE,
@@ -31,6 +31,7 @@ router = APIRouter(prefix="/api/settings")
 SETTINGS_DIR = Path("/settings")
 ADDRESS_FILE = SETTINGS_DIR / "address"
 STORAGE_ROOT_FILE = SETTINGS_DIR / "remote-root"
+LOCAL_RETENTION_FILE = SETTINGS_DIR / "local-retention.json"
 STORAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 KEY_DIR = SETTINGS_DIR / "ssh"
 KEY_FILE = KEY_DIR / "id_ed25519"
@@ -78,6 +79,45 @@ class CatalogReset(BaseModel):
     confirmation: Literal["모든 데이터 삭제"]
 
 
+class LocalRetentionConfig(BaseModel):
+    mode: Literal["manual", "days"]
+    days: int | None = None
+
+    @field_validator("days", mode="before")
+    @classmethod
+    def integer_days(cls, value):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("보존 기간은 0에서 3650 사이의 정수로 입력하세요.")
+        return value
+
+    @model_validator(mode="after")
+    def valid_policy(self):
+        if self.mode == "manual" and self.days is not None:
+            fail(400, "수동 유지 정책에는 보존 기간을 지정할 수 없습니다.")
+        if self.mode == "days" and (self.days is None or not 0 <= self.days <= 3650):
+            fail(400, "보존 기간은 0에서 3650 사이의 정수로 입력하세요.")
+        return self
+
+
+def read_local_retention():
+    try:
+        return LocalRetentionConfig.model_validate(json.loads(LOCAL_RETENTION_FILE.read_text(encoding="utf-8"))).model_dump()
+    except (OSError, ValueError, TypeError, HTTPException):
+        return {"mode": "manual", "days": None}
+
+
+def save_local_retention(mode, days):
+    policy = LocalRetentionConfig(mode=mode, days=days).model_dump()
+    with settings_lock():
+        replace_setting(LOCAL_RETENTION_FILE, json.dumps(policy, ensure_ascii=False) + "\n")
+
+
+@router.put("/retention")
+def put_local_retention(request: LocalRetentionConfig):
+    save_local_retention(request.mode, request.days)
+    return JSONResponse(settings_state(), headers=NO_STORE)
+
+
 def fail(status, message):
     raise HTTPException(status_code=status, detail=message)
 
@@ -118,6 +158,7 @@ def settings_state():
     storage_root = read_setting(STORAGE_ROOT_FILE)
     generated = KEY_FILE.is_file() and PUBLIC_KEY.is_file()
     return {
+        "localRetention": read_local_retention(),
         "storageWake": public_configuration(),
         "address": address, "storageRoot": storage_root, "account": "***", "publicKey": "***",
         "addressConfigured": bool(address),

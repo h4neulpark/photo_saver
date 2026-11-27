@@ -829,3 +829,22 @@ dialog::backdrop { background: #111d34a1; }
 .device-name-error { flex-basis: 100%; }
 
 .catalog-upload-success { color: var(--teal); }
+.source-filters, .retention-presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.source-filters { padding: 12px 18px; }
+.source-filters [aria-pressed="true"], .retention-presets [aria-pressed="true"] { background: var(--blue-soft); color: var(--ink); border-color: var(--blue); }
+.upload-offload-option { display: flex; align-items: flex-start; gap: 8px; padding: 8px 18px 16px; font-size: 13px; }
+.upload-offload-option input { flex: 0 0 auto; margin-top: 3px; }
+.source-archive-badge { display: inline-block; font-size: 11px; padding: 2px 6px; border: 1px solid var(--line, #d6ddd8); border-radius: 4px; }
+.tree-file .source-archive-badge { margin-left: 8px; white-space: normal; }
+.retention-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px 18px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--blue-soft); }
+.retention-banner > div { flex: 1 1 260px; }
+.retention-banner p { margin: 6px 0 0; }
+.retention-form { display: grid; gap: 14px; padding: 18px; }
+.retention-form > label { display: grid; gap: 6px; max-width: 420px; }
+.retention-form > .button { justify-self: start; }
+.upload-offload-summary { font-size: 13px; margin: 12px 0; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .retention-banner { align-items: stretch; }
+  .retention-banner > .button { width: 100%; }
+  .source-archive-badge { max-width: 100%; }
+}

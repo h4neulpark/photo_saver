@@ -19,6 +19,17 @@ import settings
 router = APIRouter(prefix="/api/archive")
 MAX_ENTRIES = 10000
 DOWNLOAD_CHUNK = 1024 * 1024
+CONNECTION_ERRORS = (paramiko.SSHException, EOFError, BrokenPipeError, ConnectionError, TimeoutError, socket.timeout)
+
+
+def sftp_disconnected(sftp, error=None):
+    if isinstance(error, CONNECTION_ERRORS):
+        return True
+    if hasattr(sftp, "get_channel"):
+        channel = sftp.get_channel()
+        if channel is not None and not channel.active:
+            return True
+    return False
 
 
 def relative_path(value):

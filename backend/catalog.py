@@ -380,9 +380,16 @@ def has_active_jobs(connection, lanes=None):
 
 
 def active_offload_media_ids(connection):
-    return {item["id"] for row in connection.execute(
-        "SELECT payload FROM jobs WHERE kind='offload' AND status IN ('queued','running')"
-    ) for item in json.loads(row["payload"]).get("files", [])}
+    ids = set()
+    for row in connection.execute(
+        "SELECT kind,payload FROM jobs WHERE kind IN ('offload','upload') AND status IN ('queued','running')"
+    ):
+        payload = json.loads(row["payload"])
+        if row["kind"] == "offload":
+            ids.update(item["id"] for item in payload.get("files", []))
+        elif payload.get("offloadAfterUpload"):
+            ids.update(payload.get("offloadMediaIds", []))
+    return ids
 
 
 def active_duplicate_keeper_ids(connection):

@@ -102,13 +102,14 @@ class TransferTests(unittest.TestCase):
                 db.execute('UPDATE media SET xmp_path=?,xmp_sha=? WHERE id=?', (f'{file_id}/{sidecar.name}', hashlib.sha256(sidecar.read_bytes()).hexdigest(), file_id))
         return file
 
-    def queue(self, items=None, source=None, destination='', allow_duplicates=False):
+    def queue(self, items=None, source=None, destination='', allow_duplicates=False, offload_after_upload=False):
         request = transfers.TransferRequest(
             connection=transfers.config_identity(self.config),
             items=items or [{'id': 'one'}],
             source=source or [],
             destination=destination,
             allow_duplicates=allow_duplicates,
+            offload_after_upload=offload_after_upload,
         )
         with catalog.database(write=True) as db:
             result = transfers.queue_transfer(db, request, api.device_folder)
@@ -119,6 +120,142 @@ class TransferTests(unittest.TestCase):
         with catalog.database() as db:
             record = db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone()
         return record['status'], json.loads(record['result'])
+
+    def test_upload_offload_requires_media_and_xmp_or_existing_copy(self):
+        with self.assertRaises(HTTPException) as error:
+            self.queue([{'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        self.assertEqual(error.exception.status_code, 400)
+        with self.assertRaises(transfers.MissingXmpOffloadError) as error:
+            self.queue(offload_after_upload=True)
+        self.assertEqual(error.exception.missing_xmp_media_ids, ['one'])
+        self.run_job(self.queue([{'id': 'one', 'kind': 'xmp'}]))
+        status, result = self.run_job(self.queue(offload_after_upload=True))
+        self.assertEqual((status, result['offload']['offloaded']), ('done', 1))
+        self.assertFalse((self.managed / 'one').exists())
+
+    def test_upload_offload_success_and_crash_replay(self):
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with catalog.database() as db:
+            self.assertEqual(catalog.active_offload_media_ids(db), {'one'})
+        status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['offloaded'], result['offload']['freedBytes']), ('done', 1, 17))
+        with patch.object(transfers, 'send_file', side_effect=AssertionError('deleted local must not be re-uploaded')):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['uploaded'], result['offload']['offloaded']), ('done', 2, 1))
+        self.assertEqual((result['totalBytes'], result['transferredBytes']), (17, 17))
+        with catalog.database() as db:
+            self.assertEqual(transfers.offload.upload_offload_candidates(db, job['id'])['ids'], [])
+
+    def test_upload_offload_recovers_mid_delete_without_reupload(self):
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        def crash(*args, **kwargs):
+            with catalog.database(write=True) as db:
+                db.execute("UPDATE media SET status='offloading' WHERE id='one'")
+            (self.managed / 'one/clip.MP4').unlink()
+            raise SystemExit('worker crash')
+        with patch.object(transfers.offload, 'offload_file', side_effect=crash), self.assertRaises(SystemExit):
+            self.run_job(job)
+        with patch.object(transfers, 'send_file', side_effect=AssertionError('must restore durable archive outcomes')):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['offloaded']), ('done', 1))
+        with catalog.database() as db:
+            self.assertEqual(db.execute("SELECT status FROM media WHERE id='one'").fetchone()[0], 'archived')
+
+    def test_upload_offload_partial_failure_offloads_only_successful_media(self):
+        self.add_file('two', 'second.MP4', b'second video')
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}, {'id': 'two'}], offload_after_upload=True)
+        send = transfers.send_file
+        def fail_one(*args, **kwargs):
+            if args[3]['id'] == 'one':
+                raise HTTPException(409, 'failed')
+            return send(*args, **kwargs)
+        with patch.object(transfers, 'send_file', side_effect=fail_one):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['offloaded'], result['offload']['skipped']), ('failed', 1, 1))
+        self.assertTrue((self.managed / 'one/clip.MP4').exists())
+        self.assertFalse((self.managed / 'two/second.MP4').exists())
+
+    def test_upload_cancel_after_crash_rolls_back_or_finishes_atomic_file(self):
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+                # Complete upload only, simulating a crash before the followup result is saved.
+                with patch.object(transfers.offload, 'offload_file', side_effect=SystemExit), self.assertRaises(SystemExit):
+                    self.run_job(job)
+                with catalog.database(write=True) as db:
+                    db.execute("UPDATE media SET status='offloading' WHERE id='one'")
+                    db.execute('UPDATE jobs SET result=? WHERE id=?', (json.dumps({'cancelRequested': True}), job['id']))
+                if removed:
+                    (self.managed / 'one/clip.MP4').unlink()
+                with patch.object(transfers, 'send_file', side_effect=AssertionError('cancel must not upload')):
+                    status, result = self.run_job(job)
+                self.assertEqual((status, result['offload']['phase']), ('cancelled', '중지됨'))
+                with catalog.database() as db:
+                    self.assertEqual(db.execute("SELECT status FROM media WHERE id='one'").fetchone()[0], 'archived' if removed else 'available')
+
+    def test_missing_xmp_offload_http_error_and_missing_hash(self):
+        from fastapi.testclient import TestClient
+        response = TestClient(api.app).post('/api/archive/transfers', json={
+            'connection': transfers.config_identity(self.config), 'items': [{'id': 'one'}], 'offload_after_upload': True,
+        })
+        self.assertEqual((response.status_code, response.json()['code'], response.json()['missingXmpMediaIds']), (409, 'missing_xmp_for_offload', ['one']))
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE media SET xmp_sha=NULL WHERE id='one'")
+        with self.assertRaises(HTTPException) as error:
+            self.queue(offload_after_upload=True)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIn('해시', error.exception.detail)
+
+    def test_upload_offload_partial_asset_failure_keeps_local(self):
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        send = transfers.send_file
+        def fail_xmp(*args, **kwargs):
+            if args[3]['kind'] == 'xmp':
+                raise HTTPException(409, 'XMP failed')
+            return send(*args, **kwargs)
+        with patch.object(transfers, 'send_file', side_effect=fail_xmp):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['failed'], result['offload']['skipped']), ('failed', 1, 1))
+        self.assertTrue((self.managed / 'one/clip.MP4').exists())
+
+    def test_upload_offload_cancel_in_upload_and_followup(self):
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with patch.object(transfers, 'send_file', side_effect=transfers.UploadCancelled):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['phase'], result['offload']['offloaded']), ('cancelled', '건너뜀', 0))
+        self.assertIn('비우지 않았습니다', result['error'])
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with patch.object(transfers.offload, 'offload_file', side_effect=transfers.UploadCancelled):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['phase'], result['offload']['completedFiles']), ('cancelled', '중지됨', 0))
+        self.assertTrue((self.managed / 'one/clip.MP4').exists())
+
+    def test_upload_offload_disconnect_never_starts_deletion(self):
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with patch.object(transfers, 'send_file', side_effect=BrokenPipeError), patch.object(transfers.offload, 'offload_file') as remove:
+            status, result = self.run_job(job)
+        remove.assert_not_called()
+        self.assertEqual((status, result['offload']['phase']), ('failed', '건너뜀'))
+
+    def test_upload_offload_keeper_rejected_and_individual_offload_failure(self):
+        with catalog.database(write=True) as db:
+            keeper = catalog.queue_job(db, 'duplicate-cleanup', {'files': [{'keeper': {'kind': 'managed', 'id': 'one'}}]})
+        with self.assertRaises(HTTPException) as error:
+            self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        self.assertEqual(error.exception.status_code, 409)
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE jobs SET status='done' WHERE id=?", (keeper,))
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with patch.object(transfers.offload, 'offload_file', side_effect=HTTPException(409, 'verification failed')):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['failed'], result['offload']['failed']), ('failed', 0, 1))
+        self.assertEqual(result['offload']['errors'][0]['path'], 'one/clip.MP4')
+        self.assertTrue(api.job_has_attention(status, result))
+        job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with patch.object(transfers, 'active_duplicate_keeper_ids', return_value={'one'}):
+            status, result = self.run_job(job)
+        self.assertEqual((status, result['offload']['skipped']), ('done', 1))
+        self.assertEqual(result['offload']['errors'][0]['path'], 'one/clip.MP4')
 
     def test_folder_structure_sidecar_hash_and_repeat_skip(self):
         job = self.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}, {'id': 'one'}], destination='inbox')

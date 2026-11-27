@@ -375,6 +375,33 @@ class ConcurrencyTests(unittest.TestCase):
             for field in ('xmp_path', 'xmp_sha', 'xmp_metadata'):
                 self.assertEqual(after[field], before[field], field)
 
+    def test_upload_with_followup_reserves_media_for_xmp_and_duplicate_cleanup(self):
+        job = self.transfer.queue([{'id': 'one'}, {'id': 'one', 'kind': 'xmp'}], offload_after_upload=True)
+        with catalog.database() as db:
+            self.assertEqual(catalog.active_offload_media_ids(db), {'one'})
+        sidecar = {'path': 'new.xmp', 'sha': 'new', 'metadata': {}}
+        scan = self.queue('scan')
+        with catalog.database(write=True) as db:
+            worker.finish(db, scan, {})
+            db.execute("INSERT INTO scan_xmp(id,scan_id,file,candidates) VALUES ('x',?,?,'[\"one\"]')", (scan, json.dumps(sidecar)))
+        with self.assertRaises(HTTPException) as error:
+            api.link_xmp(api.XmpSelection(links=[{'id': 'x', 'media_id': 'one'}]))
+        self.assertEqual(error.exception.status_code, 409)
+        with self.assertRaises(OSError):
+            worker.retain_xmp(self.incoming, self.managed, 'one', sidecar)
+        duplicate = self.incoming / 'copy.MP4'
+        duplicate.write_bytes((self.managed / 'one/clip.MP4').read_bytes())
+        sha, info = media.hash_file(self.incoming, duplicate.name)
+        with catalog.database(write=True) as db:
+            db.execute("""INSERT INTO scan_files(scan_id,id,path,sha,size,fingerprint,status,reason)
+                VALUES (?,'copy','copy.MP4',?,?,?,'duplicate','managed의 one/clip.MP4와 동일')""", (scan, sha, info.st_size, media.fingerprint(info)))
+        with self.assertRaises(HTTPException) as error:
+            api.clean_incoming_duplicates(api.DuplicateCleanupSelection(items=[{'id': 'copy', 'keeperKind': 'managed', 'keeperId': 'one'}]))
+        self.assertEqual(error.exception.status_code, 409)
+        self.complete(job['id'])
+        with catalog.database() as db:
+            self.assertEqual(catalog.active_offload_media_ids(db), set())
+
     def test_xmp_link_and_offload_race_blocked(self):
         self.fixture.upload_all()
         queued = api.offload_files(offload.OffloadRequest(ids=['one']))

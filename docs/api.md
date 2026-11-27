@@ -334,3 +334,36 @@ incoming 디렉터리와 모든 파일·하위 폴더, SSH 설정·키와 원격
 보유 행의 `latest_archive`는 시도가 없으면 null이며, 있으면 `record_key`, `job_id`, 숫자 `item_index`, `outcome`, `job_status`, `storage_id`, `archive_root`, `target`, `recorded_at`, `verified_at`, `error`를 제공한다. `has_verified_history`는 동일 ID·자산 종류·현재 SHA의 성공 이력이다. `uploadSummary`는 선택 이벤트/장비 범위의 현재 자산별 total/success/failed/pending/unknown/legacy/none을 제공하며 검색/선택 필터는 무시한다. `archiveSelection`은 jobId/total/uploaded/skipped/legacy/failed/pending/unknown을 제공하며 작업·이벤트·장비 범위를 반영하고 검색/결과 필터는 무시한다. 기존 전역 summary는 유지한다. 아카이브 검색은 오류 문자열도 포함하며 정렬은 작업 번호 내림차순, 숫자 manifest 위치 오름차순이다.
 
 썸네일 계획/작업의 선택적 `job_id`도 같은 정수 범위를 가지며 `scope=folder,view=archives` 범위에 적용한다. 전체 생성에는 job_id를 보내지 않는다. 다운로드/썸네일 권한은 최근 업로드 결과에서 파생하지 않는다.
+## 로컬 원본 생명주기
+
+`GET /api/settings`는 `localRetention: {mode: "manual" | "days", days: int | null}`을 반환합니다.
+`PUT /api/settings/retention`은 같은 객체를 받아 전체 설정 상태를 반환합니다 (`Cache-Control: no-store`).
+수동 유지에서는 `days=null`, 기간 보관에서는 정수 `0..3650`을 사용하며 bool·실수·문자열은 거부합니다 (400 또는 422).
+설정은 `/settings/local-retention.json`에 권한 0600으로 원자 저장하고, 손상·미존재 시 수동 유지로 돌아갑니다.
+DB 백업 복원과 데이터 초기화는 이 설정을 유지합니다. 정책 저장은 자동 삭제를 시작하지 않습니다.
+
+`POST /api/archive/transfers`의 `TransferRequest`에 `offload_after_upload: bool = false`가 추가되었습니다.
+활성화하면 사진·영상 원본이 적어도 하나 있어야 하고, 연결된 XMP는 함께 선택하거나 활성 아카이브 경로에 보관되어 있어야 합니다.
+XMP가 누락되면 `MissingXmpOffloadError` (409)는 `{detail, code: "missing_xmp_for_offload", missingXmpMediaIds: [id]}`를 반환합니다.
+해시가 없거나 Incoming 중복 정리에서 보존할 원본이면 409로 거부합니다.
+업로드 단계가 완료되면 같은 SFTP 세션에서 성공한 에셋의 원본만 Safe Offload로 처리합니다.
+업로드 취소·연결 단절 시 후속 비우기를 시작하지 않으며, 비우기 취소는 현재 파일의 원자 삭제가 끝난 뒤 적용합니다.
+결과의 `offload`는 `{enabled, totalFiles, completedFiles, offloaded, skipped, failed, freedBytes, errors, phase}`입니다.
+업로드 또는 후속 비우기 실패가 있으면 작업 상태는 `failed`이고 작업 내역에서 주의 대상으로 표시합니다.
+
+- `POST /api/jobs/offload/{job_id}/cancel`: queued는 즉시 cancelled, running은 `cancelRequested=true` 요청 후 안전 경계에서 종료합니다. 종료된 작업에는 멱등이며 없으면 404입니다. 작업 객체를 반환합니다.
+- `GET /api/archive/transfers/{job_id}/offload-candidates`: 업로드의 uploaded/skipped 기록과 현재 로컬·활성 아카이브·XMP·중복 보존 상태를 교차 검증합니다. 없거나 upload가 아니면 404입니다. `{ids, totalEligibleCount, truncated, totalBytes, blockedByKeeperCount, excludedMissingXmp, samples}`를 반환합니다. 원래 전송 순서로 정렬하고 samples는 최대 20건입니다.
+- `GET /api/offload/retention-candidates`: `{ids, totalEligibleCount, truncated, totalBytes, blockedByKeeperCount, missingVerifiedAtCount, storageConfigured, samples}`를 반환합니다. 검증 시각과 이름 순으로 정렬하고 samples는 최대 50건입니다.
+
+위 세 엔드포인트는 모두 `Cache-Control: no-store`입니다. 두 후보 API의 ids는 최대 10,000건이며 집계는 전체 대상 기준입니다. `totalBytes`는 연결된 XMP를 포함합니다. 후보 조회는 파일을 삭제하지 않으며, 사용자 확인 후 기존 `POST /api/jobs/offload`에 ids를 전달합니다.
+
+`GET /api/state`의 추가 필드:
+
+- `retention`: `{mode, days, storageConfigured, eligibleCount, eligibleBytes, blockedByKeeperCount, missingVerifiedAtCount}`.
+- `latestUploadOffload`: 가장 최근 remote 작업이 종료된 upload일 때 `{jobId, count, totalBytes, blockedByKeeperCount, excludedMissingXmp}`. 대상·제외가 모두 없거나 다른 작업이면 null.
+- 각 managed 항목 (`view_media`): 기존 십진 MB `size`를 유지하고 `sizeBytes: int`, `xmpSizeBytes: int | null`, `archivedAt: ISO | null`, `retentionDueAt: ISO | null`, `retentionEligible: bool`을 추가합니다.
+
+보존 기간은 촬영일·first_seen_at·last_seen_at이 아닌 활성 archive_root의 present 사본 `verified_at`에서만 계산합니다.
+동일 storage_id 사본을 우선하고 그 안의 가장 이른 검증을 사용합니다. XMP가 연결되어 있으면 원본과 XMP 검증 중 더 늦은 시각부터 계산합니다.
+검증 시각이 없거나 파싱할 수 없으면 대상에서 제외합니다. 0일은 검증 직후, 1일 이상은 UTC 만료 시각 이후에 제안합니다.
+실제 삭제 시 원격 존재·크기와 로컬 fingerprint·SHA-256을 다시 확인하며, 중복 정리의 보존 원본은 예약과 실행 시점 모두 보호합니다.
