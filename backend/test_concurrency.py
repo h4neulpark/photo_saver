@@ -42,7 +42,7 @@ class ConcurrencyTests(unittest.TestCase):
         for kind in ('upload', 'offload', 'remote-index', 'thumbnails-remote', 'storage-wake', 'reset-all'):
             with self.subTest(kind=kind), self.assertRaises(catalog.JobConflictError):
                 self.queue(kind)
-        for kind in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'thumbnails-local'):
+        for kind in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'aux-cleanup', 'thumbnails-local'):
             local = self.queue(kind)
             self.assertEqual(self.status(shutdown), 'queued')
             self.complete(local)
@@ -108,7 +108,7 @@ class ConcurrencyTests(unittest.TestCase):
                         db.execute("UPDATE jobs SET lane='exclusive' WHERE lane='remote'")
 
     def test_local_and_remote_allowed_concurrently_same_lane_rejected(self):
-        for local in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'thumbnails-local'):
+        for local in ('scan', 'move', 'delete', 'xmp-link', 'duplicate-cleanup', 'aux-cleanup', 'thumbnails-local'):
             for remote in ('upload', 'offload', 'remote-index', 'thumbnails-remote'):
                 with self.subTest(local=local, remote=remote):
                     a, b = self.queue(local), self.queue(remote)
@@ -130,6 +130,30 @@ class ConcurrencyTests(unittest.TestCase):
         self.complete(cleanup)
         with catalog.database() as db:
             self.assertEqual(catalog.active_duplicate_keeper_ids(db), set())
+
+    def test_aux_http_worker_with_remote_lane_and_local_conflicts(self):
+        target = self.incoming / 'orphan.THM'
+        target.write_bytes(b'aux')
+        remote = self.queue('upload')
+        client = TestClient(api.app)
+        self.addCleanup(client.close)
+        with patch.object(api, 'INCOMING_PREVIEW', self.incoming):
+            item = client.get('/api/incoming/aux/plan').json()['items'][0]
+            response = client.post('/api/jobs/aux-cleanup', json={'items': [{key: item[key] for key in ('path', 'fingerprint')}]})
+            self.assertEqual(response.status_code, 202)
+            for kind in ('scan', 'move', 'delete', 'duplicate-cleanup', 'xmp-link', 'aux-cleanup', 'thumbnails-local'):
+                with self.assertRaises(catalog.JobConflictError):
+                    self.queue(kind)
+            coordinator = worker.WorkerCoordinator(self.incoming, self.managed)
+            # Keep the remote queue occupied without starting network work.
+            with catalog.database(write=True) as db:
+                db.execute("UPDATE jobs SET status='running' WHERE id=?", (remote,))
+            coordinator.dispatch_once()
+            coordinator.running['local'].join(timeout=5)
+        result = api.state()['latestIncomingResult']
+        self.assertEqual((result['id'], result['kind'], result['result']['deleted']), (response.json()['id'], 'aux-cleanup', 1))
+        self.assertEqual(self.status(remote), 'running')
+        self.assertFalse(target.exists())
 
     def test_latest_incoming_result_survives_a_new_scan(self):
         cleanup = self.queue('duplicate-cleanup')

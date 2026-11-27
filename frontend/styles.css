@@ -24,6 +24,29 @@
   font-synthesis: none;
 }
 *, *::before, *::after { box-sizing: border-box; }
+.cleanup-aux-option { padding: 12px; border: 1px solid var(--red-line); background: var(--red-soft); border-radius: 8px; }
+.cleanup-aux-option .checkbox-row, .aux-cleanup-item, .companion-group > .checkbox-row { min-height: 44px; }
+.companions-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0; }
+.companions-toolbar > div { flex: 1 1 280px; min-width: 0; }
+.companions-toolbar .button { min-height: 44px; white-space: normal; }
+[data-action="cleanup-aux-companions"], dialog:has(.aux-cleanup-groups) .button,
+dialog:has(.cleanup-aux-option) .button, dialog:has(.cleanup-aux-option) select { min-height: 44px; white-space: normal; }
+.companion-group { min-width: 0; border-top: 1px solid var(--line); padding: 16px 0; }
+.companion-group h3 { margin: 0 0 12px; font-size: 14px; }
+.companion-group ul { list-style: none; padding: 0; margin: 0; }
+.companion-row { padding: 10px 0; }
+.companion-meta { display: block; margin-top: 4px; }
+.companion-row, .companion-meta, .aux-cleanup-item, .cleanup-aux-option, .aux-cleanup-warning { overflow-wrap: anywhere; }
+.aux-cleanup-warning { padding: 12px; border-left: 3px solid var(--amber); background: var(--amber-soft); color: var(--amber); }
+.aux-cleanup-groups { min-width: 0; }
+.aux-cleanup-item { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.aux-cleanup-item > span { min-width: 0; }
+.aux-cleanup-item input { flex-shrink: 0; }
+@media (max-width: 480px) {
+  .companions-toolbar { align-items: stretch; }
+  .companions-toolbar .button { flex: 1 1 100%; }
+  .aux-cleanup-item { gap: 8px; }
+}
 .active-jobs-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .active-job-pill { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; max-width: 100%; padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); background: var(--white); }
 .active-job-pill > span { min-width: 0; overflow-wrap: anywhere; }

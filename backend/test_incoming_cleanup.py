@@ -328,3 +328,169 @@ class IncomingCleanupTests(unittest.TestCase):
         fail.assert_called_once_with(409, result["items"][0]["reason"])
         self.assertEqual(source.read_bytes(), b"footage")
         self.assertEqual(self.scan_row("copy")["status"], "review")
+
+    def attach_aux(self, file_id, names, *, legacy=False):
+        entries = []
+        for name in names:
+            path = self.incoming / name
+            path.write_bytes(b"auxiliary")
+            entry = {"path": name, "fingerprint": media.fingerprint(path.stat()), "disposition": "keep"}
+            if not legacy:
+                entry["size"] = path.stat().st_size
+            entries.append(entry)
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE scan_files SET companions=? WHERE id=?", (json.dumps(entries), file_id))
+        return entries
+
+    def queue_with_aux(self, *ids, keeper=None):
+        keeper = keeper or self.plan(*ids)[0]["keepers"][0]
+        with catalog.database(write=True) as db:
+            result = incoming_cleanup.queue_duplicate_cleanup(db, [self.request(file_id, keeper) for file_id in ids], delete_aux=True)
+            return dict(db.execute("SELECT * FROM jobs WHERE id=?", (result["id"],)).fetchone())
+
+    def test_aux_opt_in_whitelist_and_legacy_size(self):
+        source = self.add_incoming("GH010636")
+        self.add_managed()
+        entries = self.attach_aux("GH010636", ["GL010636.LRV", "GH010636.THM", "GH010636.AAE", "GH010636.xmp"], legacy=True)
+        group, = self.plan("GH010636")
+        self.assertEqual(len(group["auxCompanions"]), 3)
+        self.assertTrue(all(item["sizeBytes"] == 9 for item in group["auxCompanions"]))
+        result = self.run_job(self.queue_with_aux("GH010636"))
+        self.assertEqual((result["cleaned"], result["auxDeleted"], result["companionReview"], result["freedBytes"]), (1, 3, 0, 34))
+        self.assertFalse(source.exists())
+        self.assertTrue((self.incoming / entries[-1]["path"]).exists())
+        self.assertEqual([item["disposition"] for item in result["items"][0]["companions"]], ["deleted"] * 3 + ["keep"])
+
+    def test_aux_default_false_preserves_fingerprinted_aux(self):
+        self.add_incoming("copy")
+        self.add_managed()
+        self.attach_aux("copy", ["copy.AAE"])
+        job = self.queue(self.request("copy", self.plan("copy")[0]["keepers"][0]))
+        self.assertNotIn("deleteAux", json.loads(job["payload"]))
+        result = self.run_job(job)
+        self.assertEqual(result["auxDeleted"], 0)
+        self.assertTrue((self.incoming / "copy.AAE").exists())
+
+    def test_aux_incoming_keeper_survives_and_promotes(self):
+        self.add_incoming("first")
+        self.add_incoming("second")
+        self.attach_aux("first", ["first.THM"])
+        self.attach_aux("second", ["second.THM"])
+        keeper = next(item for item in self.plan("second")[0]["keepers"] if item["id"] == "first")
+        result = self.run_job(self.queue_with_aux("second", keeper=keeper))
+        self.assertEqual(result["auxDeleted"], 1)
+        self.assertTrue((self.incoming / "first.THM").exists())
+        self.assertEqual(self.scan_row("first")["status"], "ready")
+        self.assertEqual(json.loads(self.scan_row("first")["companions"])[0]["disposition"], "delete-after-move")
+
+    def test_shared_aux_references_are_excluded_at_plan_and_queue(self):
+        for file_id in ("first", "second"):
+            self.add_incoming(file_id)
+        self.add_managed()
+        entries = self.attach_aux("first", ["shared.THM"])
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE scan_files SET companions=?,status='review' WHERE id='second'", (json.dumps(entries),))
+        self.assertEqual(self.plan("first")[0]["auxCompanions"], [])
+        job = self.queue_with_aux("first")
+        self.assertEqual(json.loads(job["payload"])["files"][0]["auxCompanions"], [])
+        self.run_job(job)
+        self.assertTrue((self.incoming / "shared.THM").exists())
+
+    def test_failed_main_preserves_aux_and_individual_aux_failure_isolated(self):
+        source = self.add_incoming("copy")
+        keeper = self.add_managed()
+        self.attach_aux("copy", ["copy.AAE"])
+        job = self.queue_with_aux("copy")
+        keeper.unlink()
+        result = self.run_job(job)
+        self.assertEqual((result["review"], result["auxDeleted"]), (1, 0))
+        self.assertTrue(source.exists())
+        self.assertTrue((self.incoming / "copy.AAE").exists())
+
+    def test_aux_changed_absent_and_valid_are_independent(self):
+        self.add_incoming("copy")
+        self.add_managed()
+        self.attach_aux("copy", ["copy.AAE", "copy.LRV", "copy.THM"])
+        job = self.queue_with_aux("copy")
+        (self.incoming / "copy.AAE").write_bytes(b"changed edits")
+        (self.incoming / "copy.LRV").unlink()
+        with self.assertLogs(incoming_cleanup.log, level="WARNING"):
+            result = self.run_job(job)
+        self.assertEqual((result["cleaned"], result["auxDeleted"], result["companionReview"], result["review"]), (1, 1, 1, 0))
+        self.assertEqual(result["phase"], "확인 필요 항목 있음")
+        self.assertEqual([item["disposition"] for item in result["items"][0]["companions"]], ["review", "absent", "deleted"])
+
+    def test_aux_four_restart_boundaries(self):
+        for index, boundary in enumerate(("duplicate", "deleting-existing", "deleting-absent", "deleted-partial")):
+            with self.subTest(boundary=boundary):
+                file_id = f"copy{index}"
+                source = self.add_incoming(file_id)
+                if index == 0:
+                    self.add_managed()
+                entries = self.attach_aux(file_id, [f"{file_id}.THM", f"{file_id}.LRV"])
+                job = self.queue_with_aux(file_id)
+                if boundary != "duplicate":
+                    status = "deleted" if boundary == "deleted-partial" else "deleting"
+                    if boundary in {"deleting-absent", "deleted-partial"}:
+                        source.unlink()
+                    if boundary == "deleted-partial":
+                        (self.incoming / entries[0]["path"]).unlink()
+                        entries[0]["disposition"] = "deleted"
+                    with catalog.database(write=True) as db:
+                        db.execute("UPDATE scan_files SET status=?,companions=? WHERE id=?", (status, json.dumps(entries), file_id))
+                result = self.run_job(job)
+                self.assertEqual((result["cleaned"], result["auxDeleted"], result["freedBytes"]), (1, 2, 25))
+
+    def test_size_snapshot_rejects_malformed_values(self):
+        for value in (None, "bad", "{}", "[1,2,3]", "[1,2,-1,4,5]", "[1,2,true,4,5]", "[1,2,1.5,4,5]"):
+            self.assertIsNone(media.size_from_fingerprint(value))
+        self.assertEqual(media.size_from_fingerprint('[1,2,0,4,5]'), 0)
+
+    def test_ambiguous_unreadable_and_already_processed_aux_are_excluded(self):
+        self.add_incoming("copy")
+        self.add_managed()
+        entries = self.attach_aux("copy", ["orphan.THM", "unreadable.AAE", "old.LRV", "again.LRV"])
+        entries[0].pop("fingerprint")
+        entries[1].pop("fingerprint")
+        entries[2]["disposition"] = "deleted"
+        entries[3]["disposition"] = "review"
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE scan_files SET companions=? WHERE id='copy'", (json.dumps(entries),))
+        self.assertEqual(self.plan("copy")[0]["auxCompanions"], [])
+        self.assertEqual(self.run_job(self.queue_with_aux("copy"))["auxDeleted"], 0)
+        self.assertTrue(all((self.incoming / entry["path"]).exists() for entry in entries))
+
+    def test_shared_selected_target_aux_and_duplicate_entries_are_excluded(self):
+        self.add_incoming("first")
+        self.add_incoming("second")
+        self.add_managed()
+        entries = self.attach_aux("first", ["shared.THM"])
+        with catalog.database(write=True) as db:
+            db.execute("UPDATE scan_files SET companions=?", (json.dumps(entries),))
+        self.assertEqual(self.plan("first", "second")[0]["auxCompanions"], [])
+        self.assertEqual(self.run_job(self.queue_with_aux("first", "second"))["auxDeleted"], 0)
+
+    def test_aux_cleanup_then_duplicate_cleanup_preserves_terminal_companion_receipts(self):
+        self.add_managed()
+        for delete_aux in (False, True):
+            with self.subTest(delete_aux=delete_aux):
+                file_id = f"copy-{delete_aux}"
+                self.add_incoming(file_id)
+                entries = self.attach_aux(file_id, [f"{file_id}.LRV", f"{file_id}.THM"])
+                with catalog.database(write=True) as db:
+                    queued = incoming_cleanup.queue_aux_cleanup(db, self.incoming, [
+                        {key: entry[key] for key in ("path", "fingerprint")} for entry in entries])
+                    aux_job = dict(db.execute("SELECT * FROM jobs WHERE id=?", (queued["id"],)).fetchone())
+                (self.incoming / entries[1]["path"]).unlink()
+                incoming_cleanup.cleanup_aux_companions(aux_job, self.incoming, self.managed)
+                expected = ["deleted", "absent"]
+                self.assertEqual([entry["disposition"] for entry in json.loads(self.scan_row(file_id)["companions"])], expected)
+                group, = self.plan(file_id)
+                self.assertEqual(group["auxCompanions"], [])
+                job = self.queue_with_aux(file_id) if delete_aux else self.queue(self.request(file_id, group["keepers"][0]))
+                result = self.run_job(job)
+                receipt = result["items"][0]["companions"]
+                self.assertEqual([entry["disposition"] for entry in receipt], expected)
+                self.assertEqual([entry["reason"] for entry in receipt], ["", incoming_cleanup.ABSENT_REASON])
+                self.assertFalse(any(entry["disposition"] == "keep" for entry in receipt))
+                self.assertEqual((result["cleaned"], result["auxDeleted"], result["companionReview"], result["freedBytes"]), (1, 0, 0, 7))

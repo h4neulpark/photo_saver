@@ -109,7 +109,9 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | POST | `/api/jobs/move` | `{"ids":["파일ID"]}` | `202`. 최근 완료 검사에서 `ready`인 원본만 이동 등록 |
 | POST | `/api/jobs/delete` | `{"ids":["파일ID"]}` | `202`. 최근 검사에서 `ready`·`duplicate`인 사진만 삭제 등록 |
 | POST | `/api/incoming/duplicates/plan` | `{"ids":["중복파일ID"]}` | 최근 검사에 근거한 해시별 정리 대상과 남길 사본 후보 |
-| POST | `/api/jobs/duplicate-cleanup` | `{"items":[{"id":"중복파일ID","keeperKind":"managed","keeperId":"사본ID"}]}` | `202`. 선택한 사본의 실제 내용 검증 및 Incoming 중복 정리 등록 |
+| POST | `/api/jobs/duplicate-cleanup` | `{"items":[{"id":"중복파일ID","keeperKind":"managed","keeperId":"사본ID"}],"deleteAux":true}` | `202`. 선택한 사본 검증 및 중복 정리. `deleteAux` 생략 시 `false` |
+| GET | `/api/incoming/aux/plan` | 없음 | 라이브 THM·LRV·AAE 분류·지문·용량 계획. `Cache-Control: no-store` |
+| POST | `/api/jobs/aux-cleanup` | `{"items":[{"path":"clip.LRV","fingerprint":"[1,2,3,4,5]"}]}` | `202`, `{"id":작업ID,"lane":"local","count":선택수}`, `Cache-Control: no-store` |
 | POST | `/api/jobs/offload` | `{"ids":["보관파일ID"]}` | `202`. 원격 아카이브에 검증된 사본(연결 XMP 포함)이 있는 `available` 파일의 로컬 원본 비우기 등록 |
 | POST | `/api/jobs/xmp-link` | `{"links":[{"id":"XMP검사ID","media_id":"보관파일ID"}]}` | `202`. 현재 연결 후보에 있는 원본으로 XMP 연결 등록 |
 | GET, HEAD | `/api/incoming/{file_id}/original` | 경로 ID | Incoming 원본 응답. 범위 요청은 `FileResponse`가 처리 |
@@ -124,7 +126,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `timezone` | 기본 시간대 |
 | `scan` | 가장 최근 `done`인 `scan` 작업 또는 `null` |
 | `incoming` | 해당 검사의 파일 목록. Incoming 기준 `path`, 중복 근거 `duplicateSource`, 동반 파일의 `companions`와 처리 상태를 포함한다. `moved`·`deleted`는 제외 |
-| `latestIncomingResult` | 검사 이후에도 조회 가능한 최근 Incoming 처리 작업 또는 `null`. 이동·삭제·중복 정리·XMP 연결의 결과를 제공 |
+| `latestIncomingResult` | 검사 이후에도 조회 가능한 최근 Incoming 처리 작업 또는 `null`. 이동·삭제·중복 정리·보조 파일 정리·XMP 연결의 결과를 제공 |
 | `jobs` | `{local, remote, exclusive}`: 레인별 최신 작업 또는 `null` |
 | `activeJobs` | `{local, remote, exclusive}`: 레인별 현재 `queued`·`running` 작업 또는 `null` |
 | `job` | 하위 호환: 활성 exclusive → 활성 local/remote 중 가장 큰 id → 전체 최신 작업 → `null` |
@@ -132,7 +134,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `managed` | `available`·`archived` 원본의 보관 상태(`status`), 장비·촬영 시각·이벤트·확정 여부·아카이브 사본·다운로드/오프로드 가능 여부·썸네일·XMP·미리보기/원본 URL(`preview`, `original`, 로컬 `available`이며 지문·형식이 유효할 때만 문자열이고 `archived` 등은 `null`) |
 | `pendingXmp` | 최근 검사에서 아직 `linked`가 아닌 XMP와 연결 후보 |
 
-`scan`·`move`·`delete`·`duplicate-cleanup`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 활성 중복 정리에서 남길 managed 사본도 offload 대상으로 등록할 수 없다. 취소 API는 명시한 작업 ID에만 적용한다.
+`scan`·`move`·`delete`·`duplicate-cleanup`·`aux-cleanup`·`xmp-link` 등록은 `lane: "local"`, `upload`·`offload`·`remote-index` 등록은 `lane: "remote"`를 반환한다. 활성 offload의 대상 media_id에는 XMP 연결을 409로 거부한다. 활성 중복 정리에서 남길 managed 사본도 offload 대상으로 등록할 수 없다. 취소 API는 명시한 작업 ID에만 적용한다.
 
 작업 표현은 `id`, `kind`, `lane`, `status`, `createdAt`, `finishedAt`, `result`를 포함한다. 상태는 `queued`, `running`, `done`, `failed`, `cancelled`다. `result`는 작업 종류별 집계·진행 정보로 구성한다. 파일 크기는 `incoming[].size`, `managed[].size`에서는 **십진 MB**이고 파일 기록·원격 목록·전송량 필드에서는 바이트이므로 혼용하지 않는다.
 
@@ -146,7 +148,7 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 | `before_id` | 없음 | 1 이상 ID. `id < before_id` 조회 |
 | `lane` | `all` | `all`, `local`, `remote`, `exclusive` |
 | `status` | `all` | `all`, `active`, `attention`, `done`, `failed`, `cancelled` |
-| `kind` | `all` | `all`, `scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
+| `kind` | `all` | `all`, `scan`, `move`, `delete`, `duplicate-cleanup`, `aux-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
 
 잘못된 쿼리는 HTTP 422다. ID 내림차순으로 최대 `limit`건을 반환하고, 다음 페이지가 있을 때 `hasMore: true`, `nextBeforeId: 마지막 반환 ID`를 제공한다. 마지막 페이지의 `nextBeforeId`는 `null`이다. 커서는 새 작업이 추가되어도 앞 페이지와 중복되지 않는다.
 
@@ -170,7 +172,11 @@ Nginx를 통하는 기본 주소는 `http://127.0.0.1:8888`이고 모든 앱 API
 
 응답은 `payload`를 조회하거나 반환하지 않는다. `result.items`, `result.errors`, `result.unmatchedCompanions`는 각각 최대 100건이며 DB 원본은 변경하지 않는다. `items`가 100건을 넘으면 moved/deleted/cleaned/linked 이외 항목과 객체가 아닌 항목을 우선 표시한다. `resultMeta`는 전체·표시 건수·절단 여부를 제공하며 items/errors의 6개 키는 항상 포함한다. 이력 응답에는 `Cache-Control: no-store`를 적용한다.
 
-중복 정리 계획은 `groups`를 돌려준다. 그룹에는 `sha`, 선택한 `files` (`id`·`path`·`sizeBytes`), 남길 수 있는 `keepers` (`kind`·`id`·`path`, 원격 검증 시각 `verifiedAt`)가 있다. 사본 종류는 `managed`·`remote`·`incoming`이며, 정리 등록 시 그룹별로 같은 사본을 지정한다. `incoming` 사본 ID는 정리 대상에서 제외해야 한다. 계획은 DB 조회 결과이며 실제 파일 검증은 작업 실행 시 수행한다. 중복 정리 결과는 `cleaned`·`review`·`freedBytes` 집계와 파일별 `items`의 경로·상태·사유를 포함한다.
+중복 정리 계획은 `groups`를 돌려준다. 그룹에는 `sha`, 선택한 `files` (`id`·`path`·`sizeBytes`, 기존 스키마 유지), 남길 수 있는 `keepers` (`kind`·`id`·`path`, 원격 검증 시각 `verifiedAt`), `auxCompanions` (`fileId`·`path`·`kind`·`sizeBytes`, 없으면 빈 배열)가 있다. 사본 종류는 `managed`·`remote`·`incoming`이며, 정리 등록 시 그룹별로 같은 사본을 지정한다. `incoming` 사본 ID는 정리 대상에서 제외해야 한다. `deleteAux:true`는 단일 소유권과 지문이 확인된 THM·LRV·AAE만 함께 삭제한다. XMP·모호한 후보·읽기 불가·다른 행에서 공유 참조하는 경로는 제외한다. 결과는 `cleaned`·`review`·`auxDeleted`·`companionReview`·`freedBytes`와 파일별 `items[].companions`를 포함한다. 본체 검증 실패 시 보조 파일을 보존한다.
+
+보조 파일 계획은 API의 읽기 전용 Incoming 마운트를 실시간 검사한다(접근 실패 `503`). 응답은 `scanId`(없으면 null), `scannedAt`, `items`, `summary`다. 항목에는 `path`, `name`, `folder`, `kind`, `sizeBytes`, `modifiedAt`, `fingerprint`, `category`, `orphanHint`, `ownerPath`, `ownerStatus`, `candidatePaths`, `reason`, `selectable`, `defaultSelected`를 제공한다. 분류 순서는 `orphan`, `duplicate-owner`, `ambiguous`, `review-owner`, `unscanned-owner`, `ready-owner`, `unreadable`이며 같은 분류에서는 경로순이다. 고아와 중복 원본만 기본 선택하고 읽기 불가는 선택할 수 없다. 고아 힌트는 `owner-processed`(최근 검사에서 이동·삭제), `owner-archived`(보관 기록), `unverified-orphan` 순으로 결정한다. 요약은 `totalCount`, `totalBytes`, `defaultSelectedCount`, `defaultSelectedBytes`, `byCategory`(분류별 `count`, `bytes`)를 포함한다.
+
+일괄 정리 요청은 1~10,000개, 경로 1~1,024자, 지문 1~256자다. 중복·절대·상위·숨김 경로, 화이트리스트 외 확장자, JSON 5정수 외 지문은 `400`, 파일 변경·부재·심볼릭 링크·권한 오류 및 local/exclusive 충돌은 `409`, 모델 위반은 `422`다. 접수 시와 삭제 직전에 지문을 재확인한다. 결과는 `totalFiles`, `completedFiles`, `deleted`, `absent`, `review`, `freedBytes`, `phase`, `current`, `items`다. `absent`는 오류 집계에 포함하지 않으며 파일별로 `파일 없음`을 표시한다. `latestIncomingResult`와 `/api/jobs?kind=aux-cleanup`에서 조회할 수 있다.
 
 Incoming 미리보기는 최근 완료 검사에서 `ready`·`duplicate`인 파일에만 허용한다. 보관 파일 미리보기(`/api/managed/{file_id}/original`, `/preview`)는 `media.status='available'`이고 지문(`fingerprint`)이 있으며 지원 확장자·`kind`가 일치하는 파일에만 허용하며, 배정·확정 여부와 무관하게 열 수 있다. `managed` 원본은 단일 `Range`만 허용(다중·문법 오류·`end < start`·자릿수 한도 초과는 `400`, 파일 크기 초과·빈 파일/`bytes=-0`은 `416`과 `Content-Range: bytes */N`, 파일보다 큰 `suffix`는 전체 `206`으로 보정)하며 지문 해시 `ETag`로 `If-Range`를 처리한다.
 

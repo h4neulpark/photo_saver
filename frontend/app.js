@@ -96,7 +96,7 @@ const view = {
   jobsExpanded: new Set(),
   deviceUpload: { open: false, folder: '', autoScan: true, running: false, cancelling: false, activeUploadId: null, abortController: null, totalFiles: 0, completedFiles: 0, totalBytes: 0, uploadedBytes: 0, currentName: '', currentLoaded: 0, currentTotal: 0, batchId: 0, dismissedBatchId: 0, startedAt: null, results: [], scanNote: '' },
   page: '', incomingFilter: 'all', incomingKind: '', query: '', connecting: true, loadError: '',
-  incomingLayout: savedIncomingLayout(), incomingTab: 'files', preview: null, cleanupPlanning: false,
+  incomingLayout: savedIncomingLayout(), incomingTab: 'files', preview: null, cleanupPlanning: false, auxCleanupPlanning: false,
   incomingSelection: new Set(), eventId: 'unassigned', eventSelection: new Set(), eventLifecycle: 'all', eventMenuOpen: false, eventDevice: '', eventDate: '',
   eventTarget: '', eventQuery: '', eventView: savedEventView(), sourcePath: [], xmpChoices: new Map(),
   devices: null, devicesError: '', settings: null, settingsError: '', publicKeyToCopy: null, keyCopiedLocally: false, restoreFile: null,
@@ -233,7 +233,7 @@ async function api(path, method = 'GET', data) {
   return result;
 }
 
-const jobLanes = { "storage-wake": "remote", "storage-shutdown": "remote", "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
+const jobLanes = { "storage-wake": "remote", "storage-shutdown": "remote", "thumbnails-local": "local", "thumbnails-remote": "remote", scan: 'local', move: 'local', delete: 'local', 'duplicate-cleanup': 'local', 'aux-cleanup': 'local', 'xmp-link': 'local', upload: 'remote', offload: 'remote', 'remote-index': 'remote', 'reset-all': 'exclusive' };
 const lanes = ['local', 'remote', 'exclusive'];
 function isJobActive(job) { return Boolean(job && ['queued', 'running'].includes(job.status)); }
 const MAX_DISMISSED_RESULTS = 100;
@@ -359,7 +359,7 @@ function activeJobsBar() {
 function laneJobsBar() {
   if (!anyJobActive()) return '';
   const labels = { local: '로컬', remote: '원격', exclusive: '데이터 초기화' };
-  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '검사', move: '가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'aux-cleanup': '보조 파일 정리', 'xmp-link': 'XMP 연결', upload: '업로드', offload: '로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화' };
   return `<div class="active-jobs-bar" aria-label="진행 중인 작업">${lanes.map(lane => {
     const job = activeLaneJob(lane);
     if (!job) return '';
@@ -380,7 +380,8 @@ function jobMessage(job) {
   if (job.kind === 'remote-index') return `원격 인덱싱 완료 · 신규 해시 ${job.result.hashed || 0}개 · 변경 없음 ${job.result.unchanged || 0}개${job.result.missing ? ` · 누락 ${job.result.missing}개` : ''}${job.result.thumbnails ? ` · ${thumbnailJobMessage(job.result.thumbnails)}` : ''}`;
   if (job.kind === 'scan') return `${job.result.checked}개 파일의 검사를 완료했습니다.`;
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
-  if (job.kind === 'duplicate-cleanup') return `중복 ${job.result.cleaned || 0}개 정리${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
+  if (job.kind === 'duplicate-cleanup') return `중복 ${job.result.cleaned || 0}개 정리${job.result.auxDeleted ? ` · THM·LRV·AAE ${job.result.auxDeleted}개 삭제` : ''}${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.review || job.result.companionReview ? ` · 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개` : ''}`;
+  if (job.kind === 'aux-cleanup') return `보조 파일(THM·LRV·AAE) ${job.result.deleted || 0}개 삭제${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.absent ? ` · 이미 없음 ${job.result.absent}개` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
   if (job.kind === 'xmp-link') return `XMP ${job.result.linked || 0}개 연결${job.result.alreadyStored ? ` · 이미 보관 ${job.result.alreadyStored}개` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
   return `${job.result.moved}개를 보관함으로 가져왔습니다.${job.result.xmp ? ` XMP ${job.result.xmp}개 보관.` : ''}${job.result.auxDeleted ? ` THM·LRV·AAE ${job.result.auxDeleted}개 삭제.` : ''}${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review || job.result.companionReview ? ` 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개.` : ''}`;
 }
@@ -549,8 +550,16 @@ function matchesXmp(file, query) {
     .some(value => value?.toLocaleLowerCase().includes(query));
 }
 
+const cameraAuxKinds = new Set(['thm', 'lrv', 'aae']);
+function isCameraAuxCompanion(item) {
+  return cameraAuxKinds.has((item?.kind || item?.path?.split('.').at(-1) || '').toLowerCase());
+}
+function companionDispositionLabel(item) {
+  if (item?.disposition === 'keep' && isCameraAuxCompanion(item)) return 'Incoming 남음';
+  return companionLabels[item?.disposition] || '확인 필요';
+}
 function companionSummary(file) {
-  if (file.companions) return file.companions.map(item => `${item.path.split('/').at(-1)} ${companionLabels[item.disposition] || '확인 필요'}`).join(' · ');
+  if (file.companions) return file.companions.map(item => `${item.path.split('/').at(-1)} ${companionDispositionLabel(item)}`).join(' · ');
   return [file.xmp ? 'XMP' : '', file.cameraAuxCount && file.status === 'ready' ? `THM·LRV·AAE ${file.cameraAuxCount}개 원본 이동 후 정리` : ''].filter(Boolean).join(' · ');
 }
 
@@ -731,26 +740,52 @@ function pendingXmpSection() {
   `;
 }
 
+function incomingCompanions() {
+  const items = new Map((state.scan?.result?.unmatchedCompanions || []).map(item => [item.path, { ...item, ownerPaths: [] }]));
+  for (const file of state.incoming) for (const item of file.companions || []) {
+    if (!isCameraAuxCompanion(item) || !['keep', 'review'].includes(item.disposition)) continue;
+    const previous = items.get(item.path);
+    const ownerPaths = [...new Set([...(previous?.ownerPaths || []), incomingPath(file)])];
+    items.set(item.path, { ...item, ...previous, ownerPaths,
+      ownerPath: ownerPaths.length === 1 ? ownerPaths[0] : null,
+      ownerStatus: ownerPaths.length === 1 ? file.status : null });
+  }
+  return [...items.values()];
+}
+function incomingCompanionsCount() { return incomingCompanions().length; }
+function auxCleanupButton(empty = false) {
+  return button('cleanup-aux-companions', view.auxCleanupPlanning ? '보조 파일 조회 중…' : empty ? 'Incoming 보조 파일 확인' : 'THM·LRV·AAE 일괄 정리',
+    { danger: !empty, disabled: localBusy() || view.auxCleanupPlanning || view.connecting });
+}
 function unmatchedCompanionsSection() {
-  const items = state.scan?.result?.unmatchedCompanions;
-  if (!items?.length) return emptyState('check', '확인이 필요한 동반 파일이 없습니다.', button('incoming-tab', '파일 목록으로 돌아가기', { extra: 'data-value="files"' }));
-  return `<div class="unmatched-companions-panel">
-    <ul>${items.map(item => `<li><strong>${escapeHtml(item.path)}</strong> <span class="small muted">${escapeHtml(companionLabels[item.disposition] || '확인 필요')}</span>
-      <p class="small">${escapeHtml(item.reason)}</p></li>`).join('')}</ul>
-  </div>`;
+  const items = incomingCompanions();
+  if (!items.length) return emptyState('check', '확인이 필요한 동반 파일이 없습니다.', button('incoming-tab', '파일 목록으로 돌아가기', { extra: 'data-value="files"' }) + auxCleanupButton(true));
+  const aux = items.filter(isCameraAuxCompanion);
+  const bytes = aux.reduce((sum, item) => sum + (item.sizeBytes ?? item.size ?? 0), 0);
+  const groups = [ ['원본 없음', items.filter(item => isCameraAuxCompanion(item) && !item.ownerPaths.length)],
+    ['원본 연결됨', items.filter(item => isCameraAuxCompanion(item) && item.ownerPaths.length)],
+    ['보존되는 XMP (일괄 정리 제외)', items.filter(item => !isCameraAuxCompanion(item))] ];
+  return `<div class="unmatched-companions-panel"><div class="companions-toolbar"><div><p>THM·LRV·AAE는 카메라가 생성한 썸네일·저화질 프록시·편집 보조 파일입니다. XMP 메타데이터 파일은 일괄 정리 대상에서 제외됩니다.</p>
+    <p class="small muted">잔여 THM·LRV·AAE ${aux.length}개 · ${sizeLabel(bytes / 1e6)}${aux.some(item => item.sizeBytes == null && item.size == null) ? ' · 정리 창에서 실시간 용량 확인' : ''}</p></div>${auxCleanupButton()}</div>
+    ${groups.filter(([, entries]) => entries.length).map(([label, entries]) => `<section class="companion-group"><h3>${label} · ${entries.length}개</h3><ul>${entries.map(item => {
+      const itemBytes = item.sizeBytes ?? item.size;
+      const owner = item.ownerPaths.length > 1 ? `원본 후보: ${item.ownerPaths.join(', ')}` : item.ownerPath ? `원본: ${item.ownerPath} (${filterLabels[item.ownerStatus] || item.ownerStatus})` : '';
+      return `<li class="companion-row"><strong>${escapeHtml(item.path)}</strong><span class="companion-meta small muted">${escapeHtml(companionDispositionLabel(item))}${itemBytes != null ? ` · ${sizeLabel(itemBytes / 1e6)}` : ''}</span>${owner ? `<p class="companion-meta small">${escapeHtml(owner)}</p>` : ''}<p class="small">${escapeHtml(item.reason || '')}</p></li>`;
+    }).join('')}</ul></section>`).join('')}</div>`;
 }
 
 function incomingResultSection() {
-  const titles = { move: '보관함 가져오기 결과', delete: '사진 삭제 결과', 'duplicate-cleanup': '중복 정리 결과', 'xmp-link': 'XMP 연결 결과' };
+  const titles = { move: '보관함 가져오기 결과', delete: '사진 삭제 결과', 'duplicate-cleanup': '중복 정리 결과', 'aux-cleanup': '보조 파일 정리 결과', 'xmp-link': 'XMP 연결 결과' };
   const job = state.latestIncomingResult || laneJob('local');
   if (!titles[job?.kind] || isJobActive(job) || isResultDismissed(job)) return '';
   const result = job.result || {};
   const items = result.items || [];
-  const itemLabels = { moved: '이동 완료', duplicate: '이미 보관됨', cleaned: '정리 완료', deleted: '삭제 완료', review: '확인 필요', linked: '연결 완료', 'already-stored': '이미 보관됨' };
+  const itemLabels = { moved: '이동 완료', duplicate: '이미 보관됨', cleaned: '정리 완료', deleted: '삭제 완료', absent: '파일 없음', review: '확인 필요', linked: '연결 완료', 'already-stored': '이미 보관됨' };
   const previous = page.querySelector('#incoming-result-items');
   const key = jobDismissKey(job);
   const expanded = previous && previous.dataset.jobKey === key ? previous.open : (view.resultDetailsOpen.has(key) ? view.resultDetailsOpen.get(key) : jobHasAttention(job));
-  const followup = `${result.moved ? button('open-unassigned', '이벤트 분류의 미배정 열기', { glyph: 'arrow' }) : ''}${result.review || result.companionReview || job.status === 'failed' ? button('rescan-incoming', '다시 검사', { glyph: 'refresh', disabled: localBusy() }) : ''}`;
+  const keptAux = ['duplicate-cleanup', 'delete'].includes(job.kind) && items.some(item => item.companions?.some(c => isCameraAuxCompanion(c) && c.disposition === 'keep'));
+  const followup = `${result.moved ? button('open-unassigned', '이벤트 분류의 미배정 열기', { glyph: 'arrow' }) : ''}${result.review || result.companionReview || job.status === 'failed' ? button('rescan-incoming', '다시 검사', { glyph: 'refresh', disabled: localBusy() }) : ''}${keptAux ? button('incoming-tab', '동반 파일 확인', { extra: 'data-value="companions"' }) : ''}`;
   return `<section class="surface incoming-result result-banner result-banner-${resultTone(job)}" ${job.status === 'failed' ? 'role="alert"' : ''} aria-labelledby="incoming-result-title">
     <div class="incoming-result-summary">
       <div><h2 id="incoming-result-title">${titles[job.kind]}</h2><p class="small muted">${escapeHtml(jobMessage(job) || '작업을 완료하지 못했습니다.')}</p></div>
@@ -763,7 +798,7 @@ function incomingResultSection() {
       <ul>${items.map(item => `<li>
         <strong>${escapeHtml(item.path || item.id || '경로 정보 없음')}</strong> <span class="small muted">${escapeHtml(itemLabels[item.status] || item.status)}</span>
         ${item.reason ? `<p class="small">${escapeHtml(item.reason)}</p>` : ''}
-        ${item.companions?.length ? `<ul>${item.companions.map(companion => `<li class="small">${escapeHtml(companion.path)} · ${escapeHtml(companionLabels[companion.disposition] || '확인 필요')}${companion.reason ? ` · ${escapeHtml(companion.reason)}` : ''}</li>`).join('')}</ul>` : ''}
+        ${item.companions?.length ? `<ul>${item.companions.map(companion => `<li class="small">${escapeHtml(companion.path)} · ${escapeHtml(companionDispositionLabel(companion))}${companion.reason ? ` · ${escapeHtml(companion.reason)}` : ''}</li>`).join('')}</ul>` : ''}
       </li>`).join('')}</ul>
     </details>` : ''}
   </section>`;
@@ -776,12 +811,12 @@ function incomingScanStrip() {
   const complete = state.scan?.result;
   const jobLabels = {
     scan: '파일 검사 중', move: '보관함으로 가져오는 중', delete: '사진 삭제 중',
-    'duplicate-cleanup': '중복 정리 중', 'xmp-link': 'XMP 연결 중', 'reset-all': '서버 데이터 초기화 중',
+    'duplicate-cleanup': '중복 정리 중', 'aux-cleanup': '보조 파일 정리 중', 'xmp-link': 'XMP 연결 중', 'reset-all': '서버 데이터 초기화 중',
   };
   const status = active ? (jobLabels[job.kind] || '작업 진행 중') :
     failedScan ? '파일 검사 실패' : state.scan ? '최근 검사 완료' : '검사 대기';
   const xmpCount = state.pendingXmp.length;
-  const companionsCount = complete?.unmatchedCompanions?.length || 0;
+  const companionsCount = incomingCompanionsCount();
   const counts = xmpCount || companionsCount ? ` · XMP ${xmpCount} · 동반 파일 ${companionsCount}` : '';
   const detail = failedScan ? (job.result.error || '다시 검사하세요.') : active ? (job.result?.phase || '작업을 준비하고 있습니다.') :
     complete ? `${dateTimeFormatter(state.timezone).format(new Date(state.scan.finishedAt))} · 총 ${complete.checked}개 검사${counts}` : '파일 검사를 눌러 시작하세요.';
@@ -1111,7 +1146,7 @@ function incomingTabsMarkup() {
   return [
     { key: 'files', label: '파일 목록', count: state.incoming.length },
     { key: 'xmp', label: 'XMP 연결', count: state.pendingXmp.length, tone: 'is-accent' },
-    { key: 'companions', label: '동반 파일 확인', count: state.scan?.result?.unmatchedCompanions?.length || 0, tone: 'is-warn' },
+    { key: 'companions', label: '동반 파일 확인', count: incomingCompanionsCount(), tone: 'is-warn' },
   ].map(({ key, label, count, tone }) => {
     const active = view.incomingTab === key;
     return `<button type="button" role="tab" id="incoming-tab-${key}" class="catalog-tab incoming-tab${key !== 'files' && !count ? ' is-empty' : ''}" data-action="incoming-tab" data-value="${key}" aria-selected="${active}" aria-controls="incoming-tabpanel-${key}" tabindex="${active ? '0' : '-1'}">${label}<span class="incoming-tab-count${count && tone ? ` ${tone}` : ''}">${count}</span></button>`;
@@ -3008,11 +3043,11 @@ function jobHistoryActions(job) {
   if (job.kind === 'remote-index') return button('open-catalog-tab', '원격 인덱스 보기', { extra: 'data-value="remote"' });
   if (job.kind === 'offload') return button('open-events', '이벤트 분류 열기');
   if (job.kind === 'device-upload') return button('open-incoming', '가져오기 열기');
-  if (['scan', 'move', 'delete', 'duplicate-cleanup', 'xmp-link'].includes(job.kind)) return `${job.kind === 'move' && result.moved > 0 ? button('open-unassigned', '미배정 열기') : ''}${button('open-incoming', '가져오기 열기')}${jobHasAttention(job) ? button('rescan-incoming', '다시 검사', { disabled: localBusy() }) : ''}`;
+  if (['scan', 'move', 'delete', 'duplicate-cleanup', 'aux-cleanup', 'xmp-link'].includes(job.kind)) return `${job.kind === 'move' && result.moved > 0 ? button('open-unassigned', '미배정 열기') : ''}${button('open-incoming', '가져오기 열기')}${jobHasAttention(job) ? button('rescan-incoming', '다시 검사', { disabled: localBusy() }) : ''}`;
   return '';
 }
 function patchJobCard(node, job) {
-  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
+  const kinds = { "storage-wake": "OMV 시작 확인", "storage-shutdown": "OMV 종료 확인", "thumbnails-local": "썸네일 생성", "thumbnails-remote": "썸네일 생성", scan: '파일 검사', move: '보관함 가져오기', delete: '사진 삭제', 'duplicate-cleanup': '중복 정리', 'aux-cleanup': '보조 파일 정리', 'xmp-link': 'XMP 연결', upload: '아카이브 업로드', offload: 'NAS 보관 후 로컬 비우기', 'remote-index': '원격 인덱싱', 'reset-all': '초기화', 'device-upload': '기기 업로드' };
   const statuses = { queued: '대기 중', running: '진행 중', done: '완료', failed: '실패', cancelled: '중지됨' };
   const result = job.result || {}, active = isJobActive(job), key = jobHistoryKey(job);
   setSlotHtml(node.querySelector('[data-slot="head"]'), `<div><strong>${escapeHtml(kinds[job.kind] || job.kind)}</strong> ${badge(active ? 'draft' : jobHasAttention(job) ? 'review' : 'ready', statuses[job.status] || job.status)}${job.source === 'device' ? '<span class="job-source-tag">이 브라우저 기록</span>' : `<span class="small muted">#${job.id}</span>`}</div><time class="small muted">${catalogTime(job.createdAt)}</time>`);
@@ -3905,15 +3940,18 @@ function cleanupTargets(group, keeper) {
   return group.files.filter(file => keeper.kind !== 'incoming' || file.id !== keeper.id);
 }
 
-function cleanupGroupFiles(group, keeper, filesById) {
+function cleanupGroupFiles(group, keeper, filesById, deleteAux = false) {
   const targets = new Set(cleanupTargets(group, keeper).map(file => file.id));
   return `<ul class="cleanup-files">${group.files.map(file => {
-    const companions = filesById.get(file.id)?.companions || [];
+    const companions = [...(filesById.get(file.id)?.companions || [])];
+    const eligible = (group.auxCompanions || []).filter(item => item.fileId === file.id);
+    for (const item of eligible) if (!companions.some(c => c.path === item.path)) companions.push(item);
     const action = targets.has(file.id) ? '정리' : keeper ? '남김' : '보류';
     return `<li><span class="incoming-path">${escapeHtml(file.path)}</span>
       <span class="small muted">${action} · ${sizeLabel(file.sizeBytes == null ? null : file.sizeBytes / 1e6)}</span>
-      ${companions.map(item => `<div class="small muted incoming-path">${escapeHtml(item.path)} · ${item.disposition === 'linked' ? '연결됨' : 'Incoming에 보존'}
-        ${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</div>`).join('')}
+      ${companions.map(item => { const aux = eligible.find(c => c.path === item.path); const remove = deleteAux && targets.has(file.id) && aux;
+        const label = item.disposition === 'deleted' ? '정리됨' : item.disposition === 'absent' ? '파일 없음' : remove ? `함께 삭제 · ${sizeLabel((aux.sizeBytes || 0) / 1e6)}` : item.disposition === 'linked' ? '연결됨' : 'Incoming에 보존';
+        return `<div class="small muted incoming-path">${escapeHtml(item.path)} · ${label}${item.reason && !remove ? ` · ${escapeHtml(item.reason)}` : ''}</div>`; }).join('')}
     </li>`;
   }).join('')}</ul>`;
 }
@@ -3945,34 +3983,107 @@ async function confirmIncomingCleanup() {
     return cleanupTargets(group, keeper).map(file => ({ id: file.id, keeperKind: keeper.kind, keeperId: keeper.id }));
   });
   const blocked = groups.reduce((sum, group) => sum + (group.keepers.length ? 0 : group.files.length), 0);
+  const hasAux = groups.some(group => group.auxCompanions?.length);
+  let deleteAux = hasAux;
+  const targetAux = () => groups.flatMap((group, index) => {
+    const ids = new Set(cleanupTargets(group, keepers[index]).map(file => file.id));
+    return (group.auxCompanions || []).filter(item => ids.has(item.fileId));
+  });
+  const auxLabel = () => targetAux().length ? `짝이 확인된 카메라 보조 파일(THM·LRV·AAE) ${targetAux().length}개 (${sizeLabel(targetAux().reduce((sum, item) => sum + (item.sizeBytes || 0), 0) / 1e6)}) 함께 삭제` : '현재 정리 대상에 함께 삭제할 보조 파일이 없습니다.';
   const summary = () => {
     const targets = groups.flatMap((group, index) => cleanupTargets(group, keepers[index]));
     const totalBytes = targets.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
-    return `정리 ${targets.length}개 · ${sizeLabel(totalBytes / 1e6)}${blocked ? ` · 보류 ${blocked}개` : ''}`;
+    const aux = targetAux();
+    return `정리 ${targets.length}개 · ${sizeLabel(totalBytes / 1e6)}${deleteAux && aux.length ? ` · 보조 파일 ${aux.length}개 · ${sizeLabel(aux.reduce((sum, item) => sum + (item.sizeBytes || 0), 0) / 1e6)} 함께 삭제` : ''}${blocked ? ` · 보류 ${blocked}개` : ''}`;
   };
   const keeperLabel = keeper => {
     const verified = keeper.verifiedAt ? ` · 최근 검증 ${catalogTime(keeper.verifiedAt)}` : '';
     return escapeHtml(`${keeperLabels[keeper.kind]} · ${keeper.path}${verified}`);
   };
-  showDialog('중복 파일 정리', `<p>남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. Incoming에 남아 있는 XMP와 보조 파일(THM·LRV·AAE)은 보존합니다.</p>
+  showDialog('중복 파일 정리', `<p>${hasAux ? '남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. 아래 옵션이 켜져 있으면 짝이 확인된 카메라 보조 파일(THM·LRV·AAE)도 함께 삭제하며, XMP와 원본이 불명확한 보조 파일은 보존합니다.' : '남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. Incoming에 남아 있는 XMP와 보조 파일(THM·LRV·AAE)은 보존합니다.'}</p>
+    ${hasAux ? `<div class="cleanup-aux-option"><label class="checkbox-row"><input type="checkbox" name="delete_aux" value="1" checked><span id="cleanup-aux-label">${auxLabel()}</span></label><p class="small muted">XMP와 원본이 불명확한 보조 파일은 삭제하지 않고 보존합니다.</p></div>` : ''}
     <p id="cleanup-summary" class="numbers" role="status">${summary()}</p>
     <div class="cleanup-groups">${groups.map((group, index) => `<section class="cleanup-group" aria-label="중복 묶음 ${index + 1}">
       ${group.keepers.length > 1 ? `<label>남길 사본<select data-keeper-group="${index}" aria-describedby="keeper-detail-${index}">${group.keepers.map((keeper, option) => `<option value="${option}">${keeperLabel(keeper)}</option>`).join('')}</select></label>` : ''}
       ${keepers[index] ? `<p id="keeper-detail-${index}" class="small incoming-path">${group.keepers.length === 1 ? '<strong>남길 사본</strong> ' : ''}${keeperLabel(keepers[index])}</p>` : ''}
       ${group.reason || !keepers[index] ? `<p class="small muted">${escapeHtml(group.reason || '남길 사본을 찾지 못했습니다.')}</p>` : ''}
-      <div data-cleanup-group-files="${index}">${cleanupGroupFiles(group, keepers[index], filesById)}</div>
+      <div data-cleanup-group-files="${index}">${cleanupGroupFiles(group, keepers[index], filesById, deleteAux)}</div>
     </section>`).join('')}</div>`,
-  '검증 후 정리', targetItems().length ? () => submitJob('duplicate-cleanup', { items: targetItems() }) : null, { danger: true, scrollBody: true });
+  '검증 후 정리', targetItems().length ? () => submitJob('duplicate-cleanup', { items: targetItems(), ...(deleteAux && targetAux().length ? { deleteAux: true } : {}) }) : null, { danger: true, scrollBody: true });
+
+  const update = () => {
+    if (hasAux) {
+      dialog.querySelector('[name="delete_aux"]').checked = deleteAux;
+      dialog.querySelector('[name="delete_aux"]').disabled = !targetAux().length;
+      dialog.querySelector('#cleanup-aux-label').textContent = auxLabel();
+    }
+    dialog.querySelector('#cleanup-summary').textContent = summary();
+    groups.forEach((group, index) => { dialog.querySelector(`[data-cleanup-group-files="${index}"]`).innerHTML = cleanupGroupFiles(group, keepers[index], filesById, deleteAux); });
+    const submit = dialog.querySelector('[type="submit"]');
+    if (submit) submit.disabled = !targetItems().length;
+  };
+  if (hasAux) dialog.querySelector('[name="delete_aux"]').addEventListener('change', event => { deleteAux = event.target.checked; update(); });
 
   for (const select of dialog.querySelectorAll('[data-keeper-group]')) {
     select.addEventListener('change', () => {
       const index = Number(select.dataset.keeperGroup);
       keepers[index] = groups[index].keepers[Number(select.value)];
       dialog.querySelector(`#keeper-detail-${index}`).innerHTML = keeperLabel(keepers[index]);
-      dialog.querySelector(`[data-cleanup-group-files="${index}"]`).innerHTML = cleanupGroupFiles(groups[index], keepers[index], filesById);
-      dialog.querySelector('#cleanup-summary').textContent = summary();
+      update();
     });
   }
+  update();
+}
+
+const auxCategoryLabels = { orphan: '원본 없음', 'duplicate-owner': '중복 원본 연결됨', ambiguous: '원본 후보 여러 개', 'review-owner': '확인 필요한 원본', 'unscanned-owner': '미검사 원본', 'ready-owner': '가져오기 대기 원본', unreadable: '읽기 불가' };
+async function openAuxCleanupDialog() {
+  if (localBusy() || view.auxCleanupPlanning || view.connecting) return;
+  view.auxCleanupPlanning = true;
+  patchIncomingPage();
+  let plan;
+  try { plan = await api('incoming/aux/plan'); }
+  finally { view.auxCleanupPlanning = false; if (view.page === 'incoming') patchIncomingPage(); }
+  if (view.page !== 'incoming' || localBusy() || dialog.open || mediaPreview.open) return;
+  if (!plan.items.length) { announce('Incoming에 정리할 THM·LRV·AAE 보조 파일이 없습니다.'); return; }
+  const selected = new Set(plan.items.filter(item => item.selectable && item.defaultSelected).map(item => item.path));
+  const selectedItems = () => plan.items.filter(item => selected.has(item.path));
+  showDialog('보조 파일 일괄 정리 (THM·LRV·AAE)', `<p>선택한 THM·LRV·AAE 파일을 Incoming에서 영구 삭제합니다. XMP 파일과 원본 사진·영상은 삭제하지 않습니다.</p>
+    <div class="aux-cleanup-warning" id="aux-cleanup-warning" role="note" hidden></div>
+    <p id="aux-cleanup-summary" class="numbers" role="status"></p>
+    <div class="companions-toolbar">${[['defaults', '고아·중복만 선택'], ['all', '전체 선택'], ['none', '선택 해제']].map(([value, label]) => `<button type="button" class="button" data-aux-select="${value}">${label}</button>`).join('')}</div>
+    <div class="aux-cleanup-groups">${Object.entries(auxCategoryLabels).map(([category, label]) => {
+      const entries = plan.items.filter(item => item.category === category);
+      if (!entries.length) return '';
+      return `<section class="companion-group"><label class="checkbox-row"><input type="checkbox" data-aux-category="${category}" ${entries.some(item => item.selectable) ? '' : 'disabled'}><strong>${label} · ${entries.length}개 · ${sizeLabel(entries.reduce((sum, item) => sum + (item.sizeBytes || 0), 0) / 1e6)}</strong></label>
+        ${entries.map(item => `<label class="aux-cleanup-item checkbox-row"><input type="checkbox" data-aux-path="${escapeHtml(item.path)}" ${selected.has(item.path) ? 'checked' : ''} ${item.selectable ? '' : 'disabled'}><span><strong>${escapeHtml(item.path)}</strong><span class="companion-meta small muted">${escapeHtml(item.kind.toUpperCase())} · ${sizeLabel(item.sizeBytes == null ? null : item.sizeBytes / 1e6)}</span><span class="companion-meta small">${escapeHtml([item.ownerPath, ...(item.category === 'ambiguous' ? item.candidatePaths || [] : []), item.reason].filter(Boolean).join(' · '))}</span></span></label>`).join('')}</section>`;
+    }).join('')}</div>`, '선택한 0개 영구 삭제', async () => {
+    try {
+      const result = await api('jobs/aux-cleanup', 'POST', { items: selectedItems().map(({ path, fingerprint }) => ({ path, fingerprint })) });
+      setOptimisticJob({ id: result.id, kind: 'aux-cleanup', lane: 'local', status: 'queued', result: {} });
+      await syncState();
+    } catch (error) { await syncState(); throw error; }
+  }, { danger: true, scrollBody: true });
+  const update = () => {
+    const items = selectedItems();
+    dialog.querySelector('#aux-cleanup-summary').textContent = `선택 ${items.length}개 / 전체 ${plan.items.length}개 · 확보 예정 ${sizeLabel(items.reduce((sum, item) => sum + (item.sizeBytes || 0), 0) / 1e6)}`;
+    const warning = dialog.querySelector('#aux-cleanup-warning');
+    const orphans = items.filter(item => item.category === 'orphan' && item.orphanHint === 'unverified-orphan');
+    warning.hidden = !orphans.length;
+    warning.textContent = `원본 보관 여부를 확인할 수 없는 보조 파일 ${orphans.length}개가 선택되었습니다.${orphans.some(item => item.kind === 'lrv') ? ' LRV에는 저화질 영상이 남아 있을 수 있습니다.' : ''} 삭제 전 필요한 파일인지 확인하세요.`;
+    for (const input of dialog.querySelectorAll('[data-aux-path]')) input.checked = selected.has(input.dataset.auxPath);
+    for (const input of dialog.querySelectorAll('[data-aux-category]')) {
+      const entries = plan.items.filter(item => item.category === input.dataset.auxCategory && item.selectable);
+      input.checked = !!entries.length && entries.every(item => selected.has(item.path));
+      input.indeterminate = !input.checked && entries.some(item => selected.has(item.path));
+    }
+    const submit = dialog.querySelector('[type="submit"]');
+    submit.disabled = !items.length;
+    submit.textContent = `선택한 ${items.length}개 영구 삭제`;
+  };
+  for (const input of dialog.querySelectorAll('[data-aux-path]')) input.addEventListener('change', () => { if (!input.disabled) { if (input.checked) selected.add(input.dataset.auxPath); else selected.delete(input.dataset.auxPath); update(); } });
+  for (const input of dialog.querySelectorAll('[data-aux-category]')) input.addEventListener('change', () => { for (const item of plan.items.filter(item => item.category === input.dataset.auxCategory && item.selectable)) { if (input.checked) selected.add(item.path); else selected.delete(item.path); } update(); });
+  for (const btn of dialog.querySelectorAll('[data-aux-select]')) btn.addEventListener('click', () => { selected.clear(); for (const item of plan.items) if (item.selectable && (btn.dataset.auxSelect === 'all' || (btn.dataset.auxSelect === 'defaults' && item.defaultSelected))) selected.add(item.path); update(); });
+  update();
 }
 
 function previewCollection(source) {
@@ -4623,6 +4734,7 @@ const actions = {
   'move-incoming'() { return submitJob('move', { ids: selectedIncoming(file => file.status === 'ready').map(file => file.id) }); },
   'delete-incoming': confirmDeleteIncoming,
   'cleanup-incoming': confirmIncomingCleanup,
+  'cleanup-aux-companions': openAuxCleanupDialog,
   'open-unassigned'() { chooseEvent('unassigned'); location.hash = 'events'; },
   'link-xmp'() { return submitJob('xmp-link', { links: pendingXmpLinks() }); },
   'view-xmp': showXmp,

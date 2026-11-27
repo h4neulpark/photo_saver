@@ -24,7 +24,7 @@ from media import (
 from transfers import upload_selection
 from offload import offload_selection
 from remote_index import index_remote_archive
-from incoming_cleanup import cleanup_duplicates
+from incoming_cleanup import cleanup_duplicates, cleanup_aux_companions
 from resets import reset_local_data
 
 log = logging.getLogger(__name__)
@@ -164,6 +164,8 @@ def plan_companions(incoming, companion_files, media_rows):
                           "원본 후보가 여러 개입니다." if owner is None else
                           "파일 상태를 읽을 수 없습니다.")
                 entry = companion_disposition(path, "keep", reason)
+            if initial is not None:
+                entry["size"] = initial.st_size
             for candidate in ([owner] if owner else candidates):
                 attached[candidate].append(entry)
             if not candidates:
@@ -729,6 +731,7 @@ class WorkerCoordinator:
             "storage-shutdown": partial(run_storage_shutdown, stop_event=self.stop_event),
             "scan": scan_incoming, "move": import_selection, "delete": delete_selection,
             "duplicate-cleanup": partial(cleanup_duplicates, refresh_group=refresh_deleted_group),
+            "aux-cleanup": cleanup_aux_companions,
             "xmp-link": link_xmp_selection, "upload": upload_selection,
             "offload": offload_selection, "remote-index": index_remote_archive,
             "reset-all": reset_local_data,

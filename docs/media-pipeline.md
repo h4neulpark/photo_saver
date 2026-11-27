@@ -79,7 +79,11 @@ Incoming의 **기기에서 업로드**는 사진 → 영상 → XMP·THM·LRV·A
 
 `duplicate-cleanup`은 최근 검사에서 중복인 사진과 영상에 적용한다. 앱은 해시 그룹마다 사용자가 지정한 남길 사본과 정리할 Incoming 파일을 예약한다. 같은 Incoming 검사의 사본을 선택하면 그 사본은 정리 대상에서 제외한다. managed 사본은 활성 offload 목록에서 제외된 파일을 고르고, 정리가 진행되는 동안 해당 사본의 offload 등록을 차단한다.
 
-워커는 정리 대상의 지문과 SHA-256을 대조한다. 남길 로컬 사본은 파일 지문과 SHA-256을, 원격 사본은 현재 스토리지와 루트의 검증 기록 및 실시간 SFTP 파일의 SHA-256을 확인한다. 원격 해시는 업로드와 같은 SSH 우선·SFTP 대체 경로로 검사한다. 실제 삭제 직전에 남길 사본의 상태를 다시 확인한다. 불일치 또는 연결·읽기 실패 시 Incoming 파일을 보존하고 파일별 확인 사유를 기록한다. XMP·THM·LRV·AAE는 별도 보존한다.
+워커는 정리 대상의 지문과 SHA-256을 대조한다. 남길 로컬 사본은 파일 지문과 SHA-256을, 원격 사본은 현재 스토리지와 루트의 검증 기록 및 실시간 SFTP 파일의 SHA-256을 확인한다. 원격 해시는 업로드와 같은 SSH 우선·SFTP 대체 경로로 검사한다. 실제 삭제 직전에 남길 사본의 상태를 다시 확인한다. 불일치 또는 연결·읽기 실패 시 Incoming 파일과 보조 파일을 보존한다. `deleteAux:true`이면 본체 삭제를 `deleted`로 먼저 커밋한 뒤 짝이 확인된 THM·LRV·AAE를 지문 대조 후 개별 삭제한다. XMP와 모호한 후보는 보존한다. 기본 API 값은 false다.
+
+재시작은 본체 삭제 전, `deleting` 후 삭제 전, unlink 후 `deleted` 커밋 전, 본체 완료 후 보조 파일 일부 삭제 구간을 복구한다. 이미 `deleted`인 보조 파일은 다시 삭제하지 않고 집계를 복원한다. 보조 파일 부재는 `absent`, 변경·읽기 오류는 `review`/`companionReview`로 기록하며 본체 정리 완료는 유지한다. 살아남은 Incoming 사본은 `ready` 승격과 함께 자신의 보조 파일만 이동 후 정리 대상으로 승격한다.
+
+`aux-cleanup`은 `incoming_cleanup.py`에서 라이브 THM·LRV·AAE만 검사·예약·삭제한다. 최근 완료 검사와 보관 원본 경로를 결합해 고아/중복/모호/확인 필요/미검사/이동 대기/읽기 불가로 분류한다. 고아·중복만 기본 선택하지만 사용자가 다른 읽기 가능한 항목도 선택할 수 있다. 숨김 파일·링크·XMP·사진·영상은 일괄 삭제에서 제외한다. 진행 결과는 매 파일 저장하며 재시작 시 `deleted`·`absent` 영수증을 재사용한다. 완료 트랜잭션에서 최신 검사의 `scan_files.companions`를 동기화하고 실제 제거된 경로만 `unmatchedCompanions`에서 제거한다. 원본 이동 전 보조 파일을 먼저 정리해도 원본의 후속 이동은 정상 완료된다.
 
 ## 메타데이터, 썸네일과 미리보기
 
@@ -131,7 +135,7 @@ XMP에서는 제목, 설명, 키워드, 도시·지역·국가·장소, GPS 문�
 
 ## 실행 제약
 
-워커는 `worker.lock`으로 단일 프로세스를 보장한다. `WorkerCoordinator`는 기본 0.4초 폴링 및 스레드 완료 이벤트로 큐를 확인하고 한 DB 쓰기 트랜잭션에서 claim한다. `local` 스레드는 `scan`·`move`·`delete`·`duplicate-cleanup`·`xmp-link`를, `remote` 스레드는 `upload`·`offload`·`remote-index`를 실행해 최대 1+1 병렬로 처리한다. 같은 레인에는 활성 작업 하나만 허용한다. `exclusive` 작업(`reset-all`)이 대기·실행 중이면 다른 레인의 claim을 막고, 기존 스레드와 DB running 작업이 모두 끝난 뒤 코디네이터가 직접 실행한다. 기동 시 두 레인의 stale running을 queued로 복구하며 SIGTERM·SIGINT는 새 claim을 중단하고 실행 중인 스레드가 끝나기를 기다린다.
+워커는 `worker.lock`으로 단일 프로세스를 보장한다. `WorkerCoordinator`는 기본 0.4초 폴링 및 스레드 완료 이벤트로 큐를 확인하고 한 DB 쓰기 트랜잭션에서 claim한다. `local` 스레드는 `scan`·`move`·`delete`·`duplicate-cleanup`·`aux-cleanup`·`xmp-link`를, `remote` 스레드는 `upload`·`offload`·`remote-index`를 실행해 최대 1+1 병렬로 처리한다. 같은 레인에는 활성 작업 하나만 허용한다. `exclusive` 작업(`reset-all`)이 대기·실행 중이면 다른 레인의 claim을 막고, 기존 스레드와 DB running 작업이 모두 끝난 뒤 코디네이터가 직접 실행한다. 기동 시 두 레인의 stale running을 queued로 복구하며 SIGTERM·SIGINT는 새 claim을 중단하고 실행 중인 스레드가 끝나기를 기다린다.
 
 병렬 스캔은 missing/XMP 해제 갱신을 available에만 적용하고 분석 upsert는 offloading·archived를 덮어쓰지 않는다. 로컬 비우기는 삭제 직전 status·sha·path·xmp_path·xmp_sha를 한 SQL로 확인해 offloading으로 전환한다. 정보가 달라졌으면 삭제 없이 409로 거부한다. 활성 offload 대상의 XMP 연결은 API와 워커에서 거부하며, XMP 이동 후 원본 상태가 바뀌어 연결에 실패하면 옮긴 XMP를 Incoming으로 돌려놓는다. 삭제 후 썸네일 정리는 available·archived·offloading·moving 참조를 모두 보존한다.
 

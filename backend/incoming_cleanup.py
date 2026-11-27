@@ -11,7 +11,9 @@ from fastapi import HTTPException
 
 from archive import archive_config, archive_connection, archive_revision, resolve_remote_file, storage_id_for
 from catalog import LANE_LOCAL, active_offload_media_ids, database, load_latest_scan, now, queue_job
-from media import SUPPORTED, delete_verified_file, fingerprint, hash_file, inspect
+from companions import CAMERA_AUX, aux_owner, source_candidates, source_index
+from media import (SUPPORTED, delete_verified_file, fingerprint, hash_file, inspect, iso_time,
+                   relative_parts, scan_tree, size_from_fingerprint)
 from settings import fail
 from transfers import CONNECTION_ERRORS, remote_hash, sftp_disconnected, stat_mtime_ns
 
@@ -29,7 +31,7 @@ def _archive_config_if_set():
 def _scan_snapshot(db, ids):
     scan = load_latest_scan(db)
     rows = db.execute(
-        """SELECT id,scan_id,path,sha,size,fingerprint,status FROM scan_files
+        """SELECT id,scan_id,path,sha,size,fingerprint,status,companions FROM scan_files
            WHERE scan_id=? AND status IN ('ready','duplicate') ORDER BY (status='duplicate'), path""",
         (scan["id"],),
     ) if scan else ()
@@ -81,12 +83,43 @@ def _duplicate_groups(db, ids):
             for sha, files in selected.items()]
 
 
+def deletable_aux_companions(row):
+    return [{"path": entry["path"],
+             "kind": PurePosixPath(entry["path"]).suffix.lower().lstrip("."),
+             "fingerprint": entry["fingerprint"],
+             "size": entry.get("size") if entry.get("size") is not None else size_from_fingerprint(entry["fingerprint"])}
+            for entry in json.loads(row["companions"] or "[]")
+            if PurePosixPath(entry.get("path", "")).suffix.lower() in CAMERA_AUX
+            and entry.get("fingerprint") and entry.get("disposition") in {"keep", "delete-after-move"}]
+
+
+def _unique_aux(db, rows):
+    """Reject shared references, even if a corrupt scan assigned a unique owner."""
+    references = defaultdict(set)
+    selected_counts = defaultdict(int)
+    for scan_id in {row["scan_id"] for row in rows}:
+        for row in db.execute("SELECT id,companions FROM scan_files WHERE scan_id=? AND status IN ('ready','duplicate','review')", (scan_id,)):
+            for entry in json.loads(row["companions"] or "[]"):
+                if entry.get("fingerprint"):
+                    references[entry.get("path")].add(row["id"])
+    candidates = {row["id"]: deletable_aux_companions(row) for row in rows}
+    for entries in candidates.values():
+        for entry in entries:
+            selected_counts[entry["path"]] += 1
+    return {key: [entry for entry in entries if len(references[entry["path"]]) <= 1
+                  and selected_counts[entry["path"]] == 1] for key, entries in candidates.items()}
+
+
 def plan_duplicate_cleanup(db, ids):
+    planned = _duplicate_groups(db, ids)
+    aux = _unique_aux(db, [row for _sha, rows, _keepers in planned for row in rows])
     groups = []
-    for sha, files, keepers in _duplicate_groups(db, ids):
+    for sha, files, keepers in planned:
         group = {
             "sha": sha,
             "files": [{"id": row["id"], "path": row["path"], "sizeBytes": row["size"]} for row in files],
+            "auxCompanions": [{"fileId": row["id"], "path": entry["path"], "kind": entry["kind"], "sizeBytes": entry["size"]}
+                              for row in files for entry in aux[row["id"]]],
             "keepers": [{key: keeper[key] for key in ("kind", "id", "path", "verifiedAt") if key in keeper}
                         for keeper in keepers],
         }
@@ -96,7 +129,7 @@ def plan_duplicate_cleanup(db, ids):
     return {"groups": groups}
 
 
-def queue_duplicate_cleanup(db, items):
+def queue_duplicate_cleanup(db, items, *, delete_aux=False):
     from catalog import has_active_storage_shutdown
     if any(item['keeperKind'] == 'remote' for item in items) and has_active_storage_shutdown(db):
         fail(409, 'storage_shutdown_active')
@@ -109,7 +142,9 @@ def queue_duplicate_cleanup(db, items):
     if not chosen:
         fail(400, "정리할 중복 파일을 선택하세요.")
     files = []
-    for sha, targets, keepers in _duplicate_groups(db, chosen):
+    planned = _duplicate_groups(db, chosen)
+    aux = _unique_aux(db, [row for _sha, rows, _keepers in planned for row in rows]) if delete_aux else {}
+    for sha, targets, keepers in planned:
         choices = {chosen[row["id"]] for row in targets}
         if len(choices) != 1:
             fail(400, "같은 내용의 파일에는 남길 사본을 하나만 지정하세요.")
@@ -122,8 +157,13 @@ def queue_duplicate_cleanup(db, items):
         for row in targets:
             files.append({**{key: row[key] for key in ("id", "scan_id", "path", "fingerprint", "size")},
                           "sha": sha, "keeper": keeper})
+            if delete_aux:
+                files[-1]["auxCompanions"] = aux[row["id"]]
     try:
-        job_id = queue_job(db, "duplicate-cleanup", {"files": files})
+        payload = {"files": files}
+        if delete_aux:
+            payload["deleteAux"] = True
+        job_id = queue_job(db, "duplicate-cleanup", payload)
     except ValueError as error:
         fail(409, str(error))
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(_result(len(files)), ensure_ascii=False), job_id))
@@ -282,24 +322,70 @@ def _remove_duplicate(incoming, managed, item, remote):
 
 def _result(count):
     return {"totalFiles": count, "completedFiles": 0, "cleaned": 0, "review": 0,
-            "freedBytes": 0, "phase": "대기 중", "items": []}
+            "auxDeleted": 0, "companionReview": 0, "freedBytes": 0, "phase": "대기 중", "items": []}
 
 
 def _save_progress(db, job_id, result):
     db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), job_id))
 
 
-def _companion_receipt(row):
+def _companion_receipt(row, *, cleaned_paths=()):
     companions = []
     for item in json.loads(row["companions"]) if row else ():
         path = item["path"]
         kind = item.get("kind") or PurePosixPath(path).suffix.lower().lstrip(".")
-        if item.get("disposition") in {"linked", "already-stored"}:
+        allowed = {"linked", "already-stored", "deleted", "absent"} | ({"review"} if path in cleaned_paths else set())
+        if item.get("disposition") in allowed:
             disposition, reason = item["disposition"], item.get("reason", "")
         else:
             disposition, reason = "keep", "중복 정리 시 동반 파일은 보존합니다."
-        companions.append({"path": path, "kind": kind, "disposition": disposition, "reason": reason})
+        companions.append({"path": path, "kind": kind, "disposition": disposition, "reason": reason,
+                           "sizeBytes": item.get("size") if item.get("size") is not None else size_from_fingerprint(item.get("fingerprint"))})
     return companions
+
+
+ABSENT_REASON = "Incoming에서 이미 사라진 보조 파일입니다."
+
+
+def companion_error(exc):
+    return getattr(exc, "strerror", None) or str(exc)
+
+
+def _validate_aux_path(path):
+    if any(part.startswith(".") for part in relative_parts(path)) or PurePosixPath(path).suffix.lower() not in CAMERA_AUX:
+        raise ValueError("THM·LRV·AAE 보조 파일만 정리할 수 있습니다.")
+
+
+def _cleanup_paired_aux(incoming, item):
+    deleted = review = freed = 0
+    aux_by_path = {aux["path"]: aux for aux in item["auxCompanions"]}
+    with database() as db:
+        row = db.execute("SELECT companions FROM scan_files WHERE id=?", (item["id"],)).fetchone()
+    entries = json.loads(row["companions"])
+    for entry in entries:
+        aux = aux_by_path.get(entry.get("path"))
+        if not aux:
+            continue
+        if entry.get("disposition") not in {"deleted", "absent"}:
+            try:
+                _validate_aux_path(aux["path"])
+                if not aux.get("fingerprint"):
+                    raise ValueError("파일 상태를 확인할 수 없습니다.")
+                delete_verified_file(incoming, aux["path"], aux["fingerprint"])
+                entry.update(disposition="deleted", reason="")
+            except FileNotFoundError:
+                entry.update(disposition="absent", reason=ABSENT_REASON)
+            except (OSError, ValueError) as exc:
+                entry.update(disposition="review", reason=companion_error(exc))
+                log.warning("보조 파일을 정리할 수 없습니다: %s", aux["path"])
+            with database(write=True) as db:
+                db.execute("UPDATE scan_files SET companions=? WHERE id=?", (json.dumps(entries, ensure_ascii=False), item["id"]))
+        if entry.get("disposition") == "deleted":
+            deleted += 1
+            freed += aux.get("size") or 0
+        elif entry.get("disposition") == "review":
+            review += 1
+    return deleted, review, freed
 
 
 def cleanup_duplicates(job, incoming, managed, *, refresh_group=None):
@@ -323,14 +409,22 @@ def cleanup_duplicates(job, incoming, managed, *, refresh_group=None):
                     "원본이나 남길 사본을 확인할 수 없습니다. 연결 상태를 확인하고 파일을 다시 검사하세요."
                 )
             else:
+                with database(write=True) as db:
+                    db.execute("UPDATE scan_files SET status='deleted', thumbnail=NULL WHERE id=?", (item["id"],))
                 cleaned_hashes.add(item["sha"])
                 result["freedBytes"] += item["size"]
+                if item.get("auxCompanions"):
+                    deleted, review, freed = _cleanup_paired_aux(incoming, item)
+                    result["auxDeleted"] += deleted
+                    result["companionReview"] += review
+                    result["freedBytes"] += freed
             result["completedFiles"] += 1
             result[outcome["status"]] += 1
             with database(write=True) as db:
                 row = db.execute("SELECT companions FROM scan_files WHERE id=? AND scan_id=?",
                                  (item["id"], item["scan_id"])).fetchone()
-                companions = _companion_receipt(row)
+                companions = _companion_receipt(row, cleaned_paths={aux["path"] for aux in item.get("auxCompanions", [])}
+                                                if outcome["status"] == "cleaned" else ())
                 if companions:
                     outcome["companions"] = companions
                 if outcome["status"] == "cleaned":
@@ -349,8 +443,156 @@ def cleanup_duplicates(job, incoming, managed, *, refresh_group=None):
     if refresh_group:
         for sha in cleaned_hashes:
             refresh_group(managed, sha)
-    result.update(phase="확인 필요 항목 있음" if result["review"] else "완료", current="", items=outcomes)
+    result.update(phase="확인 필요 항목 있음" if result["review"] or result["companionReview"] else "완료", current="", items=outcomes)
     with database(write=True) as db:
         db.execute("""UPDATE jobs SET status='done',result=?,finished_at=?
                       WHERE id=? AND status IN ('queued','running')""",
+                   (json.dumps(result, ensure_ascii=False), now(), job["id"]))
+
+
+AUX_CATEGORY_ORDER = ("orphan", "duplicate-owner", "ambiguous", "review-owner", "unscanned-owner", "ready-owner", "unreadable")
+
+
+def plan_aux_cleanup(db, incoming_root):
+    try:
+        live = list(scan_tree(incoming_root, SUPPORTED | CAMERA_AUX))
+    except OSError:
+        fail(503, "Incoming 폴더에 접근할 수 없습니다.")
+    scan = load_latest_scan(db)
+    rows = {row["path"]: row for row in db.execute("SELECT path,status FROM scan_files WHERE scan_id=?", (scan["id"],))} if scan else {}
+    processed = source_index([path for path, row in rows.items() if row["status"] in {"moved", "deleted"}])
+    archived = source_index([row["original_path"] for row in db.execute(
+        "SELECT original_path FROM media WHERE status IN ('available','archived') AND original_path IS NOT NULL")])
+    live_index = source_index([path for path, _info in live if PurePosixPath(path).suffix.lower() in SUPPORTED])
+    items = []
+    for path, info in live:
+        if PurePosixPath(path).suffix.lower() not in CAMERA_AUX:
+            continue
+        candidates = source_candidates(path, live_index)
+        owner = aux_owner(path, candidates)
+        owner_status = rows[owner]["status"] if owner in rows else None
+        hint = None
+        if info is None:
+            category, reason = "unreadable", "파일 상태를 읽을 수 없습니다."
+        elif not candidates:
+            category = "orphan"
+            processed_matches = source_candidates(path, processed)
+            archived_matches = source_candidates(path, archived)
+            if processed_matches:
+                hint = "owner-processed"
+                reason = f"원본({', '.join(processed_matches)})이 이미 이동·정리된 뒤 남아 있는 보조 파일입니다."
+            elif archived_matches:
+                hint = "owner-archived"
+                reason = f"원본({', '.join(archived_matches)})이 보관함에 등록된 기록이 있는 보조 파일입니다."
+            else:
+                hint = "unverified-orphan"
+                reason = "원본 보관 여부를 확인할 수 없는 고아 보조 파일입니다."
+        elif owner is None:
+            category, reason = "ambiguous", "원본 후보가 여러 개입니다."
+        else:
+            category = {"duplicate": "duplicate-owner", "ready": "ready-owner", "review": "review-owner"}.get(owner_status, "unscanned-owner")
+            reason = "원본 이동 시 자동 정리 예정" if category == "ready-owner" else "연결된 Incoming 원본을 확인하세요."
+        name = PurePosixPath(path)
+        items.append({"path": path, "name": name.name, "folder": "" if str(name.parent) == "." else str(name.parent),
+                      "kind": name.suffix.lower().lstrip("."), "sizeBytes": info.st_size if info else None,
+                      "modifiedAt": iso_time(info.st_mtime) if info else None, "fingerprint": fingerprint(info) if info else None,
+                      "category": category, "orphanHint": hint, "ownerPath": owner, "ownerStatus": owner_status,
+                      "candidatePaths": candidates, "reason": reason, "selectable": info is not None,
+                      "defaultSelected": category in {"orphan", "duplicate-owner"}})
+    items.sort(key=lambda item: (AUX_CATEGORY_ORDER.index(item["category"]), item["path"]))
+    by_category = {key: {"count": 0, "bytes": 0} for key in AUX_CATEGORY_ORDER}
+    for item in items:
+        bucket = by_category[item["category"]]
+        bucket["count"] += 1
+        bucket["bytes"] += item["sizeBytes"] or 0
+    return {"scanId": scan["id"] if scan else None, "scannedAt": now(), "items": items,
+            "summary": {"totalCount": len(items), "totalBytes": sum(item["sizeBytes"] or 0 for item in items),
+                        "defaultSelectedCount": sum(item["defaultSelected"] for item in items),
+                        "defaultSelectedBytes": sum(item["sizeBytes"] or 0 for item in items if item["defaultSelected"]),
+                        "byCategory": by_category}}
+
+
+def _aux_result(count):
+    return {"totalFiles": count, "completedFiles": 0, "deleted": 0, "absent": 0, "review": 0,
+            "freedBytes": 0, "phase": "대기 중", "current": "", "items": []}
+
+
+def queue_aux_cleanup(db, incoming_root, items):
+    verified, seen = [], set()
+    for item in items:
+        path, snapshot = item["path"], item["fingerprint"]
+        if path in seen:
+            fail(400, "정리 대상이 중복으로 선택되었습니다.")
+        seen.add(path)
+        try:
+            _validate_aux_path(path)
+            if size_from_fingerprint(snapshot) is None:
+                raise ValueError("잘못된 파일 상태입니다.")
+        except ValueError as exc:
+            fail(400, str(exc))
+        try:
+            info = inspect(incoming_root, path)
+            if fingerprint(info) != snapshot:
+                raise ValueError("파일 변경")
+        except (OSError, ValueError):
+            fail(409, "보조 파일 상태가 변경되었습니다. 목록을 다시 확인하세요.")
+        verified.append({"path": path, "fingerprint": snapshot, "size": info.st_size,
+                         "kind": PurePosixPath(path).suffix.lower().lstrip(".")})
+    if not verified:
+        fail(400, "정리할 보조 파일을 선택하세요.")
+    scan = load_latest_scan(db)
+    try:
+        job_id = queue_job(db, "aux-cleanup", {"scan_id": scan["id"] if scan else None, "files": verified})
+    except ValueError as exc:
+        fail(409, str(exc))
+    _save_progress(db, job_id, _aux_result(len(verified)))
+    return {"id": job_id, "lane": LANE_LOCAL, "count": len(verified)}
+
+
+def _sync_removed_aux(db, outcomes):
+    removed = {item["path"]: item["status"] for item in outcomes if item["status"] in {"deleted", "absent"}}
+    scan = load_latest_scan(db)
+    if not scan or not removed:
+        return
+    for row in db.execute("SELECT id,companions FROM scan_files WHERE scan_id=?", (scan["id"],)).fetchall():
+        entries = json.loads(row["companions"] or "[]")
+        for entry in entries:
+            status = removed.get(entry.get("path"))
+            if status:
+                entry.update(disposition=status, reason="" if status == "deleted" else ABSENT_REASON)
+        db.execute("UPDATE scan_files SET companions=? WHERE id=?", (json.dumps(entries, ensure_ascii=False), row["id"]))
+    scan_result = json.loads(scan["result"] or "{}")
+    scan_result["unmatchedCompanions"] = [entry for entry in scan_result.get("unmatchedCompanions", []) if entry.get("path") not in removed]
+    _save_progress(db, scan["id"], scan_result)
+
+
+def cleanup_aux_companions(job, incoming, managed):
+    files = json.loads(job["payload"])["files"]
+    prior = {item["path"]: item for item in json.loads(job["result"] or "{}").get("items", [])
+             if item.get("status") in {"deleted", "absent"}}
+    result = _aux_result(len(files))
+    for item in files:
+        outcome = prior.get(item["path"])
+        if outcome is None:
+            outcome = {"path": item["path"], "kind": item.get("kind"), "status": "deleted", "sizeBytes": item["size"]}
+            try:
+                _validate_aux_path(item["path"])
+                if size_from_fingerprint(item.get("fingerprint")) is None:
+                    raise ValueError("파일 상태를 확인할 수 없습니다.")
+                delete_verified_file(incoming, item["path"], item["fingerprint"])
+            except FileNotFoundError:
+                outcome.update(status="absent", reason=ABSENT_REASON)
+            except (OSError, ValueError) as exc:
+                outcome.update(status="review", reason=companion_error(exc))
+        result[outcome["status"]] += 1
+        if outcome["status"] == "deleted":
+            result["freedBytes"] += item["size"]
+        result["items"].append(outcome)
+        result.update(completedFiles=result["completedFiles"] + 1, current=item["path"], phase="보조 파일 정리 중")
+        with database(write=True) as db:
+            _save_progress(db, job["id"], result)
+    result.update(current="", phase="확인 필요 항목 있음" if result["review"] else "완료")
+    with database(write=True) as db:
+        _sync_removed_aux(db, result["items"])
+        db.execute("UPDATE jobs SET status='done',result=?,finished_at=? WHERE id=? AND status IN ('queued','running')",
                    (json.dumps(result, ensure_ascii=False), now(), job["id"]))

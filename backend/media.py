@@ -61,6 +61,18 @@ def fingerprint(info):
     return json.dumps((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
 
 
+def size_from_fingerprint(snapshot):
+    """Read the byte size from a stored stat snapshot, including legacy scans."""
+    try:
+        values = json.loads(snapshot)
+        if (isinstance(values, list) and len(values) == 5 and
+                all(type(value) is int for value in values) and values[2] >= 0):
+            return values[2]
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def regular_stat(parent, name):
     info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):

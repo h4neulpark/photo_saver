@@ -41,8 +41,8 @@ erDiagram
 | 필드 | 내용 |
 | --- | --- |
 | `id` | 정수 기본 키 |
-| `kind` | `scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
-| `lane` | `local` (`scan`, `move`, `delete`, `duplicate-cleanup`, `xmp-link`), `remote` (`upload`, `offload`, `remote-index`), `exclusive` (`reset-all`). 기본 `exclusive` |
+| `kind` | `scan`, `move`, `delete`, `duplicate-cleanup`, `aux-cleanup`, `xmp-link`, `upload`, `offload`, `remote-index`, `reset-all` |
+| `lane` | `local` (`scan`, `move`, `delete`, `duplicate-cleanup`, `aux-cleanup`, `xmp-link`), `remote` (`upload`, `offload`, `remote-index`), `exclusive` (`reset-all`). 기본 `exclusive` |
 | `status` | 기본 `queued`. 처리 중 `running`, 종료 시 `done`·`failed`·`cancelled` |
 | `payload` | JSON 객체. 선택 ID, XMP 연결 또는 전송 파일 목록·연결 식별자·작업 토큰 |
 | `result` | JSON 객체 또는 NULL. 집계·진행 상황·취소 요청·오류 |
@@ -53,6 +53,12 @@ erDiagram
 `initialize()`는 배타 카탈로그 파일 잠금 안에서 구버전 `jobs.lane`을 추가하고 `backfill_job_lanes()`로 종류별 레인을 채운 뒤 `one_active_job`을 제거한다. 미지의 과거 종류는 `exclusive`로 처리하며 신규 미지 종류 등록은 거부한다. 구버전 DB를 열 수 있도록 공통 `SCHEMA`에는 lane 참조 인덱스·트리거를 두지 않고 마이그레이션 뒤 생성한다. SQLite는 WAL, 연결 timeout 30초 및 `busy_timeout=30000`을 사용한다. 재시작 시 두 레인의 `running`을 함께 `queued`로 복구한다.
 
 ### `scan_files`: Incoming 검사 결과
+
+`companions`의 THM·LRV·AAE 엔트리는 stat 성공 시 `size` 바이트를 저장한다. 유일한 소유 원본을 확인한 경우에만 `fingerprint`(JSON dev·ino·size·mtime_ns·ctime_ns 5정수)를 저장한다. 모호·고아·읽기 불가에는 지문을 넣지 않는다. API는 `sizeBytes`를 제공하며 레거시 데이터는 지문의 세 번째 값에서 크기를 읽는다.
+
+중복 정리 payload는 `deleteAux:true`일 때 `files[].auxCompanions`에 path·kind·fingerprint·size를 스냅샷한다. keep/delete-after-move 상태, 화이트리스트 확장자, 단일 참조만 허용하며 보존 사본의 보조 파일은 제외한다. 완료 결과는 `auxDeleted`·`companionReview`를 0부터 집계한다.
+
+보조 파일 일괄 정리 payload는 `scan_id`(null 허용), `files`(path·kind·fingerprint·size)다. 결과 항목은 `deleted`·`absent`·`review`이며 재실행은 deleted/absent 항목을 재사용한다. 최종 job 완료, 최신 검사의 companions disposition 갱신, unmatchedCompanions 제거는 동일 쓰기 트랜잭션이다. review와 XMP는 제거하지 않는다. Jobs의 `absent`는 비주의 영수증이고 `companionReview`는 확인 필요 신호다.
 
 | 필드 | 내용 |
 | --- | --- |

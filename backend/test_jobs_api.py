@@ -69,6 +69,21 @@ class JobsApiTests(unittest.TestCase):
             self.assertEqual([job['id'] for job in self.query(kind=kind)['jobs']], [job_id])
         self.assertEqual(api.state()['latestIncomingResult']['id'], original)
 
+    def test_aux_filter_latest_incoming_and_companion_attention(self):
+        complete = self.add('aux-cleanup', result={'deleted': 2, 'absent': 1, 'items': [{'status': 'absent'}]})
+        self.assertEqual([job['id'] for job in self.query(kind='aux-cleanup')['jobs']], [complete])
+        self.assertFalse(self.query(kind='aux-cleanup')['jobs'][0]['hasAttention'])
+        self.add('scan')
+        self.assertEqual(api.state()['latestIncomingResult']['id'], complete)
+        attention = self.add('duplicate-cleanup', result={'cleaned': 1, 'companionReview': 1})
+        self.assertEqual(self.query(status='attention')['jobs'][0]['id'], attention)
+        self.assertEqual(api.state()['latestIncomingResult']['id'], attention)
+
+    def test_absent_receipts_do_not_displace_review_when_truncated(self):
+        self.add('aux-cleanup', result={'items': [{'status': 'absent'}] * 110 + [{'status': 'review'}], 'review': 1})
+        job = self.query(kind='aux-cleanup')['jobs'][0]
+        self.assertEqual(job['result']['items'][0]['status'], 'review')
+
     def test_cursor_is_descending_and_stable_with_new_jobs(self):
         ids = [self.add() for _ in range(5)]
         first = self.query(limit=2)

@@ -1,5 +1,25 @@
 # 개발과 검증
 
+## Incoming 보조 파일 정리 검증
+
+운영 모듈 추가 없이 `incoming_cleanup.py`에서 중복 동시 정리와 `aux-cleanup`을 구현한다. Dockerfile과 운영 의존성은 그대로 사용한다. 기존 보호 테스트는 수정하지 않는다. 새 `test_aux_cleanup.py`, `test_aux_cleanup.cjs`와 확장된 cleanup/concurrency/jobs 테스트는 소유권, 7개 분류, 숨김·링크·지문 검증, 원본/보조 파일 오류 격리, 4구간 복구, 완료 트랜잭션 정합성, keeper 전환과 선택 요약, 409 재동기화 및 레인 잠금을 검사한다.
+
+```sh
+docker compose config --quiet
+docker compose build api worker
+printf 'FROM photo-saver-backend\nRUN pip install --no-cache-dir httpx==0.28.1\n' | docker build -t photo-saver-backend-tests -
+docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev -v "$PWD/backend:/app:ro" -w /app photo-saver-backend-tests python -m unittest test_incoming_cleanup test_aux_cleanup test_incoming_workflow test_concurrency test_jobs_api -v
+docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev -v "$PWD/backend:/app:ro" -w /app photo-saver-backend-tests python -m unittest discover -s . -p 'test_*.py' -v
+shasum -a 256 frontend/styles.css frontend/app.js
+node --check frontend/app.js
+node --check frontend/test_aux_cleanup.cjs
+node --test frontend/test_aux_cleanup.cjs frontend/test_media_preview.cjs frontend/test_job_concurrency.cjs frontend/test_phase1_ui.cjs frontend/test_phase2_ui.cjs frontend/test_phase3_ui.cjs
+node --test frontend/test_*.cjs
+git diff --check
+```
+
+CSS와 JS 변경 뒤 `index.html`의 각 `?v=`를 해당 파일 SHA-256 앞 12자리로 갱신한다. 반응형 보조 파일 목록은 320~1280px에서 긴 경로 줄바꿈과 최소 44px 터치 영역을 유지한다.
+
 ## OMV 시작 검증
 
 추가 모듈은 `storage_wake.py`, `storage_wake_io.py`이며 Dockerfile에 둘 다 명시적으로 복사한다. 운영 의존성 추가는 없다. 실제 HA services 호출이나 NAS 쓰기를 테스트에 사용하지 않는다. 네트워크 차단·운영 볼륨 없는 기존 테스트 이미지에서 temp SQLite/settings와 모의 HA/SSH를 사용한다.

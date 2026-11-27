@@ -27,13 +27,13 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import Headers, MutableHeaders
 
 from catalog import LANE_LOCAL, active_jobs_by_lane, latest_jobs_by_lane, active_offload_media_ids, DEFAULT_ZONE, PHOTOS, backfill_remote_files, database, initialize, load_latest_scan, now, queue_job
-from media import VIDEOS, capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview
+from media import VIDEOS, capture_time, modified_time_from_fingerprint, parse_capture_datetime, regular_file, save_image_preview, size_from_fingerprint
 from settings import NO_STORE, ensure_storage_id, read_local_retention, router as settings_router
 from archive import active_storage_scope, router as archive_router
 from transfers import MissingXmpOffloadError, RemoteDuplicateError, TransferRequest, queue_transfer
 from offload import OffloadRequest, queue_offload
 from remote_index import RemoteIndexRequest, queue_remote_index
-from incoming_cleanup import plan_duplicate_cleanup, queue_duplicate_cleanup
+from incoming_cleanup import plan_duplicate_cleanup, queue_duplicate_cleanup, plan_aux_cleanup, queue_aux_cleanup
 from records import router as records_router
 from devices import router as devices_router, device_names, effective_device, device_sql, device_folder
 
@@ -174,6 +174,16 @@ class DuplicateCleanupItem(BaseModel):
 
 class DuplicateCleanupSelection(BaseModel):
     items: list[DuplicateCleanupItem] = Field(min_length=1)
+    deleteAux: bool = False
+
+
+class AuxCleanupItem(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    fingerprint: str = Field(min_length=1, max_length=256)
+
+
+class AuxCleanupSelection(BaseModel):
+    items: list[AuxCleanupItem] = Field(min_length=1, max_length=10000)
 
 
 class EventFields(BaseModel):
@@ -394,6 +404,7 @@ def view_scan_companion(item, status):
     return {
         "path": item["path"], "kind": kind, "disposition": disposition,
         "reason": reason, "pendingId": item.get("pendingId"),
+        "sizeBytes": item.get("size") if item.get("size") is not None else size_from_fingerprint(item.get("fingerprint")),
     }
 
 
@@ -476,7 +487,7 @@ def job_history_entry(row):
         if total > MAX_JOB_RESULT_LIST:
             if name == "items":
                 def attention(item):
-                    return not isinstance(item, dict) or item.get("status") not in {"moved", "deleted", "cleaned", "linked", "generated", "reused"}
+                    return not isinstance(item, dict) or item.get("status") not in {"moved", "deleted", "absent", "cleaned", "linked", "generated", "reused"}
                 values = [item for item in values if attention(item)] + [item for item in values if not attention(item)]
             result[name] = values[:MAX_JOB_RESULT_LIST]
         meta.update({f"{name}Total": total, f"{name}Shown": min(total, MAX_JOB_RESULT_LIST),
@@ -491,7 +502,7 @@ def job_history(
     before_id: int | None = Query(default=None, ge=1),
     lane: Literal["all", "local", "remote", "exclusive"] = "all",
     status: Literal["all", "active", "attention", "done", "failed", "cancelled"] = "all",
-    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote", "storage-wake", "storage-shutdown"] = "all",
+    kind: Literal["all", "scan", "move", "delete", "duplicate-cleanup", "aux-cleanup", "xmp-link", "upload", "offload", "remote-index", "reset-all", "thumbnails-local", "thumbnails-remote", "storage-wake", "storage-shutdown"] = "all",
 ):
     clauses, params = [], []
     if before_id is not None:
@@ -834,7 +845,7 @@ def state():
                 latest_upload_offload = {"jobId": remote["id"], "count": upload_candidates["totalEligibleCount"],
                                          **{key: upload_candidates[key] for key in ("totalBytes", "blockedByKeeperCount", "excludedMissingXmp")}}
         latest_incoming_result = db.execute(
-            """SELECT * FROM jobs WHERE kind IN ('move','delete','duplicate-cleanup','xmp-link')
+            """SELECT * FROM jobs WHERE kind IN ('move','delete','duplicate-cleanup','aux-cleanup','xmp-link')
                AND status IN ('done','failed','cancelled') ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         compat_job = active['exclusive'] or max(
@@ -981,7 +992,20 @@ def incoming_duplicate_plan(selection: Selection):
 @app.post("/api/jobs/duplicate-cleanup", status_code=202)
 def clean_incoming_duplicates(selection: DuplicateCleanupSelection):
     with database(write=True) as db:
-        return queue_duplicate_cleanup(db, [item.model_dump() for item in selection.items])
+        return queue_duplicate_cleanup(db, [item.model_dump() for item in selection.items], delete_aux=selection.deleteAux)
+
+
+@app.get("/api/incoming/aux/plan")
+def incoming_aux_plan():
+    with database() as db:
+        return JSONResponse(plan_aux_cleanup(db, INCOMING_PREVIEW), headers=NO_STORE)
+
+
+@app.post("/api/jobs/aux-cleanup", status_code=202)
+def clean_incoming_aux(selection: AuxCleanupSelection):
+    with database(write=True) as db:
+        return JSONResponse(queue_aux_cleanup(db, INCOMING_PREVIEW, [item.model_dump() for item in selection.items]),
+                            status_code=202, headers=NO_STORE)
 
 
 @app.post("/api/jobs/offload", status_code=202)
