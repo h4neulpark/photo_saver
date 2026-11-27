@@ -2,7 +2,7 @@
 
 ## OMV 원격 종료
 
-아카이브·설정의 **OMV 끄기**는 별도 Home Assistant 종료 스크립트를 확인창 이후 한 번 실행합니다. `.env`의 `PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY`는 기본 빈 값(비활성)이며 wake 스크립트와 달라야 합니다. `PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS`는 기본 180초(30~600초)입니다. [설정·검증 명령](docs/setup-and-operations.md#omv-원격-종료-선택-설정), [API](docs/api.md#omv-원격-종료), [사용 안내](docs/user-guide.md#원격-omv-서버-끄기)를 참고하세요.
+아카이브·설정의 **OMV 켜기 / OMV 끄기**는 Home Assistant Template Switch와 연동합니다. `.env`에 `PHOTO_SAVER_HA_POWER_SWITCH_ENTITY=switch.omv_power`를 설정하면 켜기·끄기·상태 조회가 함께 활성화됩니다. 종료는 확인창 이후 한 번 요청하고 실제 스위치 꺼짐까지 기다립니다. `PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS`는 기본 300초(30~1200초)이며, 스위치를 비워 두면 기존 켜기·종료 스크립트 설정으로 폴백합니다. [설정·검증 명령](docs/setup-and-operations.md#omv-원격-종료-선택-설정), [API](docs/api.md#omv-원격-종료), [사용 안내](docs/user-guide.md#원격-omv-서버-끄기)를 참고하세요.
 
 종료는 SSH 응답 중단과 HA 전원 꺼짐을 함께 확인합니다. 원격 파일 작업·원격 사본 중복 정리와 상호 배제하며 로컬 검사는 병행할 수 있습니다. **대기 중지**는 이미 전달된 종료 요청을 취소하지 않습니다. 아카이브 연결·다운로드는 끊길 수 있으며 부분 확인 결과는 실제 전원을 직접 확인해야 합니다. 종료 기능 테스트는 `node --test frontend/test_storage_shutdown.cjs` 및 Docker 이미지의 `python -m unittest -v test_storage_shutdown.py`입니다.
 

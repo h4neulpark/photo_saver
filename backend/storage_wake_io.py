@@ -1,6 +1,7 @@
 """Private single-operation helper; input/response are restricted JSON pipes."""
 import json
 import os
+import re
 import ssl
 import socket
 import stat
@@ -58,10 +59,43 @@ def operation(request):
                                403: 'permission_denied', 400: 'not_directory'}.get(exc.status_code, 'unreachable')}
         except Exception:
             return {'status': 'unreachable'}
+    if request['operation'] == 'get_many':
+        request = dict(request, deadline=min(request['deadline'], time.time() + 4.5))
+        entities = request.get('entities')
+        if not isinstance(entities, list) or not 1 <= len(entities) <= 4 or not all(isinstance(e, str) for e in entities):
+            return {'status': 'invalid_response', 'code': 'ha_config_invalid'}
+        results = {}
+        for entity in entities:
+            result = _get_entity(dict(request, entity=entity))
+            results[entity] = result
+            if (result.get('code') in ('ha_http_401', 'ha_http_403', 'ha_dns_error', 'ha_tls_error',
+                                       'ha_redirect_blocked', 'ha_timeout', 'ha_unreachable') or
+                    result.get('status') in ('expired', 'unreachable')):
+                # Carry the shared failure forward without another HTTP request.
+                results.update({e: dict(result) for e in entities if e not in results})
+                break
+        return {'status': 'ok', 'entities': results}
+    if request['operation'] == 'get':
+        return _get_entity(request)
+    return _ha_request(request)
+
+
+def _get_entity(request):
+    return _ha_request(dict(request, operation='get'))
+
+
+def _ha_request(request):
     ha = request['ha']
     post = request['operation'] == 'post'
-    path = '/api/services/script/turn_on' if post else '/api/states/' + request['entity']
-    data = json.dumps({'entity_id': ha['script']}).encode() if post else None
+    if post:
+        service = request.get('service', 'script/turn_on')
+        entity = request.get('entity', ha.get('script'))
+        if (service not in ('script/turn_on', 'switch/turn_on', 'switch/turn_off') or
+                not isinstance(entity, str) or not entity.startswith(service.split('/')[0] + '.') or
+                not re.fullmatch(r'(script|switch)\.[a-z0-9_]+', entity)):
+            return {'status': 'rejected', 'code': 'ha_config_invalid'}
+    path = '/api/services/' + service if post else '/api/states/' + request['entity']
+    data = json.dumps({'entity_id': entity}).encode() if post else None
     req = urllib.request.Request(ha['url'] + path, data=data,
                                  headers={'Authorization': 'Bearer ' + ha['token'], 'Content-Type': 'application/json'})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -71,16 +105,17 @@ def operation(request):
         with opener.open(req, timeout=max(.01, min(5, request['deadline'] - time.time()))) as response:
             if post:
                 return {'status': 'accepted' if response.status == 200 else 'unknown'}
+            if getattr(response, 'status', 200) != 200:
+                return {'status': 'invalid_response' if request.get('statusProjection') else 'unreachable'}
             raw = response.read(65537)
             if len(raw) > 65536:
                 return {'status': 'invalid_response' if request.get('statusProjection') else 'unreachable'}
             value = json.loads(raw)
             if not isinstance(value, dict) or value.get('entity_id') != request['entity']:
                 return {'status': 'invalid_response' if request.get('statusProjection') else 'unreachable'}
-            if request.get('statusProjection') and value.get('state') not in ('on', 'off', 'unknown', 'unavailable'):
-                return {'status': 'invalid_response'}
-            result = {'status': 'ok', 'state': value.get('state') if value.get('state') in
-                      ('on', 'off', 'unknown', 'unavailable') else 'unknown'}
+            if value.get('state') not in ('on', 'off', 'unknown', 'unavailable'):
+                return {'status': 'invalid_response' if request.get('statusProjection') else 'unreachable'}
+            result = {'status': 'ok', 'state': value['state']}
             for key in ('last_reported', 'last_updated', 'last_changed'):
                 if request.get('statusProjection'):
                     result[key + '_present'] = key in value
@@ -97,7 +132,7 @@ def operation(request):
     except (ValueError, TypeError):
         return {'status': 'invalid_response' if request.get('statusProjection') else ('unknown' if post else 'unreachable'), 'code': 'ha_response_invalid'}
     except urllib.error.HTTPError as exc:
-        return {'status': ('rejected' if post else 'ha_error') if exc.code in (400, 401, 403, 404)
+        return {'status': ('rejected' if post else 'ha_error') if exc.code in (400, 401, 403, 404) or not post and exc.code in (301, 302, 303, 307, 308)
                 else ('unknown' if post else 'unreachable'), 'code': (
                     'ha_redirect_blocked' if exc.code in (301, 302, 303, 307, 308) else
                     'ha_http_5xx' if exc.code >= 500 else 'ha_http_' + str(exc.code))}
@@ -117,7 +152,7 @@ def transport_error(exc, post):
 
 def main():
     request = json.loads(sys.stdin.readline(131072))
-    max_slice = {'ssh': 12, 'ssh_banner': 2.5}.get(request.get('operation'), 5)
+    max_slice = {'ssh': 12, 'ssh_banner': 2.5, 'get_many': 4.5}.get(request.get('operation'), 5)
     cap = max(.001, min(max_slice, request['deadline'] - time.time()))
     watchdog = threading.Timer(cap, lambda: os._exit(124))
     watchdog.daemon = True

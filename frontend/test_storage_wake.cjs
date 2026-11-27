@@ -38,6 +38,34 @@ function harness() {
 }
 const action = (h, name) => h.page.querySelector(`[data-action="${name}"]`);
 
+test('wake button disables confirmed running or connected and allows transition observation', () => {
+  for (const page of ['archive', 'settings']) {
+    const h = harness(); h.storageMonitor.expiry = Infinity;
+    for (const status of ['running', 'no_response', 'booting', 'unknown', 'stale', 'loading']) {
+      h.storageMonitor.snapshot = { status, reasonCode: status === 'booting' ? 'power_transitioning' : null };
+      route(h, page);
+      assert.equal(action(h, 'start-storage-wake').disabled, status === 'running', `${page}: ${status}`);
+      if (status === 'running') assert.equal(action(h, 'start-storage-wake').title || action(h, 'start-storage-wake').getAttribute('title'), 'OMV가 이미 작동 중입니다.');
+    }
+    h.view.archive = archive(); h.render();
+    assert.equal(action(h, 'start-storage-wake').disabled, true);
+    h.view.wakePending = { requestId: crypto.randomUUID(), targetRevision: revision }; h.render();
+    assert.equal(action(h, 'start-storage-wake').disabled, false);
+    h.view.settings = null; h.render();
+    assert.equal(action(h, 'start-storage-wake').disabled, true);
+    assert.match(action(h, 'start-storage-wake').getAttribute('title'), /불러오는 중/);
+  }
+});
+
+test('switch wake facts keep power and running sensor separate', () => {
+  const h = harness();
+  const facts = h.wakeFacts(job('running', { controlMode: 'switch', haPowerState: 'on', haState: 'off', attemptState: 'observing_existing' }));
+  assert.match(facts, /HA 전원 스위치.*켜짐/);
+  assert.match(facts, /실행 센서.*꺼짐/);
+  assert.match(facts, /기존 전원 제어 관찰 중/);
+  assert.doesNotMatch(h.wakeFacts(job()), /HA 전원 스위치/);
+});
+
 test('archive and settings use HA availability independently of SSH and local activity', () => {
   const h = harness();
   h.state.activeJobs.local = { id: 2, kind: 'scan', status: 'running', lane: 'local', result: {} };

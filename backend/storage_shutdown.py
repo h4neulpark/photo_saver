@@ -13,22 +13,25 @@ from pydantic import BaseModel, ConfigDict, Field
 import catalog
 import settings
 from storage_wake import (Interrupted, _control_budget, base_configuration, control_budget,
-                          database, digest, isolated_io, safe_object, snapshot_lock, stale_seconds)
+                          database, digest, isolated_io, safe_object, snapshot_lock, observation_freshness)
 
 
 def configuration():
     base = base_configuration()
     script = os.environ.get('PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY', '').strip()
     wake_script = os.environ.get('PHOTO_SAVER_HA_SCRIPT_ENTITY', '').strip() or 'script.wake_omv'
-    reason = base['reason'] or (None if script else 'ha_shutdown_not_configured')
-    timeout = 180
+    mode = 'switch' if base['power_switch'] else 'script'
+    reason = base['reason'] or (None if mode == 'switch' or script else 'ha_shutdown_not_configured')
+    timeout = 300
     try:
-        timeout = int(os.environ.get('PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS', '') or '180')
-        if not 30 <= timeout <= 600 or script and (not re.fullmatch(r'script\.[a-z0-9_]+', script) or script == wake_script):
+        timeout = int(os.environ.get('PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS', '') or '300')
+        if not 30 <= timeout <= 1200 or mode == 'script' and script and (not re.fullmatch(r'script\.[a-z0-9_]+', script) or script == wake_script):
             reason = base['reason'] or 'ha_config_invalid'
     except (ValueError, TypeError):
         reason = base['reason'] or 'ha_config_invalid'
-    return dict(base, script=script, timeout=timeout, reason=reason)
+    return dict(base, script=script, timeout=timeout, reason=reason, mode=mode,
+                control_entity=base['power_switch'] or script,
+                service='switch/turn_off' if mode == 'switch' else 'script/turn_on')
 
 
 def snapshot():
@@ -36,7 +39,8 @@ def snapshot():
         address = settings.read_setting(settings.ADDRESS_FILE).strip()
         ha = configuration()
         storage = digest({'address': address})
-        config = digest(dict(url=ha['url'], sensor=ha['sensor'], script=ha['script'],
+        config = digest(dict(url=ha['url'], sensor=ha['sensor'], script=ha['script'] if ha['mode'] == 'script' else None,
+                             mode=ha['mode'], control_entity=ha['control_entity'], service=ha['service'],
                              timeout=ha['timeout'], storage=storage))
         return dict(ha=ha, address=address, storageRevision=storage, configRevision=config,
                     targetRevision=digest(dict(kind='storage-shutdown', config=config)),
@@ -48,14 +52,15 @@ def public_configuration():
         snap = snapshot()
     except (HTTPException, OSError):
         return dict(available=False, reasonCode='settings_busy', message='설정을 읽는 중입니다. 잠시 후 다시 확인하세요.',
-                    timeoutSeconds=configuration()['timeout'], targetRevision=None)
+                    timeoutSeconds=configuration()['timeout'], targetRevision=None, mode=configuration()['mode'])
     ha = snap['ha']
     messages = {
         'ha_not_configured': 'Home Assistant 주소와 토큰이 설정되지 않았습니다. .env를 설정한 뒤 api와 worker를 다시 생성하세요.',
-        'ha_shutdown_not_configured': 'OMV 종료 스크립트(PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY)가 설정되지 않았습니다.',
-        'ha_config_invalid': 'Home Assistant 종료 설정을 확인하세요. 스크립트 엔티티(wake와 달라야 함)와 타임아웃(30~600초)을 점검하세요.'}
-    return dict(available=ha['reason'] is None, reasonCode=ha['reason'], message=messages.get(ha['reason']),
-                timeoutSeconds=ha['timeout'], targetRevision=snap['targetRevision'])
+        'ha_shutdown_not_configured': 'OMV 전원 스위치 또는 레거시 종료 스크립트를 .env에 설정하세요.',
+        'ha_config_invalid': 'Home Assistant 종료 설정을 확인하세요. 전원 스위치 또는 레거시 스크립트와 타임아웃(30~1200초)을 점검하세요.'}
+    return dict(available=ha['reason'] is None, reasonCode=ha['reason'], message=messages.get(ha['reason']) or (
+                'Home Assistant 전원 스위치를 끄고 전원 차단까지 확인합니다.' if ha['mode'] == 'switch' else 'Home Assistant의 기존 OMV 종료 스크립트를 사용합니다.'),
+                timeoutSeconds=ha['timeout'], targetRevision=snap['targetRevision'], mode=ha['mode'])
 
 
 class ShutdownRequest(BaseModel):
@@ -87,7 +92,7 @@ def valid_payload(p):
             UUID(alias)
         assert all(isinstance(p[k], str) and re.fullmatch(r'[0-9a-f]{64}', p[k]) for k in ('targetRevision', 'configRevision', 'storageRevision'))
         assert type(p['sshConfiguredAtAdmission']) is bool
-        assert type(p['timeoutSeconds']) is int and 30 <= p['timeoutSeconds'] <= 600
+        assert type(p['timeoutSeconds']) is int and 30 <= p['timeoutSeconds'] <= 1200
         start, end = (datetime.fromisoformat(p[k]) for k in ('requestedAt', 'deadlineAt'))
         assert start.tzinfo and end.tzinfo and 0 < (end-start).total_seconds() <= p['timeoutSeconds']
         a = p['attempt']
@@ -113,6 +118,8 @@ def initial_result(p):
                 outcome=None, code=None, detailCode=None, error=None, review=0, cancelRequested=False,
                 attemptState='not_started', attemptCount=0, intentAt=None, receiptAt=None,
                 haState='unknown', haFresh=False, haScriptState='unknown', sshState='unknown',
+                controlMode=configuration()['mode'], haPowerState='unknown', haPowerFresh=False,
+                haRunningState='unknown', haRunningFresh=False,
                 sshConfigured=p['sshConfiguredAtAdmission'], everSshStoppedAfterAttempt=False,
                 startedAt=p['requestedAt'], checkedAt=None, elapsedSeconds=0,
                 **{k: p[k] for k in ('targetRevision', 'requestedAt', 'deadlineAt', 'timeoutSeconds')})
@@ -176,7 +183,7 @@ MESSAGES = {
 DETAIL_MESSAGES = {
     'ha_http_401': 'Home Assistant 토큰 인증에 실패했습니다. .env의 HA 토큰을 확인하세요.',
     'ha_http_403': 'Home Assistant 접근 권한이 없습니다. 토큰 권한을 확인하세요.',
-    'ha_http_404': 'Home Assistant 스크립트 또는 센서를 찾을 수 없습니다. 엔티티 이름을 확인하세요.',
+    'ha_http_404': 'Home Assistant 전원 스위치·스크립트 또는 실행 센서를 찾을 수 없습니다. 엔티티 이름을 확인하세요.',
     'ha_redirect_blocked': 'Home Assistant 주소가 다른 주소로 이동합니다. 최종 주소를 설정하세요.',
     'ha_http_5xx': 'Home Assistant 서버 오류입니다. 잠시 후 다시 시도하세요.',
     'ha_dns_error': 'Home Assistant 주소를 찾을 수 없습니다. Docker에서는 .local 대신 LAN IP를 사용하세요.',
@@ -309,21 +316,21 @@ def _run(job, p, deadline, stop_event, runner):
             snap = snapshot()
             ha = snap['ha']
             ssh = io('ssh_banner', address=snap['address']) if p['sshConfiguredAtAdmission'] else dict(status='unconfigured')
-            script = io('get', ha=ha, entity=ha['script'])
-            sensor = io('get', ha=ha, entity=ha['sensor'])
-            evidence = sensor.get('last_reported') or sensor.get('last_updated')
-            try:
-                age = time.time() - datetime.fromisoformat(evidence.replace('Z', '+00:00')).timestamp()
-                fresh = age >= -30 and (not stale_seconds() or age <= stale_seconds())
-            except (ValueError, TypeError, AttributeError):
-                fresh = False
+            switch_mode = ha['mode'] == 'switch'
+            script = io('get', ha=ha, entity=ha['control_entity'], statusProjection=True)
+            sensor = io('get', ha=ha, entity=ha['sensor'], statusProjection=True)
+            _, fresh = observation_freshness(sensor, time.time())
+            _, power_fresh = observation_freshness(script, time.time())
             ha_state = sensor.get('state', 'unknown')
-            ha_off = ha_state == 'off' and fresh
+            ha_off = script.get('state') == 'off' and power_fresh if switch_mode else ha_state == 'off' and fresh
             ssh_stopped = ssh['status'] == 'unreachable'
             if attempt['state'] in ('accepted', 'unknown', 'observing_existing') and ssh_stopped:
                 ever_stopped = True
             phase = 'checking_server' if attempt['state'] == 'not_started' else 'waiting_power_off' if ssh_stopped or not p['sshConfiguredAtAdmission'] else 'waiting_shutdown'
             transition(job_id, dict(haState=ha_state, haFresh=fresh, haScriptState=script.get('state', 'unknown'),
+                                   controlMode=ha['mode'], haPowerState=script.get('state', 'unknown') if switch_mode else 'unknown',
+                                   haPowerFresh=power_fresh if switch_mode else False,
+                                   haRunningState=ha_state, haRunningFresh=fresh,
                                    sshState=ssh['status'], sshConfigured=p['sshConfiguredAtAdmission'],
                                    everSshStoppedAfterAttempt=ever_stopped, checkedAt=catalog.now(),
                                    elapsedSeconds=max(0, int(time.time()-datetime.fromisoformat(p['requestedAt']).timestamp())),
@@ -336,23 +343,25 @@ def _run(job, p, deadline, stop_event, runner):
                     finish('powered_off', 'done')
                 return
             if attempt['state'] == 'not_started':
-                permanent = next((v.get('code') for v in (script, sensor)
-                                  if v.get('status') == 'ha_error' or v.get('code') == 'ha_redirect_blocked'), None)
+                permanent = next((v.get('code') or 'ha_unreachable' for v in (script, sensor)
+                                  if (v.get('status') == 'ha_error' or v.get('code') == 'ha_redirect_blocked')
+                                  and not (switch_mode and v is sensor and v.get('code') == 'ha_http_404')), None)
                 if permanent:
                     finish('ha_request_failed', detail=permanent)
                     return
-                if script.get('state') == 'on':
+                if not switch_mode and script.get('state') == 'on':
                     attempt = dict(attempt, state='observing_existing')
                     transition(job_id, {}, attempt=attempt)
                     if ssh_stopped:
                         ever_stopped = True
                         transition(job_id, dict(everSshStoppedAfterAttempt=True))
-                elif script.get('state') == 'off' and (ssh['status'] == 'reachable' or
-                        not p['sshConfiguredAtAdmission'] and ha_state == 'on' and fresh):
+                elif ((script.get('state') == 'on' and power_fresh) if switch_mode else script.get('state') == 'off') and (
+                        ssh['status'] == 'reachable' or not p['sshConfiguredAtAdmission'] and (
+                            ha_state == 'on' and fresh or switch_mode and sensor.get('code') == 'ha_http_404')):
                     control()
                     attempt = dict(attempt, state='intent', count=1, intentAt=catalog.now())
                     transition(job_id, dict(phaseCode='requesting', phase='종료 요청 중'), attempt=attempt)
-                    response = io('post', ha=ha)
+                    response = io('post', ha=ha, service=ha['service'], entity=ha['control_entity'])
                     # A 5xx response cannot prove the script did not run. Keep the
                     # remote lane reserved and observe unknown outcomes until deadline.
                     rejected = response['status'] == 'rejected' or response.get('code') == 'ha_redirect_blocked'
@@ -362,7 +371,11 @@ def _run(job, p, deadline, stop_event, runner):
                         finish('ha_request_failed', detail=response.get('code'))
                         return
                 else:
-                    uncertain_initial = script.get('state') != 'off' or not (ha_state == 'on' and fresh and ssh_stopped)
+                    if switch_mode:
+                        server_not_ready = ssh_stopped if p['sshConfiguredAtAdmission'] else ha_state == 'off' and fresh
+                        uncertain_initial = not (script.get('state') == 'on' and power_fresh and server_not_ready)
+                    else:
+                        uncertain_initial = script.get('state') != 'off' or not (ha_state == 'on' and fresh and ssh_stopped)
                     if time.monotonic()-checking_started >= 15:
                         finish('response_unconfirmed' if uncertain_initial else 'server_not_ready')
                         return

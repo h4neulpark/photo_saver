@@ -102,6 +102,7 @@ def base_configuration():
     url = os.environ.get('PHOTO_SAVER_HA_URL', '').strip().rstrip('/')
     token = os.environ.get('PHOTO_SAVER_HA_TOKEN', '').strip()
     sensor = os.environ.get('PHOTO_SAVER_HA_RUNNING_ENTITY', '').strip() or 'binary_sensor.omv_running'
+    power_switch = os.environ.get('PHOTO_SAVER_HA_POWER_SWITCH_ENTITY', '').strip()
     reason = None
     try:
         parsed = urlsplit(url)
@@ -119,7 +120,9 @@ def base_configuration():
         reason = 'ha_config_invalid'
     if not url or not token:
         reason = 'ha_not_configured'
-    return dict(url=url, token=token, sensor=sensor, reason=reason)
+    if power_switch and not re.fullmatch(r'switch\.[a-z0-9_]+', power_switch):
+        reason = 'ha_config_invalid'
+    return dict(url=url, token=token, sensor=sensor, power_switch=power_switch, reason=reason)
 
 
 def stale_seconds():
@@ -129,6 +132,23 @@ def stale_seconds():
         return 0
 
 
+def observation_evidence(observation):
+    # A present but invalid last_reported must never fall back to last_updated.
+    key = 'last_reported' if observation.get('last_reported_present', 'last_reported' in observation) else 'last_updated'
+    return observation.get(key)
+
+
+def observation_freshness(observation, wall=None):
+    try:
+        parsed = datetime.fromisoformat(observation_evidence(observation).replace('Z', '+00:00'))
+        if parsed.tzinfo is None or observation.get('status') != 'ok':
+            return None, False
+        age = (time.time() if wall is None else wall) - parsed.timestamp()
+        return age, age >= -30 and (not stale_seconds() or age <= stale_seconds())
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        return None, False
+
+
 def configuration():
     base = base_configuration()
     script = os.environ.get('PHOTO_SAVER_HA_SCRIPT_ENTITY', '').strip() or 'script.wake_omv'
@@ -136,11 +156,13 @@ def configuration():
     reason = base['reason']
     try:
         timeout = int(os.environ.get('PHOTO_SAVER_WAKE_TIMEOUT_SECONDS', '') or '180')
-        if not 30 <= timeout <= 600 or not re.fullmatch(r'script\.[a-z0-9_]+', script):
+        if not 30 <= timeout <= 600 or not base['power_switch'] and not re.fullmatch(r'script\.[a-z0-9_]+', script):
             reason = reason or 'ha_config_invalid'
     except (ValueError, TypeError):
         reason = reason or 'ha_config_invalid'
-    return dict(base, script=script, timeout=timeout, reason=reason)
+    mode = 'switch' if base['power_switch'] else 'script'
+    return dict(base, script=script, timeout=timeout, reason=reason, mode=mode,
+                control_entity=base['power_switch'] or script, service=mode + '/turn_on')
 
 
 @contextmanager
@@ -186,12 +208,13 @@ def unlocked_snapshot():
     except HTTPException:
         config = None
     ha = configuration()
+    effective_ha = {k: v for k, v in ha.items() if ha['mode'] != 'switch' or k != 'script'}
     public = digest([address, settings.read_setting(settings.STORAGE_ROOT_FILE),
                      settings.read_storage_id(), settings.read_setting(settings.PUBLIC_KEY),
                      settings.read_setting(settings.known_host_file(address)) if address else None,
                      archive.archive_revision(config) if config else None,
-                     ha['url'], ha['script'], ha['sensor']])
-    return dict(ha=ha, storageRevision=storage, configRevision=digest([storage, ha]),
+                     ha['url'], ha['sensor'], ha['mode'], ha['control_entity'], ha['service']])
+    return dict(ha=ha, storageRevision=storage, configRevision=digest([storage, effective_ha]),
                 targetRevision=public, archiveConfiguredAtAdmission=config is not None)
 
 
@@ -201,12 +224,13 @@ def public_configuration():
     except (HTTPException, OSError):
         return dict(available=False, reasonCode='settings_busy',
                     message='설정을 읽는 중입니다. 잠시 후 다시 확인하세요.',
-                    timeoutSeconds=configuration()['timeout'], targetRevision=None)
+                    timeoutSeconds=configuration()['timeout'], targetRevision=None, mode=configuration()['mode'])
     ha = snap['ha']
     return dict(available=ha['reason'] is None, reasonCode=ha['reason'],
                 message=('Home Assistant 연결이 설정되지 않았습니다. .env에 HA 주소·토큰을 등록하고 앱을 재시작하세요.'
-                         if ha['reason'] else 'Home Assistant의 기존 OMV 켜기 스크립트를 사용합니다.'),
-                timeoutSeconds=ha['timeout'], targetRevision=snap['targetRevision'])
+                         if ha['reason'] else 'Home Assistant 전원 스위치로 OMV를 켜고 실행 센서로 응답을 확인합니다.' if ha['mode'] == 'switch'
+                         else 'Home Assistant의 기존 OMV 켜기 스크립트를 사용합니다.'),
+                timeoutSeconds=ha['timeout'], targetRevision=snap['targetRevision'], mode=ha['mode'])
 
 
 class WakeRequest(BaseModel):
@@ -323,7 +347,7 @@ def initial_result(payload):
                 **{k: payload[k] for k in ('targetRevision', 'requestedAt', 'deadlineAt', 'timeoutSeconds')},
                 elapsedSeconds=0, attemptState='not_started', attemptCount=0, intentAt=None, receiptAt=None,
                 serverState='unknown', serverObservedAt=None, serverEvidenceAt=None,
-                haState='unknown', haStateStale=True,
+                haState='unknown', haStateStale=True, controlMode=configuration()['mode'], haPowerState='unknown',
                 archiveState='checking' if payload['archiveConfiguredAtAdmission'] else 'settings_required',
                 archiveObservedAt=None, archiveConnectionVersion=None, cancelRequested=False,
                 outcome=None, message='OMV 시작 확인 대기 중입니다.', code=None, review=0)
@@ -388,7 +412,7 @@ def isolated_io(request, control):
     import subprocess
     import sys
     from pathlib import Path
-    max_slice = {'ssh': 12.0, 'ssh_banner': 2.5}.get(request['operation'], 5.0)
+    max_slice = {'ssh': 12.0, 'ssh_banner': 2.5, 'get_many': 4.5}.get(request['operation'], 5.0)
     cap = min(request['deadline'], time.time() + max_slice)
     request = dict(request, deadline=cap)
     env = {k: v for k, v in os.environ.items() if not k.startswith('PHOTO_SAVER_HA_')}
@@ -474,7 +498,7 @@ def _run_storage_wake(job, *, stop_event, runner):
         detail_messages = {
             'ha_http_401': 'Home Assistant 토큰 인증에 실패했습니다. .env의 HA 토큰을 확인하세요.',
             'ha_http_403': 'Home Assistant 접근 권한이 없습니다. 토큰 권한을 확인하세요.',
-            'ha_http_404': 'Home Assistant 스크립트 또는 센서를 찾을 수 없습니다. 엔티티 이름을 확인하세요.',
+            'ha_http_404': 'Home Assistant 전원 스위치·스크립트 또는 실행 센서를 찾을 수 없습니다. 엔티티 이름을 확인하세요.',
             'ha_dns_error': 'Home Assistant 주소를 찾을 수 없습니다. Docker에서는 .local 대신 LAN IP를 사용하세요.',
             'ha_tls_error': 'Home Assistant 보안 연결을 확인할 수 없습니다. 인증서를 확인하세요.',
             'ha_timeout': 'Home Assistant 응답 시간이 초과되었습니다. 주소와 네트워크를 확인하세요.',
@@ -561,20 +585,18 @@ def _run_storage_wake(job, *, stop_event, runner):
                     finish('archive_blocked')
                     return
             ha = snap['ha']
-            script = io('get', ha=ha, entity=ha['script'])
-            sensor = io('get', ha=ha, entity=ha['sensor'])
+            script = io('get', ha=ha, entity=ha['control_entity'], statusProjection=True)
+            sensor = io('get', ha=ha, entity=ha['sensor'], statusProjection=True)
             if attempt['state'] == 'not_started' and (
-                script['status'] == 'ha_error' or
-                (sensor['status'] == 'ha_error' and sensor.get('code') != 'ha_http_404')
+                script['status'] == 'ha_error' or script.get('code') == 'ha_redirect_blocked' or
+                ((sensor['status'] == 'ha_error' or sensor.get('code') == 'ha_redirect_blocked') and sensor.get('code') != 'ha_http_404')
             ):
                 finish('ha_error', 'failed', detail_code=script.get('code') or sensor.get('code') or 'ha_error')
                 return
-            evidence = sensor.get('last_reported') or sensor.get('last_updated')
-            try:
-                age = time.time() - datetime.fromisoformat(evidence.replace('Z', '+00:00')).timestamp()
-                fresh = age >= -30 and (not stale_seconds() or age <= stale_seconds())
-            except (AttributeError, ValueError, TypeError):
-                fresh = False
+            evidence = observation_evidence(sensor)
+            age, fresh = observation_freshness(sensor)
+            _, power_fresh = observation_freshness(script)
+            control_fresh = ha['mode'] != 'switch' or power_fresh
             state = 'missing' if sensor.get('code') == 'ha_http_404' else sensor.get('state', 'unreachable')
             if state not in ('on', 'off', 'unknown', 'unavailable', 'missing'):
                 state = 'unreachable'
@@ -585,23 +607,24 @@ def _run_storage_wake(job, *, stop_event, runner):
                 ever_ha_on = True
             previous_ha_state = state
             transition(job_id, dict(haState=state, haStateStale=not fresh, serverEvidenceAt=evidence,
+                                   controlMode=ha['mode'], haPowerState=script.get('state', 'unknown') if ha['mode'] == 'switch' else 'unknown',
                                    serverState='ssh_responding' if mount_wait_started is not None else 'ha_reported_on' if ha_on else 'unknown',
                                    serverObservedAt=now() if ha_on or mount_wait_started is not None else None,
                                    phaseCode='waiting_mount' if mount_wait_started is not None else 'waiting_server',
                                    phase='스토리지 마운트 대기 중' if mount_wait_started is not None else '서버 응답 대기 중',
                                    elapsedSeconds=min(payload['timeoutSeconds'], max(0, int(time.time()-start)))))
             if attempt['state'] == 'not_started':
-                if script.get('state') == 'on' or (ha_on and not ambiguous_on):
+                if script.get('state') == 'on' and control_fresh or (ha_on and not ambiguous_on):
                     attempt = dict(attempt, state='not_needed' if ha_on and not ambiguous_on else 'observing_existing')
                     transition(job_id, {}, attempt=attempt)
                 elif script['status'] == 'ha_error':
                     finish('ha_error', 'failed', detail_code=script.get('code'))
                     return
-                elif script.get('state') == 'off' and not (state == 'on' and (ambiguous_on or not fresh) and time.time()-start < 35):
+                elif script.get('state') == 'off' and control_fresh and not (state == 'on' and (ambiguous_on or not fresh) and time.time()-start < 35):
                     control()
                     attempt = dict(attempt, state='intent', count=1, intentAt=now())
                     transition(job_id, dict(phaseCode='requesting', phase='켜기 요청 중'), attempt=attempt)
-                    response = io('post', ha=ha)
+                    response = io('post', ha=ha, service=ha['service'], entity=ha['control_entity'])
                     attempt = dict(attempt, state=response['status'] if response['status'] in ('accepted', 'rejected') else 'unknown', receiptAt=now())
                     transition(job_id, {}, attempt=attempt)
                     if attempt['state'] == 'rejected':

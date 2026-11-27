@@ -10,7 +10,7 @@ let fixture = fs.readFileSync(path.join(__dirname, 'test_media_preview.cjs'), 'u
 fixture = fixture.replace('      chooseEvent,', `      chooseEvent, actions, confirmStorageShutdown, startStorageShutdown, cancelStorageShutdown,
       reconcileShutdownRequest, storageShutdownButton, shutdownFacts, storageMonitor, shutdownStep,
       saveShutdownPending, loadShutdownPending, deriveStorageViewModel, applyShutdownJob, startStorageWake,
-      storageShutdownStatus, catalogTime,`);
+      storageShutdownStatus, catalogTime, archivePage, shutdownElapsed,`);
 fixture = fixture.replace('return { ...api, doc, win,', 'return { ...api, context, doc, win,');
 const context = { require, __dirname, console, setImmediate, URLSearchParams };
 vm.createContext(context); vm.runInContext(fixture, context);
@@ -35,6 +35,35 @@ function harness() {
 }
 function route(h, page) { h.view.connecting = false; h.win.location.hash = `#${page}`; h.render(); }
 const action = (h, name) => h.page.querySelector(`[data-action="${name}"]`);
+
+test('power transition blocks shutdown and settings loading explains disabled action', () => {
+  const h = harness();
+  for (const page of ['archive', 'settings']) {
+    h.storageMonitor.snapshot = { status: 'booting', reasonCode: 'power_transitioning' }; route(h, page);
+    assert.equal(action(h, 'confirm-storage-shutdown').disabled, true);
+    assert.match(action(h, 'confirm-storage-shutdown').getAttribute('title'), /전원 전환/);
+  }
+  h.view.settings = null; h.render();
+  assert.match(action(h, 'confirm-storage-shutdown').getAttribute('title'), /불러오는 중/);
+});
+
+test('switch confirmation and facts describe smart plug completion and initial archive includes history', () => {
+  const h = harness(); h.view.settings.storageShutdown.mode = 'switch';
+  route(h, 'archive'); h.confirmStorageShutdown();
+  assert.match(h.dialog.textContent, /전원 스위치\(끄기\)/);
+  assert.match(h.dialog.textContent, /전원 차단 확인까지 몇 분/);
+  assert.ok(h.dialog.querySelector('[autofocus]'));
+  const done = job('done', { outcome: 'powered_off', controlMode: 'switch', haPowerState: 'off', haPowerFresh: true, haRunningState: 'off', haRunningFresh: true });
+  const facts = h.shutdownFacts(done);
+  assert.match(facts, /HA 전원 스위치.*꺼짐/); assert.match(facts, /실행 센서.*꺼짐/);
+  h.state.latestStorageShutdown = done;
+  const html = h.archivePage();
+  assert.match(html, /data-storage-history>.*최근 종료 작업/s);
+  h.state.latestStorageShutdown = job();
+  assert.match(h.archivePage(), /id="archive-wake-banner"><section class="wake-stepper is-shutdown"/);
+  const elapsed = h.shutdownElapsed({ createdAt: new Date(Date.now()-400000).toISOString(), result: {} });
+  assert.equal(elapsed, '경과 05:00');
+});
 
 test('shutdown button full status matrix in archive and settings', () => {
   for (const page of ['archive', 'settings']) {

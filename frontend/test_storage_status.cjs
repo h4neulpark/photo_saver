@@ -15,6 +15,24 @@ const { createHarness, flushMicrotasks } = vm.runInContext('({ createHarness, fl
 const response = data => ({ ok: true, json: async () => data });
 const snapshot = (extra = {}) => ({ status: 'running', reasonCode: null, rawState: 'on', sourceRevision: 'source-one',
   cached: false, checkedAt: '2026-11-26T00:00:00Z', reportedAtSource: 'last_reported', lastKnown: null, freshForSeconds: 80, nextPollInSeconds: 15, refreshAvailableInSeconds: 0, fetchedAt: '2026-11-26T00:00:00Z', reportedAt: '2026-11-26T00:00:00Z', ...extra });
+
+test('switch diagnostic schema rejects malformed data and renders distinct switch and running rows', async () => {
+  const h = await harness();
+  const entity = { configured: true, status: 'on', reasonCode: null, reportedAt: snapshot().reportedAt, changedAt: null };
+  const value = snapshot({ status: 'booting', reasonCode: 'power_transitioning', powerSwitch: entity, runningSensor: { ...entity, status: 'off' } });
+  const normalized = h.normalizeStorageStatus({ ...value, powerSwitch: { ...entity, secret: 'discard' } });
+  assert.equal(normalized.powerSwitch.secret, undefined); assert.equal(normalized.runningSensor.status, 'off');
+  for (const key of ['powerSwitch', 'runningSensor']) {
+    for (const bad of [null, [], {}, { ...entity, configured: 'true' }, { ...entity, status: 'unavailable' }, { ...entity, status: 'unconfigured' },
+      { ...entity, reasonCode: '<unsafe>' }, { ...entity, reportedAt: 'bad' }, { ...entity, changedAt: 3 }]) {
+      assert.throws(() => h.normalizeStorageStatus({ ...value, [key]: bad }));
+    }
+  }
+  h.storageMonitor.snapshot = normalized; h.patchStorageStatus();
+  assert.equal(h.storageLabel(), '전원 전환 중');
+  const text = h.page.querySelector('[data-storage-diagnostics]').textContent;
+  assert.match(text, /전원 스위치.*켜짐/); assert.match(text, /실행 센서.*꺼짐/);
+});
 async function harness() {
   const h = createHarness(url => url.startsWith('/api/storage/status') ? Promise.resolve(response(snapshot())) : new Promise(() => {}));
   await h.storageMonitor.promise;

@@ -1689,8 +1689,8 @@ function archivePage() {
           <div class="archive-actions archive-toolbar">
             ${archiveStorageActions()}
           </div>
-        <div id="archive-wake-banner">${storageWakeActivity()}</div>
-        <div id="archive-storage-detail" class="storage-detail" ${storageMonitor.open ? '' : 'hidden'}><div class="storage-detail-head"><strong>OMV 연결 진단</strong><div>${button('refresh-storage-status', '상태 확인')} <a class="button" href="#settings">설정 열기</a></div></div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus()}</div></div>
+        <div id="archive-wake-banner">${storagePowerActivity()}</div>
+        <div id="archive-storage-detail" class="storage-detail" ${storageMonitor.open ? '' : 'hidden'}><div class="storage-detail-head"><strong>OMV 연결 진단</strong><div>${button('refresh-storage-status', '상태 확인')} <a class="button" href="#settings">설정 열기</a></div></div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(false) + storageShutdownStatus(false)}</div></div>
         <div id="archive-destination-content">${archiveDestination()}</div>
       </section>
     </div><section id="archive-preview-slot" class="surface archive-preview" aria-label="NAS 최종 경로 미리보기"></section>`;
@@ -1969,9 +1969,9 @@ function storageShutdownButton() {
     { disabled: job.result?.cancelRequested, extra: `data-value="${job.id}"` });
   const current = storageCurrent();
   const ready = view.archive !== null || current.status === 'running';
-  const reason = !cfg?.available ? cfg?.message || 'Home Assistant 종료 설정이 필요합니다.' : remoteBusy()
+  const reason = !view.settings ? '종료 설정을 불러오는 중입니다.' : !cfg?.available ? cfg?.message || 'Home Assistant 종료 설정이 필요합니다.' : remoteBusy()
     ? '원격 작업이 진행 중일 때는 OMV를 끌 수 없습니다.' : !ready && !view.shutdownPending
-      ? ({ no_response: '이미 응답이 없습니다', booting: '부팅 중에는 종료할 수 없습니다' })[current.status] || '현재 상태를 확인한 뒤 종료할 수 있습니다' : '';
+      ? current.reasonCode === 'power_transitioning' ? '전원 전환이 진행 중일 때는 종료할 수 없습니다' : ({ no_response: '이미 응답이 없습니다', booting: '부팅 중에는 종료할 수 없습니다' })[current.status] || '현재 상태를 확인한 뒤 종료할 수 있습니다' : '';
   return button('confirm-storage-shutdown', view.shutdownStarting ? '요청 중…' : view.shutdownPending ? '같은 요청 다시 확인' : 'OMV 끄기',
     { danger: true, disabled: view.shutdownStarting || !!reason, extra: `title="${escapeHtml(reason)}"` });
 }
@@ -1980,9 +1980,10 @@ function storageSettingsActions() {
 }
 function shutdownFacts(job) {
   const r = job?.result || {};
-  const attempts = { not_started: '보내지 않음', not_needed: '이미 꺼져 있어 생략', observing_existing: '기존 종료 관찰', intent: '처리 여부 확인 중', accepted: 'HA 요청 수신 확인', rejected: 'HA 요청 거부', unknown: '처리 여부 알 수 없음' };
+  const attempts = { not_started: '보내지 않음', not_needed: '이미 꺼져 있어 생략', observing_existing: r.controlMode === 'switch' ? '기존 전원 제어 관찰 중' : '기존 종료 관찰', intent: '처리 여부 확인 중', accepted: 'HA 요청 수신 확인', rejected: 'HA 요청 거부', unknown: '처리 여부 알 수 없음' };
   const ssh = r.sshConfigured === false ? '주소 미설정 · HA만 확인' : ({ reachable: 'SSH 응답 중', unreachable: 'SSH 응답 중단' })[r.sshState] || '미확인';
-  return `<dl class="wake-facts"><div><dt>종료 요청</dt><dd>${escapeHtml(attempts[r.attemptState] || '미확인')}</dd></div><div><dt>HA 전원 센서</dt><dd>${escapeHtml(({ on: '켜짐', off: '꺼짐' })[r.haState] || '미확인')}${r.haFresh ? '' : ' · 보고 미확인'}</dd></div><div><dt>SSH 응답</dt><dd>${escapeHtml(ssh)}</dd></div><div><dt>소요 시간</dt><dd>${Math.max(0, Number(r.elapsedSeconds) || 0)}초</dd></div></dl>`;
+  const power = r.controlMode === 'switch' ? `<div><dt>HA 전원 스위치</dt><dd>${escapeHtml(storageEntityLabel(r.haPowerState))}${r.haPowerFresh ? '' : ' · 보고 미확인'}</dd></div><div><dt>실행 센서</dt><dd>${escapeHtml(storageEntityLabel(r.haRunningState))}${r.haRunningFresh ? '' : ' · 보고 미확인'}</dd></div>` : `<div><dt>HA 전원 센서</dt><dd>${escapeHtml(storageEntityLabel(r.haState))}${r.haFresh ? '' : ' · 보고 미확인'}</dd></div>`;
+  return `<dl class="wake-facts"><div><dt>종료 요청</dt><dd>${escapeHtml(attempts[r.attemptState] || '미확인')}</dd></div>${power}<div><dt>SSH 응답</dt><dd>${escapeHtml(ssh)}</dd></div><div><dt>소요 시간</dt><dd>${Math.max(0, Number(r.elapsedSeconds) || 0)}초</dd></div></dl>`;
 }
 function shutdownStep(r) {
   if (r.outcome === 'powered_off' || r.outcome === 'already_off') return 3;
@@ -1991,7 +1992,7 @@ function shutdownStep(r) {
 }
 function shutdownElapsed(job) {
   const r = job?.result || {};
-  const elapsed = Math.max(0, Math.min(r.timeoutSeconds || 180, Math.floor((Date.now()-Date.parse(r.requestedAt || job?.createdAt))/1000) || 0));
+  const elapsed = Math.max(0, Math.min(r.timeoutSeconds || 300, Math.floor((Date.now()-Date.parse(r.requestedAt || job?.createdAt))/1000) || 0));
   return `경과 ${String(Math.floor(elapsed/60)).padStart(2, '0')}:${String(elapsed%60).padStart(2, '0')}`;
 }
 function storageShutdownActivity() {
@@ -2027,7 +2028,8 @@ function storageShutdownStatus(inSettings = false) {
 }
 function confirmStorageShutdown() {
   if (view.shutdownStarting || remoteBusy() || !view.settings?.storageShutdown?.available) return;
-  showDialog('OMV 서버를 끄시겠습니까?', `<p>Home Assistant 종료 스크립트를 실행해 OMV 서버 전원을 끕니다. 실행 후에는 되돌릴 수 없습니다.</p>
+  const explanation = view.settings.storageShutdown.mode === 'switch' ? 'Home Assistant 전원 스위치(끄기)를 실행해 OMV 서버 전원을 끕니다. 실행 후에는 되돌릴 수 없으며, 전원 차단 확인까지 몇 분 걸릴 수 있습니다.' : 'Home Assistant 종료 스크립트를 실행해 OMV 서버 전원을 끕니다. 실행 후에는 되돌릴 수 없습니다.';
+  showDialog('OMV 서버를 끄시겠습니까?', `<p>${explanation}</p>
     <p>현재 열려 있는 아카이브 연결이 끊기며, 진행 중인 파일 다운로드가 있으면 중단될 수 있습니다.</p>
     ${view.archiveBusy ? '<p class="form-error">현재 아카이브 목록을 불러오는 중입니다. 잠시 후 종료하는 것을 권장합니다.</p>' : ''}
     <p>종료가 시작된 뒤 '대기 중지'를 눌러도 이미 전달된 종료 요청은 취소되지 않으며 상태 확인만 중단됩니다.</p>`, 'OMV 끄기', startStorageShutdown, { danger: true });
@@ -2085,8 +2087,12 @@ function storageWakeButton() {
   const job = storageWakeJob();
   if (isJobActive(job)) return button('cancel-storage-wake', job.result?.cancelRequested ? '중지 중…' : '대기 중지',
     { disabled: job.result?.cancelRequested, extra: `data-value="${job.id}"` });
+  const cfg = view.settings?.storageWake;
+  const isConfirmedOn = view.archive !== null || storageCurrent().status === 'running';
+  const reason = !view.settings ? '켜기 설정을 불러오는 중입니다.' : !cfg?.available ? cfg?.message || 'Home Assistant 켜기 설정이 필요합니다.' : remoteBusy()
+    ? '원격 작업이 진행 중일 때는 OMV를 켤 수 없습니다.' : isConfirmedOn && !view.wakePending ? 'OMV가 이미 작동 중입니다.' : '';
   return button('start-storage-wake', view.wakeStarting ? '요청 중…' : view.wakePending ? '같은 요청 다시 확인' : 'OMV 켜기',
-    { primary: storageCurrent().status === 'no_response', disabled: view.wakeStarting || remoteBusy() || !view.settings?.storageWake?.available });
+    { primary: storageCurrent().status === 'no_response', disabled: view.wakeStarting || !!reason, extra: `title="${escapeHtml(reason)}"` });
 }
 function archiveStorageActions() {
   return `${isJobActive(storageWakeJob()) ? '' : storageWakeButton()}
@@ -2097,13 +2103,14 @@ function archiveStorageActions() {
 }
 function wakeFacts(job) {
   const r = job?.result || {};
-  const attempt = { not_started: '보내지 않음', not_needed: '응답 확인으로 생략', observing_existing: '기존 스크립트 실행 관찰 중',
+  const attempt = { not_started: '보내지 않음', not_needed: '응답 확인으로 생략', observing_existing: r.controlMode === 'switch' ? '기존 전원 제어 관찰 중' : '기존 스크립트 실행 관찰 중',
     intent: '처리 여부 확인 중', accepted: 'HA 요청 수신 확인', rejected: 'HA 요청 거부', unknown: '처리 여부 알 수 없음' };
   const server = { unknown: '현재 응답 미확인', ha_reported_on: 'HA에서 응답 보고', ssh_responding: 'SSH 서버 응답', archive_ready: '아카이브 접근 확인' };
   const archive = { settings_required: 'SSH 설정 필요', checking: '접근 확인 중', ready: '인증 및 폴더 읽기 확인', unreachable: '접근 미확인',
     auth_failed: 'SSH 인증 실패 · 계정과 공개키 확인', host_key_error: '호스트 키 확인 필요 · 설정에서 접속 테스트',
     path_missing: '저장 폴더 없음 · 경로 확인', permission_denied: '폴더 읽기 권한 필요', not_directory: '저장 경로가 폴더가 아님', sftp_error: 'SFTP 지원 확인 필요' };
-  return `<dl class="wake-facts"><div><dt>켜기 요청</dt><dd>${escapeHtml(attempt[r.attemptState] || '미확인')}</dd></div><div><dt>서버 응답</dt><dd>${escapeHtml(server[r.serverState] || '미확인')}${r.haStateStale && r.haState === 'on' ? ' · HA 보고 갱신 대기' : ''}</dd></div><div><dt>아카이브 접근</dt><dd>${escapeHtml(archive[r.archiveState] || '미확인')}</dd></div></dl>`;
+  const power = r.controlMode === 'switch' ? `<div><dt>HA 전원 스위치</dt><dd>${escapeHtml(storageEntityLabel(r.haPowerState))}</dd></div><div><dt>실행 센서</dt><dd>${escapeHtml(storageEntityLabel(r.haState))}${r.haStateStale ? ' · 보고 미확인' : ''}</dd></div>` : '';
+  return `<dl class="wake-facts"><div><dt>켜기 요청</dt><dd>${escapeHtml(attempt[r.attemptState] || '미확인')}</dd></div>${power}<div><dt>서버 응답</dt><dd>${escapeHtml(server[r.serverState] || '미확인')}${r.haStateStale && r.haState === 'on' ? ' · HA 보고 갱신 대기' : ''}</dd></div><div><dt>아카이브 접근</dt><dd>${escapeHtml(archive[r.archiveState] || '미확인')}</dd></div></dl>`;
 }
 function wakeElapsed(job) {
   const r = job.result || {};
@@ -2115,6 +2122,9 @@ const storageMonitor = { snapshot: { status: 'loading' }, promise: null, sequenc
   pendingManualRefresh: false, pendingForce: false, refreshing: false, hiddenAt: null };
 const storageNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
 const storageReasons = {
+  power_transitioning: '전원 제어가 진행 중입니다. 실행 센서와 SSH 응답을 기다리고 있습니다.',
+  switch_unknown: 'HA가 전원 스위치 상태를 확인하지 못했습니다.', switch_unavailable: 'HA 전원 스위치를 사용할 수 없습니다.',
+  switch_missing: 'HA에서 전원 스위치를 찾을 수 없습니다. 전원 스위치 설정을 확인하세요.',
   sensor_unknown: 'HA가 센서 상태를 확인하지 못했습니다.', sensor_unavailable: 'HA가 센서 상태를 확인하지 못했습니다.',
   sensor_missing: 'HA에서 OMV 상태 센서를 찾을 수 없습니다.', ha_auth_error: 'Home Assistant 인증 설정을 확인하세요.',
   ha_tls_error: 'Home Assistant 보안 연결을 확인할 수 없습니다.', ha_unreachable: 'Home Assistant에 연결할 수 없습니다. 잠시 후 다시 확인하세요.',
@@ -2133,8 +2143,12 @@ function storageCurrent() {
     ? { ...value, status: 'stale', reasonCode: 'report_stale', freshForSeconds: 0 } : value;
 }
 function storageLabel(value = storageCurrent()) {
+  if (value.status === 'booting' && value.reasonCode === 'power_transitioning') return '전원 전환 중';
   return ({ loading: '확인 중…', booting: '부팅 중 · SSH 대기', running: value.ssh?.status === 'reachable' ? '작동 중 · 연결 가능' : '작동 중', no_response: '꺼짐 · 응답 없음',
     unknown: '상태 확인 불가', stale: '보고 지연', unconfigured: 'HA 미설정' })[value.status];
+}
+function storageEntityLabel(status) {
+  return ({ on: '켜짐', off: '꺼짐', stale: '보고 지연', error: '조회 오류', unknown: '상태 미확인', unavailable: '사용 불가', unconfigured: '미설정' })[status] || '미확인';
 }
 function deriveStorageViewModel() {
   const snapshot = storageCurrent(), job = storageWakeJob();
@@ -2163,6 +2177,16 @@ function storageWakeActivity() {
     ${job ? `<div class="wake-stepper-foot"><div><strong data-wake-phase>${escapeHtml(active ? r.phase || '서버 응답 대기 중' : jobMessage(job))}</strong><p class="small muted" data-wake-elapsed>${active ? wakeElapsed(job) : escapeHtml(catalogTime(job.createdAt))}</p></div>${active ? storageWakeButton() : ''}</div>` : ''}
     ${view.wakePending && (!job || view.wakeUncertain) ? '<p class="small muted">요청 결과 확인 중 · 자동 재전송 없음</p>' : ''}
     ${view.wakeError ? `<p class="form-error" role="alert">${escapeHtml(view.wakeError)}</p>` : ''}</section>`;
+}
+function storagePowerActivity() {
+  const shutdown = storageShutdownJob(), wake = storageWakeJob();
+  if (isJobActive(shutdown)) return storageShutdownActivity();
+  if (!isJobActive(wake)) {
+    if (view.shutdownError || view.shutdownPending) return storageShutdownActivity();
+    if (shutdown && shutdown.id > (wake?.id || 0) && !view.wakeError && !view.wakePending)
+      return jobHasAttention(shutdown) ? storageShutdownActivity() : '';
+  }
+  return storageWakeActivity();
 }
 function patchStoragePowerActivity() {
   const node = page.querySelector('#archive-wake-banner');
@@ -2233,7 +2257,7 @@ function patchStorageStatus() {
     ? `<p class="small muted">마지막 확인: ${escapeHtml(storageTime(value.lastKnown.reportedAt))} ${value.lastKnown.rawState === 'on' ? '작동 중' : '응답 없음'} · 현재 상태 미확인</p>` : '';
   document.querySelectorAll('[data-storage-diagnostics]').forEach(node => {
     const ha = value.ha, ssh = value.ssh;
-    const html = `<div class="storage-diagnostic-grid"><section class="storage-diagnostic"><h3>전원·호스트 <span class="small muted">(Home Assistant)</span></h3><p>${escapeHtml(({on:'작동 보고',off:'응답 없음 보고',stale:'보고 지연',error:'조회 오류',unknown:'상태 미확인',unconfigured:'미설정'})[ha?.status] || storageLabel(value))}</p><dl class="storage-times"><div><dt>최근 조회</dt><dd>${escapeHtml(storageTime(value.fetchedAt))}${value.cached ? ' · 캐시' : ''}</dd></div><div><dt>HA 보고</dt><dd>${escapeHtml(storageTime(value.reportedAt))}</dd></div><div><dt>상태 변경</dt><dd>${escapeHtml(storageTime(value.changedAt))}</dd></div></dl><p class="small muted">${escapeHtml(storageReasons[ha?.reasonCode || value.reasonCode] || (value.reasonCode ? '상태 진단을 확인하세요. 잠시 후 다시 조회할 수 있습니다.' : 'HA 센서의 응답입니다.'))}</p>${history}</section>
+    const html = `<div class="storage-diagnostic-grid"><section class="storage-diagnostic"><h3>전원·호스트 <span class="small muted">(Home Assistant)</span></h3><p>${escapeHtml(({on:'작동 보고',off:'응답 없음 보고',stale:'보고 지연',error:'조회 오류',unknown:'상태 미확인',unconfigured:'미설정'})[ha?.status] || storageLabel(value))}</p><dl class="storage-times">${value.powerSwitch?.configured ? `<div><dt>전원 스위치</dt><dd>${escapeHtml(storageEntityLabel(value.powerSwitch.status))}</dd></div><div><dt>실행 센서</dt><dd>${escapeHtml(storageEntityLabel(value.runningSensor?.status))}</dd></div>` : ''}<div><dt>최근 조회</dt><dd>${escapeHtml(storageTime(value.fetchedAt))}${value.cached ? ' · 캐시' : ''}</dd></div><div><dt>HA 보고</dt><dd>${escapeHtml(storageTime(value.reportedAt))}</dd></div><div><dt>상태 변경</dt><dd>${escapeHtml(storageTime(value.changedAt))}</dd></div></dl><p class="small muted">${escapeHtml(storageReasons[ha?.reasonCode || value.reasonCode] || (value.reasonCode ? '상태 진단을 확인하세요. 잠시 후 다시 조회할 수 있습니다.' : 'HA 센서의 응답입니다.'))}</p>${history}</section>
       <section class="storage-diagnostic"><h3>아카이브 서버 <span class="small muted">(SSH / SFTP)</span></h3><p>${view.archive ? '인증 및 폴더 읽기 확인' : view.archiveBusy ? '아카이브 확인 중' : ssh?.status === 'reachable' ? `SSH 응답 확인${Number.isFinite(ssh.latencyMs) ? ` · ${ssh.latencyMs}ms` : ''}` : ssh?.configured ? 'SSH 응답 없음' : 'SSH 주소 미설정'}</p><p class="small muted">${escapeHtml(view.archiveError || '상태 조회는 인증 없이 SSH 배너만 확인합니다. 아카이브 연결에서 인증과 폴더 접근을 확인합니다.')}</p></section></div>`;
     if (node.innerHTML !== html) node.innerHTML = html;
   });
@@ -2287,6 +2311,7 @@ function normalizeStorageStatus(value) {
   const safeReason = reason => reason === null || typeof reason === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(reason);
   if (!['running', 'booting', 'no_response', 'stale', 'unknown', 'unconfigured'].includes(status) || !safeReason(reasonCode)) return fail();
   let ha, ssh;
+  const entities = {};
   const changedAt = value.changedAt ?? null;
   if (changedAt !== null && !timestamp(changedAt)) return fail();
   if (value.ha !== undefined) {
@@ -2301,12 +2326,21 @@ function normalizeStorageStatus(value) {
         !(s.latencyMs === null || Number.isFinite(s.latencyMs) && s.latencyMs >= 0)) return fail();
     ssh = { configured: s.configured, status: s.status, latencyMs: s.latencyMs };
   }
+  for (const key of ['powerSwitch', 'runningSensor']) {
+    if (value[key] === undefined) continue;
+    const h = value[key];
+    if (!h || typeof h !== 'object' || Array.isArray(h) || typeof h.configured !== 'boolean' ||
+        !['on', 'off', 'stale', 'unknown', 'error', 'unconfigured'].includes(h.status) ||
+        (h.status === 'unconfigured') !== !h.configured || !safeReason(h.reasonCode) ||
+        !(h.reportedAt === null || timestamp(h.reportedAt)) || !(h.changedAt === null || timestamp(h.changedAt))) return fail();
+    entities[key] = { configured: h.configured, status: h.status, reasonCode: h.reasonCode, reportedAt: h.reportedAt, changedAt: h.changedAt };
+  }
   let history = null;
   if (lastKnown !== null) {
     if (!lastKnown || !['on', 'off'].includes(lastKnown.rawState) || !timestamp(lastKnown.reportedAt) || !timestamp(lastKnown.fetchedAt)) return fail();
     history = { rawState: lastKnown.rawState, reportedAt: lastKnown.reportedAt, fetchedAt: lastKnown.fetchedAt };
   }
-  return { status, reasonCode, rawState, reportedAt, fetchedAt, checkedAt, reportedAtSource, cached, sourceRevision, freshForSeconds, nextPollInSeconds, refreshAvailableInSeconds, lastKnown: history, changedAt, ha, ssh };
+  return { status, reasonCode, rawState, reportedAt, fetchedAt, checkedAt, reportedAtSource, cached, sourceRevision, freshForSeconds, nextPollInSeconds, refreshAvailableInSeconds, lastKnown: history, changedAt, ha, ssh, ...entities };
 }
 function revealStorageStatus() {
   if (view.page !== 'archive' || !storageMonitor.reveal) return;
@@ -3206,8 +3240,8 @@ function settingsPage() {
     <section class="surface settings-section" aria-label="스토리지 연결">
       <div class="surface-head"><h2>${icon('disk')} 스토리지 연결</h2></div>
       <div class="storage-settings-card"><div class="storage-detail-head"><strong>OMV <span class="storage-pill" data-storage-label></span></strong><div>${button('refresh-storage-status', '상태 확인')} <span data-storage-settings-actions>${storageSettingsActions()}</span></div></div>
-        <p class="small muted">Home Assistant로 서버를 켜고 SSH / SFTP로 아카이브 연결을 확인합니다. 파일 업로드는 연결 후 시작하세요.</p>
-        <div id="archive-wake-banner">${storageWakeActivity()}</div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(true) + storageShutdownStatus(true)}</div></div>
+        <p class="small muted">${settings?.storageWake?.mode === 'switch' ? 'Home Assistant 전원 스위치로 OMV를 켜고 끕니다. 실행 센서와 SSH / SFTP로 연결을 확인하며, 종료 시 전원 차단까지 몇 분 걸릴 수 있습니다.' : 'Home Assistant 스크립트로 서버를 켜고 끕니다. SSH / SFTP로 아카이브 연결을 확인합니다.'} 파일 업로드는 연결 후 시작하세요.</p>
+        <div id="archive-wake-banner">${storagePowerActivity()}</div><div data-storage-diagnostics></div><div data-storage-history>${storageWakeStatus(true) + storageShutdownStatus(true)}</div></div>
       ${settingRow('스토리지 IP 주소', '연결할 스토리지의 IPv4 또는 IPv6 주소',
         visibleSetting(settings?.address) +
         button('edit-storage-address', settings?.addressConfigured ? 'IP 변경' : 'IP 등록', { disabled: !settings || view.sshTestBusy }))}

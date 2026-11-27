@@ -350,7 +350,7 @@ def queue_job(connection, kind, payload):
 def _job_conflict(lane, conflict_lane):
     messages = {
         LANE_LOCAL: "로컬 파일 작업(검사·이동·중복 정리·보조 파일 정리·삭제·XMP 연결)이 진행 중입니다.",
-        LANE_REMOTE: "원격 아카이브 작업(업로드·로컬 비우기·원격 인덱싱·OMV 시작 확인)이 진행 중입니다.",
+        LANE_REMOTE: "원격 아카이브 작업(업로드·로컬 비우기·원격 인덱싱·OMV 시작·종료 확인)이 진행 중입니다.",
         LANE_EXCLUSIVE: "데이터 초기화 중입니다. 완료 후 다시 시도하세요.",
     }
     message = "진행 중인 파일 작업이 끝난 뒤 다시 시도하세요." if lane == LANE_EXCLUSIVE else messages[conflict_lane]

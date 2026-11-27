@@ -69,9 +69,9 @@ class ShutdownTests(unittest.TestCase):
                 return post or dict(status='accepted')
             if request['operation'] == 'ssh_banner':
                 return dict(status=probe[0])
-            if request['entity'].startswith('script.'):
+            if request['entity'].startswith(('script.', 'switch.')):
                 script = probe[2] if len(probe)>2 else 'off'
-                return script if isinstance(script, dict) else dict(status='ok', state=script)
+                return script if isinstance(script, dict) else dict(status='ok', state=script, last_reported=datetime.fromtimestamp(clock.value, timezone.utc).isoformat())
             cycles[0] += 1
             if isinstance(probe[1], dict):
                 return probe[1]
@@ -88,7 +88,7 @@ class ShutdownTests(unittest.TestCase):
                  ({'PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY': 'switch.omv'}, 'ha_config_invalid'),
                  ({'PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS': 'x'}, 'ha_config_invalid'),
                  ({'PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS': '29'}, 'ha_config_invalid'),
-                 ({'PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS': '601'}, 'ha_config_invalid')]
+                 ({'PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS': '1201'}, 'ha_config_invalid')]
         for env, reason in cases:
             with self.subTest(env=env), patch.dict(os.environ, env):
                 self.assertEqual(shutdown.configuration()['reason'], reason)
@@ -410,6 +410,86 @@ class ShutdownTests(unittest.TestCase):
         shutdown.transition(job['id'], {}, attempt=dict(original, state='intent', count=1, intentAt=catalog.now()))
         with self.assertRaises(wake.Interrupted):
             shutdown.transition(job['id'], {}, attempt=original)
+
+
+    def test_switch_configuration_timeout_boundaries_and_fail_closed(self):
+        with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power',
+                                    'PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY': '', 'PHOTO_SAVER_HA_SCRIPT_ENTITY': 'bad'}):
+            for timeout in ('', '29', '30', '300', '1200', '1201'):
+                with patch.dict(os.environ, {'PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS': timeout}):
+                    cfg = shutdown.public_configuration()
+                    self.assertEqual(cfg['available'], timeout not in ('29', '1201'))
+                    self.assertEqual(cfg['mode'], 'switch')
+                    if cfg['available']:
+                        self.assertEqual(cfg['timeoutSeconds'], int(timeout or '300'))
+                        job = self.submit()
+                        with catalog.database() as db:
+                            p = json.loads(db.execute('SELECT payload FROM jobs WHERE id=?', (job['id'],)).fetchone()[0])
+                        self.assertTrue(shutdown.valid_payload(p))
+                        shutdown.cancel(job['id'])
+            cfg = shutdown.configuration()
+            self.assertEqual((cfg['control_entity'], cfg['service']), ('switch.omv_power', 'switch/turn_off'))
+            revision = shutdown.snapshot()['configRevision']
+            with patch.dict(os.environ, {'PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY': 'bad-ignored-script'}):
+                self.assertEqual(revision, shutdown.snapshot()['configRevision'])
+        for entity in ('script.omv_power', 'switch.BAD!'):
+            with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': entity}):
+                self.assertEqual(shutdown.configuration()['reason'], 'ha_config_invalid')
+
+    def test_switch_waits_for_smart_plug_after_ssh_stops(self):
+        with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power'}):
+            job = self.job()
+            seen = []
+            def inspect(request, control):
+                if request['operation'] == 'post':
+                    self.assertEqual((request['entity'], request['service']), ('switch.omv_power', 'switch/turn_off'))
+                with catalog.database() as db:
+                    row = db.execute('SELECT status,result FROM jobs WHERE id=?', (job['id'],)).fetchone()
+                    seen.append((row['status'], json.loads(row['result'])))
+            final, calls, phases = self.run_job(job, [('reachable', 'on', 'on'), ('unreachable', 'off', 'on'),
+                                                        ('unreachable', 'off', 'on'), ('unreachable', 'off', 'off')], hook=inspect)
+        self.assertEqual(calls.count('post'), 1)
+        self.assertIn('waiting_power_off', phases)
+        self.assertTrue(any(status == 'running' and r.get('phaseCode') == 'waiting_power_off' and r.get('haPowerState') == 'on' and r.get('haRunningState') == 'off' for status, r in seen))
+        self.assertEqual((final['status'], final['result']['outcome'], final['result']['review']), ('done', 'powered_off', 0))
+        self.assertTrue(final['result']['haPowerFresh'])
+        self.assertEqual(final['result']['controlMode'], 'switch')
+
+    def test_switch_preflight_already_off_safety_and_missing_sensor(self):
+        cases = [([('unreachable', 'off', 'off')], True, 'already_off', 0),
+                 ([('unreachable', 'off', 'on')], True, 'server_not_ready', 0),
+                 ([('unconfigured', 'off', 'on')], False, 'server_not_ready', 0),
+                 ([('reachable', 'on', 'unknown')], True, 'response_unconfirmed', 0),
+                 ([('reachable', 'on', 'unavailable')], True, 'response_unconfirmed', 0),
+                 ([('reachable', 'on', dict(status='ok', state='on', last_reported='bad'))], True, 'response_unconfirmed', 0),
+                 ([('unconfigured', dict(status='ha_error', code='ha_http_404'), 'on'), ('unconfigured', 'off', 'off')], False, 'powered_off', 1)]
+        for probes, ssh, outcome, posts in cases:
+            with self.subTest(outcome=outcome, probes=probes), patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power'}):
+                settings.ADDRESS_FILE.unlink(missing_ok=True)
+                final, calls, _ = self.run_job(self.job(ssh), probes)
+                self.assertEqual(final['result']['outcome'], outcome)
+                self.assertEqual(calls.count('post'), posts)
+
+    def test_switch_post_attempt_unavailable_does_not_mean_off(self):
+        with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power'}):
+            final, calls, phases = self.run_job(self.job(), [('reachable', 'on', 'on'), ('unreachable', 'off', 'unavailable')])
+        self.assertEqual(calls.count('post'), 1)
+        self.assertIn('waiting_power_off', phases)
+        self.assertEqual(final['result']['outcome'], 'ssh_stopped_ha_unconfirmed')
+        self.assertEqual(final['result']['review'], 1)
+        self.assertFalse(final['result']['haPowerState'] == 'off')
+
+    def test_switch_permanent_preflight_errors_never_post(self):
+        for position in (1, 2):
+            for code in ('ha_http_401', 'ha_dns_error', 'ha_tls_error', 'ha_redirect_blocked', 'ha_http_404'):
+                if position == 1 and code == 'ha_http_404': continue
+                probes = ['reachable', 'on', 'on']
+                probes[position] = dict(status='ha_error', code=code)
+                with self.subTest(position=position, code=code), patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power'}):
+                    final, calls, _ = self.run_job(self.job(), [tuple(probes)])
+                    self.assertEqual(final['result']['outcome'], 'ha_request_failed')
+                    self.assertEqual(calls.count('post'), 0)
+                    self.assertNotIn('sentinel-secret', json.dumps(final))
 
 
 if __name__ == '__main__':

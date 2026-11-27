@@ -41,19 +41,19 @@ class StatusService:
         self.completed = 0
 
     def identity(self, config):
-        return tuple(config[k] for k in ('url', 'token', 'sensor', 'reason')) + (self.ssh_address(), stale_seconds())
+        return tuple(config.get(k) for k in ('url', 'token', 'sensor', 'reason', 'power_switch')) + (self.ssh_address(), stale_seconds())
 
     def source(self, config):
         key = self.identity(config)
         if key != self.key:
             self.key, self.revision = key, uuid4().hex
             self.address, self.stale_seconds = key[-2:]
+            self.power_switch = config.get('power_switch')
             self.record = self.last_known = self.task = None
             self.started = float('-inf')
         return key
 
-    def project(self, record, cached=False):
-        observation, fetched = record if record else ({}, None)
+    def classify(self, observation, prefix='sensor'):
         now = datetime.fromtimestamp(self.wall(), timezone.utc)
         raw = observation.get('state') if observation.get('state') in ('on', 'off', 'unknown', 'unavailable') else None
         source = 'last_reported' if observation.get('last_reported_present', 'last_reported' in observation) else 'last_updated'
@@ -65,7 +65,7 @@ class StatusService:
         if reason:
             ha_status = 'unconfigured' if reason == 'ha_not_configured' else 'error'
         elif raw in ('unknown', 'unavailable'):
-            reason = 'sensor_' + raw
+            reason = prefix + '_' + raw
         elif raw in ('on', 'off'):
             age = (now - reported).total_seconds() if reported else None
             if age is None:
@@ -79,10 +79,34 @@ class StatusService:
                 fresh = max(0, min(limit, limit - age)) if limit else None
         else:
             ha_status, reason = 'error', 'ha_response_invalid'
+        changed = stamp(observation.get('last_changed'))
+        return dict(configured=ha_status != 'unconfigured', status=ha_status, reasonCode=reason,
+                    reportedAt=reported.isoformat() if reported else None,
+                    changedAt=changed.isoformat() if changed else None), raw, source, fresh
+
+    def project(self, record, cached=False):
+        observation, fetched = record if record else ({}, None)
+        now = datetime.fromtimestamp(self.wall(), timezone.utc)
+        switch_mode = bool(getattr(self, 'power_switch', None))
+        control = observation.get('powerSwitch', observation) if switch_mode else observation
+        ha, raw, source, fresh = self.classify(control, 'switch' if switch_mode else 'sensor')
+        ha_status, reason = ha['status'], ha['reasonCode']
+        diagnostics = {}
+        transitioning = False
+        if switch_mode:
+            running, _, _, _ = self.classify(observation.get('runningSensor', observation))
+            diagnostics = dict(powerSwitch=dict(ha), runningSensor=running)
+            transitioning = ha_status == 'on' and running['status'] in ('off', 'unknown', 'stale')
+            if transitioning:
+                ha = dict(ha, reasonCode='power_transitioning')
+                reason = 'power_transitioning'
         ssh = observation.get('ssh') or dict(configured=False, status='unconfigured', latencyMs=None)
         reachable = ssh['status'] == 'reachable'
         if ha_status == 'on':
-            status, top_reason = ('booting', 'ssh_unreachable') if ssh['status'] == 'unreachable' else ('running', None)
+            if transitioning:
+                status, top_reason = ('running', 'ha_lagging') if reachable else ('booting', 'power_transitioning')
+            else:
+                status, top_reason = ('booting', 'ssh_unreachable') if ssh['status'] == 'unreachable' else ('running', None)
         elif ha_status == 'off':
             status, top_reason = ('running', 'ha_lagging') if reachable else ('no_response', None)
         elif ha_status == 'unconfigured':
@@ -92,16 +116,11 @@ class StatusService:
             status, top_reason = ('running', None) if reachable else ('stale', reason)
         else:
             status, top_reason = ('running' if reachable else 'unknown', reason)
-        changed = stamp(observation.get('last_changed'))
-        changed = changed.isoformat() if changed else None
-        reported_at = reported.isoformat() if reported else None
         return dict(status=status, reasonCode=top_reason, rawState=raw, fetchedAt=fetched,
-                    checkedAt=now.isoformat(), reportedAt=reported.isoformat() if reported else None,
-                    reportedAtSource=source if reported else None, cached=cached,
+                    checkedAt=now.isoformat(), reportedAt=ha['reportedAt'],
+                    reportedAtSource=source if ha['reportedAt'] else None, cached=cached,
                     sourceRevision=self.revision, freshForSeconds=fresh,
-                    changedAt=changed,
-                    ha=dict(configured=ha_status != 'unconfigured', status=ha_status, reasonCode=reason,
-                            reportedAt=reported_at, changedAt=changed), ssh=ssh,
+                    changedAt=ha['changedAt'], ha=ha, ssh=ssh, **diagnostics,
                     nextPollInSeconds=1 if reason == 'config_changed' else {
                         'booting': 5, 'running': 15, 'no_response': 15, 'unknown': 30,
                         'stale': 30, 'unconfigured': 60}[status],
@@ -113,8 +132,24 @@ class StatusService:
         def control():
             if self.monotonic() >= deadline:
                 raise Interrupted('ha_timeout')
-        return self.runner(dict(operation='get', ha=config, entity=config['sensor'],
+        target = dict(operation='get_many', entities=[config['power_switch'], config['sensor']]) if config.get('power_switch') else dict(operation='get', entity=config['sensor'])
+        return self.runner(dict(ha=config, **target,
                                 statusProjection=True, deadline=self.wall() + 4.5), control)
+
+    def normalize(self, result, prefix='sensor'):
+        if result.get('status') == 'ok':
+            return result
+        code = result.get('code')
+        reason = {'ha_http_401': 'ha_auth_error', 'ha_http_403': 'ha_auth_error',
+                  'ha_http_404': prefix + '_missing'}.get(code)
+        if code in ('ha_tls_error', 'ha_dns_error', 'ha_timeout', 'ha_unreachable', 'ha_redirect_blocked', 'ha_http_5xx'):
+            reason = code
+        elif isinstance(code, str) and code.startswith('ha_http_5'):
+            reason = 'ha_http_5xx'
+        elif code in ('ha_http_301', 'ha_http_302', 'ha_http_303', 'ha_http_307', 'ha_http_308'):
+            reason = 'ha_redirect_blocked'
+        return {'reason': reason or ('ha_timeout' if result.get('status') == 'expired' else
+                'ha_unreachable' if not code and result.get('status') == 'unreachable' else 'ha_response_invalid')}
 
     def probe(self, address):
         deadline = self.monotonic() + 2.5
@@ -138,19 +173,11 @@ class StatusService:
                     return {'reason': 'ha_timeout' if exc.reason == 'ha_timeout' else 'ha_unreachable'}
                 except Exception:
                     return {'reason': 'ha_unreachable'}
-                if result.get('status') != 'ok':
-                    code = result.get('code')
-                    reason = {'ha_http_401': 'ha_auth_error', 'ha_http_403': 'ha_auth_error',
-                              'ha_http_404': 'sensor_missing'}.get(code)
-                    if code in ('ha_tls_error', 'ha_dns_error', 'ha_timeout', 'ha_unreachable', 'ha_redirect_blocked', 'ha_http_5xx'):
-                        reason = code
-                    elif isinstance(code, str) and code.startswith('ha_http_5'):
-                        reason = 'ha_http_5xx'
-                    elif code in ('ha_http_301', 'ha_http_302', 'ha_http_303', 'ha_http_307', 'ha_http_308'):
-                        reason = 'ha_redirect_blocked'
-                    result = {'reason': reason or ('ha_timeout' if result.get('status') == 'expired' else
-                              'ha_unreachable' if not code and result.get('status') == 'unreachable' else 'ha_response_invalid')}
-                return result
+                if config.get('power_switch'):
+                    entities = result.get('entities', {})
+                    return dict(powerSwitch=self.normalize(entities.get(config['power_switch'], result), 'switch'),
+                                runningSensor=self.normalize(entities.get(config['sensor'], result)))
+                return self.normalize(result)
             async def ssh_read():
                 if not key[-2]:
                     return dict(configured=False, status='unconfigured', latencyMs=None)

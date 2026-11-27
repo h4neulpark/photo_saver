@@ -37,6 +37,7 @@ class WakeApiTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         p = patch.dict(os.environ, {'PHOTO_SAVER_HA_URL': 'http://ha.local:8123',
+                                   'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': '',
                                    'PHOTO_SAVER_HA_TOKEN': 'sentinel-secret'})
         p.start()
         self.addCleanup(p.stop)
@@ -412,7 +413,7 @@ class WakeApiTests(unittest.TestCase):
                                    'last_reported': 'sentinel-secret', 'last_updated': '2026-11-26T00:00:00'}).encode())
         with patch('urllib.request.build_opener', return_value=opener):
             result = helper.operation(dict(operation='get', entity=ha['sensor'], deadline=time.time()+2, ha=ha))
-        self.assertEqual(result, {'status': 'ok', 'state': 'unknown'})
+        self.assertEqual(result, {'status': 'unreachable'})
 
     def test_ha_helper_redirects_tls_and_large_response_are_safe(self):
         import storage_wake_io as helper
@@ -924,6 +925,101 @@ class WakeApiTests(unittest.TestCase):
             ssh.return_value.__enter__.return_value.open_sftp.side_effect = archive.paramiko.SFTPError('Incompatible sftp protocol')
             result = helper.operation(dict(operation='ssh', storageRevision=revision, deadline=time.time()+2))
         self.assertEqual(result['status'], 'sftp_error')
+
+
+    def test_switch_configuration_fail_closed_and_legacy_fallback(self):
+        for entity in ('script.omv_power', 'switch.BAD!', 'switch.', 'switch.omv/turn_off'):
+            with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': entity}):
+                self.assertEqual(wake.configuration()['reason'], 'ha_config_invalid')
+                self.assertFalse(wake.public_configuration()['available'])
+        with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power', 'PHOTO_SAVER_HA_SCRIPT_ENTITY': 'bad'}):
+            cfg = wake.configuration()
+            self.assertIsNone(cfg['reason'])
+            self.assertEqual((cfg['mode'], cfg['control_entity'], cfg['service']), ('switch', 'switch.omv_power', 'switch/turn_on'))
+            self.assertEqual(wake.public_configuration()['mode'], 'switch')
+            self.assertNotIn('sentinel-secret', json.dumps(wake.public_configuration()))
+            switch_revision = wake.snapshot()['targetRevision']
+            config_revision = wake.snapshot()['configRevision']
+            with patch.dict(os.environ, {'PHOTO_SAVER_HA_SCRIPT_ENTITY': 'other-invalid-legacy'}):
+                self.assertEqual(config_revision, wake.snapshot()['configRevision'])
+        self.assertEqual(wake.configuration()['mode'], 'script')
+        self.assertNotEqual(switch_revision, wake.snapshot()['targetRevision'])
+
+    def run_switch_job(self, power, running='off', recover=False):
+        ticks = [time.time(), time.monotonic()]
+        calls, observations = [], []
+        outer = self
+        class ClockEvent(threading.Event):
+            def wait(self, timeout=None):
+                observations.append(outer.client.get('/api/storage/wake').json()['job']['result'])
+                ticks[0] += timeout
+                ticks[1] += timeout
+        def runner(request, control):
+            calls.append(request)
+            if request['operation'] == 'post':
+                self.assertEqual((request['service'], request['entity']), ('switch/turn_on', 'switch.omv_power'))
+                return dict(status='accepted')
+            value = power if request['entity'].startswith('switch.') else ('on' if recover and observations else running)
+            if isinstance(value, dict): return value
+            return dict(status='ok', state=value, last_reported=datetime.fromtimestamp(ticks[0], timezone.utc).isoformat())
+        with patch.dict(os.environ, {'PHOTO_SAVER_HA_POWER_SWITCH_ENTITY': 'switch.omv_power', 'PHOTO_SAVER_WAKE_TIMEOUT_SECONDS': '30'}):
+            job = self.job()
+            with patch.object(wake.time, 'time', side_effect=lambda: ticks[0]), patch.object(wake.time, 'monotonic', side_effect=lambda: ticks[1]):
+                wake.run_storage_wake(job, runner=runner, stop_event=ClockEvent())
+        return self.client.get('/api/storage/wake').json()['job'], calls, observations
+
+    def test_switch_existing_on_does_not_post_or_complete_before_running_sensor(self):
+        final, calls, observations = self.run_switch_job('on', recover=True)
+        self.assertEqual(final['result']['outcome'], 'server_responding_settings_required')
+        self.assertTrue(observations)
+        self.assertTrue(all(r['attemptState'] == 'observing_existing' and r['outcome'] is None for r in observations))
+        self.assertFalse(any(r['operation'] == 'post' for r in calls))
+        final, calls, _ = self.run_switch_job('on')
+        self.assertEqual(final['result']['outcome'], 'startup_timeout')
+        self.assertEqual(final['result']['controlMode'], 'switch')
+        self.assertEqual(final['result']['haPowerState'], 'on')
+
+    def test_switch_off_posts_once_and_unknown_unavailable_never_post(self):
+        final, calls, _ = self.run_switch_job('off', recover=True)
+        self.assertEqual(sum(c['operation'] == 'post' for c in calls), 1)
+        self.assertEqual(final['result']['outcome'], 'server_responding_settings_required')
+        for value in ('unknown', 'unavailable', dict(status='ok', state='off', last_reported='bad'),
+                      dict(status='ok', state='off', last_reported_present=True, last_updated=datetime.now(timezone.utc).isoformat()),
+                      dict(status='ok', state='off', last_reported=(datetime.now(timezone.utc)+timedelta(seconds=3600)).isoformat())):
+            final, calls, _ = self.run_switch_job(value)
+            self.assertEqual(final['result']['outcome'], 'response_unconfirmed')
+            self.assertFalse(any(c['operation'] == 'post' for c in calls))
+
+    def test_switch_permanent_errors_and_missing_running_sensor(self):
+        for code in ('ha_http_401', 'ha_http_404', 'ha_dns_error', 'ha_tls_error', 'ha_redirect_blocked'):
+            final, calls, _ = self.run_switch_job(dict(status='ha_error', code=code))
+            self.assertEqual(final['result']['outcome'], 'ha_error')
+            self.assertFalse(any(c['operation'] == 'post' for c in calls))
+            self.assertNotIn('sentinel-secret', json.dumps(final))
+        final, calls, _ = self.run_switch_job('off', dict(status='ha_error', code='ha_http_404'))
+        self.assertEqual(sum(c['operation'] == 'post' for c in calls), 1)
+        self.assertNotEqual(final['result']['outcome'], 'server_responding_settings_required')
+
+    def test_switch_post_service_allowlist_and_domain_validation(self):
+        import storage_wake_io as helper
+        from unittest.mock import MagicMock
+        for service, entity, allowed in [('switch/turn_on', 'switch.omv_power', True), ('switch/turn_off', 'switch.omv_power', True),
+                ('switch/turn_on', 'script.wake_omv', False), ('script/turn_on', 'switch.omv_power', False),
+                ('switch/toggle', 'switch.omv_power', False), ('switch/turn_off', 'switch.bad/extra', False)]:
+            with self.subTest(service=service, entity=entity), patch.object(helper.urllib.request, 'build_opener') as build:
+                response = MagicMock(status=200)
+                build.return_value.open.return_value.__enter__.return_value = response
+                result = helper.operation(dict(operation='post', service=service, entity=entity, deadline=time.time()+3,
+                    ha=dict(url='http://ha.invalid', token='sentinel-secret', script='script.wake_omv')))
+                self.assertEqual(result['status'], 'accepted' if allowed else 'rejected')
+                if allowed:
+                    request = build.return_value.open.call_args.args[0]
+                    self.assertEqual(request.full_url, 'http://ha.invalid/api/services/' + service)
+                    self.assertEqual(json.loads(request.data), dict(entity_id=entity))
+                else:
+                    build.assert_not_called()
+                    self.assertEqual(result['code'], 'ha_config_invalid')
+                self.assertNotIn('sentinel-secret', json.dumps(result))
 
 
 if __name__ == '__main__':

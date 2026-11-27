@@ -259,7 +259,105 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.record)
 
 
+    async def test_switch_complete_status_matrix(self):
+        self.config['power_switch'] = 'switch.omv_power'
+        self.service.source(self.config)
+        def obs(state, prefix):
+            if state == 'error': return dict(reason='ha_dns_error')
+            if state == 'missing': return dict(reason=prefix + '_missing')
+            if state == 'stale': return dict(state='on', last_reported='bad')
+            if state == 'unconfigured': return dict(reason='ha_not_configured')
+            return dict(state=state, last_reported=self.iso())
+        for power in ('on', 'off', 'stale', 'unknown', 'unavailable', 'error', 'missing', 'unconfigured'):
+            for sensor in ('on', 'off', 'unknown', 'stale', 'missing', 'error'):
+                for ssh in ('reachable', 'unreachable', 'unconfigured'):
+                    with self.subTest(power=power, sensor=sensor, ssh=ssh):
+                        record = dict(powerSwitch=obs(power, 'switch'), runningSensor=obs(sensor, 'sensor'),
+                                      ssh=dict(configured=ssh != 'unconfigured', status=ssh, latencyMs=None))
+                        p = self.service.project((record, self.iso()))
+                        reason = None
+                        ha_reason = None
+                        if power == 'on':
+                            if sensor in ('off', 'unknown', 'stale'):
+                                status, reason = ('running', 'ha_lagging') if ssh == 'reachable' else ('booting', 'power_transitioning')
+                                ha_reason = 'power_transitioning'
+                            else:
+                                status, reason = ('booting', 'ssh_unreachable') if ssh == 'unreachable' else ('running', None)
+                        elif power == 'off':
+                            status, reason = ('running', 'ha_lagging') if ssh == 'reachable' else ('no_response', None)
+                        elif power == 'stale':
+                            ha_reason = 'report_time_invalid'
+                            status, reason = ('running', None) if ssh == 'reachable' else ('stale', ha_reason)
+                        elif power == 'unconfigured':
+                            ha_reason = 'ha_not_configured'
+                            status, reason = ('running', None) if ssh == 'reachable' else ('no_response', None) if ssh == 'unreachable' else ('unconfigured', ha_reason)
+                        else:
+                            ha_reason = 'ha_dns_error' if power == 'error' else 'switch_' + power
+                            status, reason = ('running' if ssh == 'reachable' else 'unknown', ha_reason)
+                        self.assertEqual((p['status'], p['reasonCode'], p['ha']['reasonCode']), (status, reason, ha_reason))
+                        self.assertEqual(p['nextPollInSeconds'], {'running': 15, 'no_response': 15, 'booting': 5, 'stale': 30, 'unknown': 30, 'unconfigured': 60}[status])
+                        self.assertEqual(p['powerSwitch']['status'], 'error' if power in ('error', 'missing') else 'unknown' if power == 'unavailable' else power)
+
+    async def test_switch_get_many_single_runner_and_config_invalidates_history(self):
+        self.config['power_switch'] = 'switch.omv_power'
+        self.result = dict(status='ok', entities={'switch.omv_power': dict(status='ok', state='on', last_reported=self.iso()),
+            self.config['sensor']: dict(status='ok', state='off', last_reported=self.iso())})
+        a = await self.service.get()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual((self.calls[0]['operation'], self.calls[0]['entities']), ('get_many', ['switch.omv_power', self.config['sensor']]))
+        self.assertEqual(a['reasonCode'], 'power_transitioning')
+        self.assertNotIn('switch.omv_power', json.dumps(a))
+        self.config['power_switch'] = 'switch.changed'
+        self.result = dict(status='unreachable')
+        b = await self.service.get()
+        self.assertNotEqual(a['sourceRevision'], b['sourceRevision'])
+        self.assertIsNone(b['lastKnown'])
+        self.assertEqual(len(self.calls), 2)
+
+
 class BaseAndHelperTests(unittest.TestCase):
+    def test_get_many_shared_deadline_short_circuit_and_safe_projection(self):
+        from unittest.mock import MagicMock
+        entities = ['switch.omv_power', 'binary_sensor.omv_running']
+        request = dict(operation='get_many', entities=entities, statusProjection=True, deadline=time.time()+4.5,
+                       ha=dict(url='http://ha.invalid', token='sentinel-secret'))
+        class Response:
+            def __init__(self, entity): self.entity = entity
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size): return json.dumps(dict(entity_id=self.entity, state='on', attributes=dict(secret='sentinel-secret'))).encode()
+        with patch.object(storage_wake_io.urllib.request, 'build_opener') as build:
+            build.return_value.open.side_effect = [Response(e) for e in entities]
+            result = storage_wake_io.operation(request)
+            self.assertEqual(list(result['entities']), entities)
+            self.assertEqual(build.return_value.open.call_count, 2)
+            self.assertNotIn('attributes', json.dumps(result))
+            self.assertNotIn('sentinel-secret', json.dumps(result))
+            self.assertTrue(all(c.kwargs['timeout'] <= 4.5 for c in build.return_value.open.call_args_list))
+        failures = [urllib.error.HTTPError('private', c, 'secret', {}, None) for c in (401, 403, 302)]
+        failures += [urllib.error.URLError(e) for e in (socket.gaierror(), ssl.SSLError(), TimeoutError(), ConnectionRefusedError())]
+        for failure in failures:
+            with self.subTest(error=type(failure)), patch.object(storage_wake_io.urllib.request, 'build_opener') as build:
+                build.return_value.open.side_effect = failure
+                result = storage_wake_io.operation(request)
+                self.assertEqual(build.return_value.open.call_count, 1)
+                self.assertEqual(result['entities'][entities[0]], result['entities'][entities[1]])
+        # Missing running entities do not hide the independent switch result.
+        with patch.object(storage_wake_io.urllib.request, 'build_opener') as build:
+            build.return_value.open.side_effect = [urllib.error.HTTPError('hidden', 404, 'secret', {}, None), Response(entities[1])]
+            self.assertEqual(storage_wake_io.operation(request)['entities'][entities[1]]['status'], 'ok')
+            self.assertEqual(build.return_value.open.call_count, 2)
+        for raw in (b'[]', b'{broken', b'x'*65537):
+            with patch.object(storage_wake_io.urllib.request, 'build_opener') as build:
+                response = MagicMock()
+                response.__enter__.return_value.read.return_value = raw
+                build.return_value.open.return_value = response
+                result = storage_wake_io.operation(request)
+                self.assertTrue(all(v['status'] == 'invalid_response' for v in result['entities'].values()))
+        with patch.object(storage_wake_io, '_get_entity') as get:
+            storage_wake_io.operation(dict(request, entities=entities*3))
+            get.assert_not_called()
+
     def test_helper_get_transport_projection_and_bad_responses(self):
         request = dict(operation='get', statusProjection=True, deadline=time.time()+4,
                        entity='binary_sensor.omv_running', ha=dict(url='https://ha.invalid', token='sentinel-secret'))

@@ -2,16 +2,22 @@
 
 ## OMV 원격 종료 (선택 설정)
 
-기존 `PHOTO_SAVER_HA_URL`, `PHOTO_SAVER_HA_TOKEN`, `PHOTO_SAVER_HA_RUNNING_ENTITY`를 공유한다. Home Assistant에 안전하게 OMV를 종료하는 별도 스크립트를 먼저 만들고 `.env`에 아래 값을 등록한다. 앱은 OMV SSH 셸의 poweroff 명령을 직접 실행하지 않는다.
+기존 `PHOTO_SAVER_HA_URL`, `PHOTO_SAVER_HA_TOKEN`, `PHOTO_SAVER_HA_RUNNING_ENTITY`를 공유한다. Home Assistant에 이미 구성된 OMV Template Switch를 연결하면 단일 설정으로 켜기·끄기·상태 조회가 활성화된다. 앱은 OMV SSH 셸의 poweroff 명령을 직접 실행하지 않는다.
 
 ```dotenv
-# 기본 빈 값: 명시적으로 설정해야 활성화
-PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY=script.shutdown_omv
-# 정수 30..600초, 기본 180초
-PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS=180
+# 권장: 기존 HA Template Switch
+PHOTO_SAVER_HA_POWER_SWITCH_ENTITY=switch.omv_power
+# 정수 30..1200초, 기본 300초 (HA 종료 시퀀스가 길면 최대 1200초)
+PHOTO_SAVER_SHUTDOWN_TIMEOUT_SECONDS=300
+# 스위치를 비워 둘 때만 사용하는 레거시 폴백
+# PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY=script.shutdown_omv
 ```
 
-종료 엔티티는 `script.[a-z0-9_]+` 형식이며 `PHOTO_SAVER_HA_SCRIPT_ENTITY`(기본 `script.wake_omv`)와 같으면 거부한다. 적용은 `docker compose up -d --force-recreate api worker`로 한다. wake와 shutdown의 스크립트·타임아웃 검증은 서로 독립적이며 상태 조회에도 영향을 주지 않는다. HA 토큰은 DB payload·리비전·공개 API에 포함하지 않는다. 토큰 교체 후에도 주소·엔티티가 같다면 진행 중 종료 대상은 유지된다.
+스위치는 `switch.[a-z0-9_]+` 형식만 허용한다. 값이 있으면 기존 스크립트 설정을 무시하며, 잘못된 스위치 값은 `ha_config_invalid`로 차단하고 레거시로 폴백하지 않는다. 빈 값일 때만 켜기 `PHOTO_SAVER_HA_SCRIPT_ENTITY`(기본 `script.wake_omv`)와 별도 종료 `PHOTO_SAVER_HA_SHUTDOWN_SCRIPT_ENTITY`를 사용한다. 레거시 종료 엔티티는 `script.[a-z0-9_]+` 형식이며 켜기 스크립트와 같으면 거부한다. wake와 shutdown의 타임아웃 검증은 서로 독립적이며 상태 조회에도 영향을 주지 않는다. HA 토큰은 DB payload·공개 API·종료 revision에 포함하지 않는다. 토큰 교체 후에도 주소·엔티티가 같다면 진행 중 종료 대상은 유지된다.
+
+전원 스위치의 on은 HA 제어 시퀀스가 진행 중이라는 뜻일 수도 있다. 켜기 완료는 신선한 실행 센서 `binary_sensor.omv_running=on` 또는 실제 SFTP 접근으로 확인한다. 종료 완료는 신선한 스위치 off와 (주소가 있으면) SSH 응답 중단이 모두 필요하다. SSH가 먼저 멈춰도 전원 스위치가 on이면 원격 작업 레인을 유지하고 스마트플러그 차단까지 기다린다. 최초 종료 요청은 스위치 on과 SSH 응답(주소 미설정 시 실행 센서 on 또는 센서 404)을 확인한 뒤 한 번만 보낸다. SSH 미응답 또는 실행 센서 off는 15초 유예 후 안전 차단한다.
+
+백엔드 소스는 이미지에 복사되므로 변경 후 반드시 재빌드한다. `curl -fsS http://127.0.0.1:8888/api/state`의 `activeJobs`에 활성 작업이 없는지 확인한 뒤 `docker compose up -d --build --force-recreate api worker`를 실행한다. `restart`만으로 환경변수나 이미지 변경은 반영되지 않는다. 검증 중 실제 HA 제어 서비스나 라이브 wake/shutdown POST를 호출하지 않는다.
 
 오류를 확인할 때 401은 토큰, 403은 권한, 404는 스크립트/센서, redirect는 최종 HA URL을 점검한다. SSH만 중단되고 HA가 꺼짐을 확인하지 못하면 서버 전원을 직접 확인한다. HTTP 아카이브 탐색·다운로드는 Job이 아니므로 종료 확인창의 경고를 확인한다.
 
@@ -34,14 +40,15 @@ git diff --check
 
 ## OMV 원격 시작 선택 설정
 
-기존 Home Assistant 스크립트를 그대로 사용한다. 앱의 기본 HA 대상은 `script.wake_omv`와 `binary_sensor.omv_running`이다. HA 스크립트·자동화·플러그를 수정하거나 직접 WOL·종료를 추가하지 않는다. SSH 설정 전에도 선택 기능을 사용할 수 있고 HA 미설정은 일반 API health/아카이브 기능에 영향을 주지 않는다.
+권장 설정은 기존 Home Assistant Template Switch와 `binary_sensor.omv_running`이다. 스위치가 비어 있으면 기존 `script.wake_omv`를 그대로 사용한다. HA 스크립트·자동화·플러그를 수정하거나 직접 WOL·종료를 추가하지 않는다. SSH 설정 전에도 선택 기능을 사용할 수 있고 HA 미설정은 일반 API health/아카이브 기능에 영향을 주지 않는다.
 
-사용자가 실제 `.env`에 아래 값을 직접 등록한다. 토큰은 상태 읽기와 기존 스크립트 실행 권한이 있는 long-lived access token이며 브라우저에 입력하지 않는다. 커넥터에서 자격 증명을 추출하지 않는다.
+실제 `.env`에 아래 값을 등록한다. 토큰은 상태 읽기와 해당 스위치/스크립트 제어 권한이 있는 long-lived access token이며 브라우저에 입력하지 않는다. 커넥터에서 자격 증명을 추출하지 않는다.
 
 ```dotenv
 PHOTO_SAVER_HA_URL=https://home-assistant.example
 PHOTO_SAVER_HA_TOKEN=<사용자가 발급한 토큰>
-PHOTO_SAVER_HA_SCRIPT_ENTITY=script.wake_omv
+PHOTO_SAVER_HA_POWER_SWITCH_ENTITY=switch.omv_power
+# 스위치를 비워 두면 PHOTO_SAVER_HA_SCRIPT_ENTITY=script.wake_omv 사용
 PHOTO_SAVER_HA_RUNNING_ENTITY=binary_sensor.omv_running
 PHOTO_SAVER_HA_STALE_SECONDS=0
 PHOTO_SAVER_WAKE_TIMEOUT_SECONDS=180
@@ -206,7 +213,7 @@ docker compose down
 SQLite 백업에는 이미지 파일이 포함되지 않는다. 복원 후 설정 → 썸네일 캐시 → 현황 새로고침 → 누락 썸네일 일괄 생성을 실행한다. 로컬 원본 또는 활성 NAS 사본이 있어야 복구할 수 있다. 실패 상태 초기화는 캐시 이미지를 삭제하지 않으며 재시도 상태만 초기화한다. 미참조 썸네일 정리는 모든 레인의 작업이 끝난 뒤 실행하며 배타적 catalog 잠금 안에서 참조를 다시 확인한다. 원격 사본과 전송 이력이 참조하는 캐시는 보존한다.
 ## OMV 읽기 전용 상태 모니터
 
-모니터는 HA 센서 GET과 저장된 IP의 비인증 SSH 배너를 병행한다. 원격 기동 스크립트·timeout 오류와 무관하게 센서 GET이 동작하며 HA 미설정이어도 SSH 도달성을 확인한다. 토큰 양 끝의 CRLF/공백은 제거하고 내부 제어 문자는 거부한다. 실제 `.env`의 값은 응답·로그로 공개하지 않는다.
+모니터는 스위치 설정 시 전원 스위치·실행 센서를 단일 서브프로세스의 공유 4.5초 예산으로 조회하고, 저장된 IP의 비인증 SSH 배너와 병행한다. 스위치 미설정 시 기존 단일 센서 GET을 유지한다. 원격 기동 스크립트·timeout 오류와 무관하게 센서 GET이 동작하며 HA 미설정이어도 SSH 도달성을 확인한다. 토큰 양 끝의 CRLF/공백은 제거하고 내부 제어 문자는 거부한다. 실제 `.env`의 값은 응답·로그로 공개하지 않는다.
 
 기본 신선도 정책 `PHOTO_SAVER_HA_STALE_SECONDS=0`은 장기 안정 상태를 허용한다. 명시적으로 90 등 양수를 주면 해당 초수 이후 보고 지연으로 표시한다. 음수/비정수는 0으로 처리한다. 보고 시각 파싱 실패와 30초 넘는 미래는 항상 진단한다. 상태별 조회 주기는 설정 변경 1초, 부팅 5초, 작동/응답 없음 15초, 오류/보고 지연 30초, 미설정 60초다. 숨긴 탭은 멈추고 10초 이상 숨겼거나 다음 조회 시각이 지났을 때 재개한다. 수동 확인은 5초 쿨다운을 따르며 자동 조회 중 클릭도 예약한다.
 

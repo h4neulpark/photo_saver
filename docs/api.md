@@ -12,9 +12,11 @@
 
 새 요청의 revision 불일치는 409 `target_changed`, remote/exclusive 충돌은 409 `remote_busy`, 원격 keeper를 가진 활성 중복 정리는 409 `remote_cleanup_busy`다. 반대로 원격 keeper 중복 정리 접수는 종료 작업 중 409 `storage_shutdown_active`다. 설정 문제는 409 `ha_not_configured|ha_shutdown_not_configured|ha_config_invalid|settings_busy`다. 동일 UUID는 종료 후에도 같은 작업을 반환하며 같은 대상의 활성 종료에 다른 UUID로 합류하면 별칭을 저장한다(별칭 128개 상한, 초과 429 `shutdown_request_limit`). 같은 UUID를 다른 revision에 재사용할 수 없다.
 
-`GET /api/settings.storageShutdown`은 `{available,reasonCode,message,timeoutSeconds,targetRevision}`를 제공하며 `/api/state.latestStorageShutdown`은 다른 원격 작업 이후에도 최근 종료 작업을 보존한다. `/api/jobs?kind=storage-shutdown`과 `status=attention`으로 이력을 확인한다. payload·별칭·HA 토큰은 공개하지 않는다. `/api/storage/status`의 스키마·읽기 전용 성격은 바뀌지 않는다.
+`GET /api/settings`의 `storageWake`·`storageShutdown`은 기존 `{available,reasonCode,message,timeoutSeconds,targetRevision}`에 `mode:"switch"|"script"`를 추가한다. 유효한 `PHOTO_SAVER_HA_POWER_SWITCH_ENTITY` 설정은 두 기능을 함께 활성화하며 레거시 스크립트 설정보다 우선한다. 잘못된 스위치는 `ha_config_invalid`로 차단한다. 종료 timeout은 기본 300초, 정수 30~1200초다. `/api/state.latestStorageShutdown`은 다른 원격 작업 이후에도 최근 종료 작업을 보존한다. `/api/jobs?kind=storage-shutdown`과 `status=attention`으로 이력을 확인한다. payload·별칭·HA 토큰은 공개하지 않는다.
 
 공개 result는 `phaseCode/phase/message/outcome/code/detailCode/error/review/cancelRequested`, `attemptState/attemptCount/intentAt/receiptAt`, `haState/haFresh/haScriptState`, `sshState/sshConfigured/everSshStoppedAfterAttempt`, `startedAt/requestedAt/deadlineAt/checkedAt/elapsedSeconds/timeoutSeconds/targetRevision`를 사용한다. 단계는 `queued → checking_server → requesting → waiting_shutdown → waiting_power_off → complete`다. 파일 진행률은 없다.
+
+추가 종료 result는 `controlMode`, `haPowerState`, `haPowerFresh`, `haRunningState`, `haRunningFresh`다. 스위치 모드에서는 `switch/turn_off`를 한 번만 요청하며, 완료는 신선한 전원 스위치 off와 SSH 응답 중단(주소가 없으면 스위치 off만)으로 판정한다. SSH·실행 센서가 먼저 멈춰도 `waiting_power_off`를 유지한다. 스위치 unknown/unavailable는 완료 증거가 아니다. preflight에서 스위치 on과 SSH 응답(주소 미설정 시 실행 센서 on 또는 404)이 없으면 요청하지 않으며, 미응답은 15초 후 `server_not_ready`, 불확실한 상태는 `response_unconfirmed`다.
 
 성공은 `powered_off|already_off`(done, review=0), 부분 확인은 `ssh_stopped_ha_unconfirmed`(done, review=1)다. 실패는 `ha_request_failed|server_not_ready|response_unconfirmed|remote_cleanup_busy|shutdown_timeout|request_unknown|config_changed|interrupted|invalid_operation`(failed, review=1), 사용자 중지는 `cancelled`(cancelled, review=1)다. HA 인증·권한·엔티티·리다이렉트 오류 등은 detailCode에 보존한다. 취소는 확인 대기만 중단하며 이미 전송된 종료 스크립트는 계속 진행될 수 있다.
 
@@ -37,6 +39,12 @@ POST의 202 응답은 `id,kind:"storage-wake",lane:"remote",status,reused,target
 성공/주의 outcome은 `archive_ready`, `server_responding_settings_required`, `archive_blocked`, `archive_unconfirmed`(done), 실패 outcome은 `expired`, `startup_timeout`, `request_unknown`, `response_unconfirmed`, `ha_error`, `invalid_operation`(failed), 중지는 `config_changed`, `cancelled`(cancelled)다. HA 접수와 실제 접근 준비는 독립적이므로 unknown 접수 상태에서도 SFTP ready가 가능하다. queued 취소는 즉시 종료하고 running 취소는 flag를 저장한 뒤 I/O 프로세스를 종료·회수한 후 종료한다. 이미 보낸 기동 요청은 취소되지 않는다.
 
 ## OMV 현재 상태
+
+스위치 모드에서는 HA 전원 스위치와 실행 센서를 동일 서브프로세스의 `get_many`로 순차 조회한다(최대 4개, 전체 4.5초 예산). 인증·DNS·TLS·리다이렉트·시간 초과·연결 실패 시 나머지 요청은 단락한다. `rawState`와 `ha`는 전원 스위치 기준이고, 선택 필드 `powerSwitch`·`runningSensor`는 각각 `{configured:boolean,status:"on"|"off"|"stale"|"unknown"|"error"|"unconfigured",reasonCode:string|null,reportedAt:string|null,changedAt:string|null}`이다. 엔티티 ID·URL·토큰·attributes는 반환하지 않는다. 스위치 변경 시 sourceRevision·캐시·lastKnown을 폐기한다.
+
+스위치 on이고 실행 센서 off/unknown/stale이면 SSH 응답 시 `running/ha_lagging`, SSH 미응답·미설정이면 `booting/power_transitioning`(5초 재조회)이다. 이때 `ha.status=on`, `ha.reasonCode=power_transitioning`이다. 실행 센서 on 또는 404/error면 기존 HA on + SSH 결합 규칙을 쓴다. 스위치 off/stale/unknown/error는 아래 기존 표와 동일하다. 스위치 unknown/unavailable/404의 사유는 `switch_unknown|switch_unavailable|switch_missing`이며 실행 센서 404는 `sensor_missing`이다.
+
+켜기 result에 `controlMode`, `haPowerState`가 추가된다. 스위치 on이면 `observing_existing`으로 관찰하며 POST하지 않는다. HA만으로 켜기 완료를 판단하거나 HA on 이력을 저장할 때는 신선한 실행 센서 on만 인정한다. 켜기는 `switch/turn_on`, 종료는 `switch/turn_off`, 레거시는 `script/turn_on`만 허용하며 서비스와 대상 엔티티 도메인이 다르면 요청을 거부한다.
 
 `GET /api/storage/status`는 HA 센서 GET과, 저장된 IP가 있으면 TCP 22의 SSH 배너 확인을 병행한다. SSH는 인증·SFTP·디스크 접근 없이 최대 256바이트만 읽으며 HA 미설정이어도 수행한다. `?refresh=true`는 5초 재조회 간격이 허용할 때 새 조회를 수행한다. 센서 갱신·서비스·기동은 실행하지 않으며 작업/DB/설정 잠금/워커에 의존하지 않는다. 예상 오류도 HTTP200, 잘못된 bool query는 422, 모든 응답은 `Cache-Control: no-store`다.
 
