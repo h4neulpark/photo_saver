@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from catalog import (DATA, DEFAULT_ZONE, PHOTOS, THUMBNAILS, LANE_LOCAL, LANE_REMOTE,
                      LANE_EXCLUSIVE, active_offload_media_ids, database, initialize, now)
-from companions import CAMERA_AUX, COMPANION_EXTENSIONS, XMP, read_xmp, source_candidates, source_index, xmp_owner
+from companions import CAMERA_AUX, COMPANION_EXTENSIONS, XMP, aux_owner, read_xmp, source_candidates, source_index, xmp_owner
 from media import (
     SUPPORTED, VIDEO_METADATA_VERSION, analyze, delete_photo, delete_verified_file, fingerprint, hash_file, inspect, iso_time, move_file,
     preview_thumbnail, relative_parts, scan_tree, thumbnail_path,
@@ -151,18 +151,19 @@ def plan_companions(incoming, companion_files, media_rows):
         suffix = Path(path).suffix.lower()
         candidates = source_candidates(path, incoming_index)
         if suffix in CAMERA_AUX:
-            if len(candidates) == 1 and initial is not None and incoming_by_path[candidates[0]][-2] == "ready":
-                entry = companion_disposition(path, "delete-after-move")
+            owner = aux_owner(path, candidates)
+            if owner is not None and initial is not None:
+                if incoming_by_path[owner][-2] == "ready":
+                    entry = companion_disposition(path, "delete-after-move")
+                else:
+                    entry = companion_disposition(path, "keep", "원본이 이동 대상이 아니므로 보조 파일을 보존합니다.")
                 entry["fingerprint"] = fingerprint(initial)
             else:
                 reason = ("연결할 원본을 찾지 못했습니다." if not candidates else
-                          "원본 후보가 여러 개입니다." if len(candidates) > 1 else
-                          "파일 상태를 읽을 수 없습니다." if initial is None else
-                          "원본이 이동 대상이 아니므로 보조 파일을 보존합니다.")
+                          "원본 후보가 여러 개입니다." if owner is None else
+                          "파일 상태를 읽을 수 없습니다.")
                 entry = companion_disposition(path, "keep", reason)
-                if len(candidates) == 1 and initial is not None:
-                    entry["fingerprint"] = fingerprint(initial)
-            for candidate in candidates:
+            for candidate in ([owner] if owner else candidates):
                 attached[candidate].append(entry)
             if not candidates:
                 unmatched.append(entry)

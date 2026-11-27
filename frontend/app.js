@@ -380,7 +380,7 @@ function jobMessage(job) {
   if (job.kind === 'delete') return `사진 ${job.result.deleted}개를 삭제했습니다.${job.result.review ? ` 확인 필요 ${job.result.review}개.` : ''}`;
   if (job.kind === 'duplicate-cleanup') return `중복 ${job.result.cleaned || 0}개 정리${job.result.freedBytes ? ` · ${sizeLabel(job.result.freedBytes / 1e6)} 비움` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
   if (job.kind === 'xmp-link') return `XMP ${job.result.linked || 0}개 연결${job.result.alreadyStored ? ` · 이미 보관 ${job.result.alreadyStored}개` : ''}${job.result.review ? ` · 확인 필요 ${job.result.review}개` : ''}`;
-  return `${job.result.moved}개를 보관함으로 가져왔습니다.${job.result.xmp ? ` XMP ${job.result.xmp}개 보관.` : ''}${job.result.auxDeleted ? ` THM·LRV ${job.result.auxDeleted}개 삭제.` : ''}${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review || job.result.companionReview ? ` 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개.` : ''}`;
+  return `${job.result.moved}개를 보관함으로 가져왔습니다.${job.result.xmp ? ` XMP ${job.result.xmp}개 보관.` : ''}${job.result.auxDeleted ? ` THM·LRV·AAE ${job.result.auxDeleted}개 삭제.` : ''}${job.result.duplicate ? ` 중복 ${job.result.duplicate}개.` : ''}${job.result.review || job.result.companionReview ? ` 확인 필요 ${(job.result.review || 0) + (job.result.companionReview || 0)}개.` : ''}`;
 }
 
 async function syncState() {
@@ -544,7 +544,7 @@ function matchesXmp(file, query) {
 
 function companionSummary(file) {
   if (file.companions) return file.companions.map(item => `${item.path.split('/').at(-1)} ${companionLabels[item.disposition] || '확인 필요'}`).join(' · ');
-  return [file.xmp ? 'XMP' : '', file.cameraAuxCount && file.status === 'ready' ? `THM·LRV ${file.cameraAuxCount}개 원본 이동 후 정리` : ''].filter(Boolean).join(' · ');
+  return [file.xmp ? 'XMP' : '', file.cameraAuxCount && file.status === 'ready' ? `THM·LRV·AAE ${file.cameraAuxCount}개 원본 이동 후 정리` : ''].filter(Boolean).join(' · ');
 }
 
 function filteredIncoming(filter = view.incomingFilter) {
@@ -789,7 +789,7 @@ function incomingScanStrip() {
 
 const devicePhotoExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
 const deviceVideoExtensions = new Set(['mp4', 'mov']);
-const deviceCompanionExtensions = new Set(['xmp', 'thm', 'lrv']);
+const deviceCompanionExtensions = new Set(['xmp', 'thm', 'lrv', 'aae']);
 function deviceExtension(name) {
   const dot = name.lastIndexOf('.');
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
@@ -3787,7 +3787,7 @@ async function confirmIncomingCleanup() {
     const verified = keeper.verifiedAt ? ` · 최근 검증 ${catalogTime(keeper.verifiedAt)}` : '';
     return escapeHtml(`${keeperLabels[keeper.kind]} · ${keeper.path}${verified}`);
   };
-  showDialog('중복 파일 정리', `<p>남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. Incoming에 남아 있는 XMP와 카메라 보조 파일은 보존합니다.</p>
+  showDialog('중복 파일 정리', `<p>남길 사본을 다시 검증한 뒤 선택한 Incoming 파일을 영구 삭제합니다. Incoming에 남아 있는 XMP와 보조 파일(THM·LRV·AAE)은 보존합니다.</p>
     <p id="cleanup-summary" class="numbers" role="status">${summary()}</p>
     <div class="cleanup-groups">${groups.map((group, index) => `<section class="cleanup-group" aria-label="중복 묶음 ${index + 1}">
       ${group.keepers.length > 1 ? `<label>남길 사본<select data-keeper-group="${index}" aria-describedby="keeper-detail-${index}">${group.keepers.map((keeper, option) => `<option value="${option}">${keeperLabel(keeper)}</option>`).join('')}</select></label>` : ''}

@@ -89,6 +89,8 @@ class CatalogResetTests(unittest.TestCase):
         (self.incoming / 'returned-old/nested/.hidden').write_bytes(b'hidden')
         (self.incoming / 'sidecar.xmp').write_bytes(b'xmp')
         (self.incoming / 'aux.LRV').write_bytes(b'aux')
+        (self.incoming / 'edits.AAE').write_bytes(b'apple edits')
+        (self.fixture.managed / 'edits.AAE').write_bytes(b'old apple edits')
         (catalog.DATA / 'leftover.sqlite3').write_bytes(b'old backup')
         (catalog.DATA / 'temp/sub').mkdir(parents=True)
         (catalog.DATA / 'temp/sub/leftover').write_bytes(b'temp')

@@ -11,7 +11,9 @@ from catalog import PHOTOS
 from media import VIDEOS, capture_time, fingerprint, regular_file
 
 XMP = ".xmp"
-CAMERA_AUX = {".thm", ".lrv"}
+AAE = ".aae"
+GOPRO_PROXY_AUX = {".thm", ".lrv"}
+CAMERA_AUX = GOPRO_PROXY_AUX | {AAE}
 COMPANION_EXTENSIONS = CAMERA_AUX | {XMP}
 MAX_XMP_BYTES = 1024 * 1024
 NAMESPACES = {
@@ -95,10 +97,10 @@ def source_candidates(sidecar, index, *, include_folder=True):
     suffix = path.suffix.lower()
     folder, stem = source_key(sidecar, include_folder=include_folder)
     embedded = PurePosixPath(stem)
-    if suffix == XMP and embedded.suffix.lower() in PHOTOS | VIDEOS:
+    if suffix in {XMP, AAE} and embedded.suffix.lower() in PHOTOS | VIDEOS:
         return [item for item in index[(folder, embedded.stem)] if PurePosixPath(item).name.casefold() == stem]
     found = index.get((folder, stem), [])
-    if suffix in CAMERA_AUX and not found:
+    if suffix in GOPRO_PROXY_AUX and not found:
         # GoPro proxies use GL + the chapter and recording number of a GH/GX original.
         proxy = re.fullmatch(r"gl([a-z0-9]{2}[0-9]{4})", stem)
         if proxy:
@@ -110,6 +112,17 @@ def source_candidates(sidecar, index, *, include_folder=True):
     if suffix == ".lrv":
         return [item for item in found if PurePosixPath(item).suffix.lower() in VIDEOS]
     return found
+
+
+def aux_owner(sidecar, candidates):
+    if len(candidates) == 1:
+        return candidates[0]
+    if PurePosixPath(sidecar).suffix.lower() == AAE and len(candidates) == 2:
+        photos = [path for path in candidates if PurePosixPath(path).suffix.lower() in PHOTOS]
+        movs = [path for path in candidates if PurePosixPath(path).suffix.lower() == ".mov"]
+        if len(photos) == 1 and len(movs) == 1:
+            return photos[0]
+    return None
 
 
 def xmp_owner(candidates):

@@ -38,7 +38,7 @@ nextPollInSeconds와 캐시는 config_changed 1초, booting 5초, running/no_res
 
 ## 기기 → Incoming 청크 업로드
 
-사진 JPG·JPEG·PNG·WEBP·HEIC·HEIF, 영상 MP4·MOV, 동반 파일 XMP·THM·LRV를 허용한다. 모든 업로드 응답(오류 포함)에 Cache-Control: no-store와 X-Content-Type-Options: nosniff를 적용한다. 워커 작업을 생성하지 않으며 기존 reset-all 쓰기 차단(409)을 따른다.
+사진 JPG·JPEG·PNG·WEBP·HEIC·HEIF, 영상 MP4·MOV, 동반 파일 XMP·THM·LRV·AAE를 허용한다. 모든 업로드 응답(오류 포함)에 Cache-Control: no-store와 X-Content-Type-Options: nosniff를 적용한다. 워커 작업을 생성하지 않으며 기존 reset-all 쓰기 차단(409)을 따른다.
 
 | 메서드 | 경로 | 입력 | 반환 |
 | --- | --- | --- | --- |

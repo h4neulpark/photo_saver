@@ -53,7 +53,7 @@ erDiagram
 | `fingerprint` | 파일 상태 JSON 배열 문자열 |
 | `sha`, `size`, `modified_at` | SHA-256, 바이트 크기, 수정 시각 |
 | `thumbnail` | 썸네일 상대 파일명 |
-| `companions` | 연결한 XMP·THM·LRV의 정보 JSON 배열 |
+| `companions` | 연결한 XMP·THM·LRV·AAE의 정보 JSON 배열 |
 | `status`, `reason` | 판정·이동·삭제 상태와 사용자 확인 사유 |
 
 `scan_files_by_job(scan_id, path)` 인덱스가 있다. 새 검사 결과를 저장하고 작업을 완료하는 트랜잭션에서 이전 검사의 `scan_files`와 `scan_xmp` 행을 삭제하므로 검사별 파일 목록을 누적 보존하지 않는다. Incoming 화면은 최근 **완료한** `scan` 작업을 사용하며, 파일 기록도 현재 남아 있는 검사 행만 조회한다. 과거 검사 작업의 `jobs` 행과 집계 결과는 남는다. 파일 상태와 복구 규칙은 [미디어 처리](media-pipeline.md)를 참고한다.

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import api
 import catalog
 import media
 import worker
@@ -36,6 +37,210 @@ class IncomingWorkflowTests(unittest.TestCase):
     def files(self):
         with catalog.database() as db:
             return {row["path"]: dict(row) for row in db.execute("SELECT * FROM scan_files")}
+
+    def move(self, *paths):
+        files = self.files()
+
+        def analysis(root, path, *args):
+            kind = "photo" if Path(path).suffix.lower() in catalog.PHOTOS else "video"
+            return (kind, {}, None, None, None, False, None)
+
+        with patch.object(worker, "analyze", side_effect=analysis):
+            return self.run_job("move", worker.import_selection, {"ids": [files[path]["id"] for path in paths]})
+
+    def test_aae_single_photo_and_video_are_deleted_after_move_without_managed_copy(self):
+        for name in ("IMG_0001.HEIC", "IMG_0001.AAE", "clip.mov", "clip.aae"):
+            (self.incoming / name).write_bytes(name.encode())
+        self.run_job("scan", worker.scan_incoming)
+        files = self.files()
+        for name in ("IMG_0001.HEIC", "clip.mov"):
+            entry, = json.loads(files[name]["companions"])
+            self.assertEqual((entry["kind"], entry["disposition"]), ("aae", "delete-after-move"))
+            self.assertTrue(entry["fingerprint"])
+            self.assertEqual(api.view_scan_file(files[name])["cameraAuxCount"], 1)
+        result = self.move("IMG_0001.HEIC", "clip.mov")
+        self.assertEqual((result["moved"], result["auxDeleted"]), (2, 2))
+        self.assertTrue(all(item["companions"][0]["disposition"] == "deleted" for item in result["items"]))
+        self.assertEqual(list(self.incoming.iterdir()), [])
+        self.assertEqual(sorted(path.name for path in self.managed.rglob("*") if path.is_file()), ["IMG_0001.HEIC", "clip.mov"])
+
+    def test_live_photo_aae_belongs_only_to_photo_and_is_deleted_once(self):
+        for stem, extension in (("IMG_1001", "HEIC"), ("IMG_1002", "JPG")):
+            for suffix in (extension, "MOV", "AAE"):
+                name = f"{stem}.{suffix}"
+                (self.incoming / name).write_bytes(name.encode())
+        self.run_job("scan", worker.scan_incoming)
+        files = self.files()
+        for stem, extension in (("IMG_1001", "HEIC"), ("IMG_1002", "JPG")):
+            photo, video = files[f"{stem}.{extension}"], files[f"{stem}.MOV"]
+            self.assertEqual(api.view_scan_file(photo)["cameraAuxCount"], 1)
+            self.assertEqual(api.view_scan_file(video)["cameraAuxCount"], 0)
+            self.assertEqual(json.loads(video["companions"]), [])
+            entry, = json.loads(photo["companions"])
+            self.assertEqual(entry["path"], f"{stem}.AAE")
+            self.assertEqual(entry["disposition"], "delete-after-move")
+            # Moving the video first must neither delete nor attach the photo's AAE.
+            result = self.move(video["path"], photo["path"])
+            self.assertEqual((result["moved"], result["auxDeleted"]), (2, 1))
+            self.assertNotIn("companionReview", result)
+            self.assertNotIn("companions", result["items"][0])
+            self.assertEqual(result["items"][1]["companions"][0]["disposition"], "deleted")
+            self.assertFalse((self.incoming / f"{stem}.AAE").exists())
+
+    def test_live_photo_aae_with_unreadable_stat_is_kept_only_on_photo(self):
+        for name in ("IMG_1001.HEIC", "IMG_1001.MOV", "IMG_1001.AAE"):
+            (self.incoming / name).write_bytes(name.encode())
+        scan_tree = worker.scan_tree
+
+        def unreadable_aae(root, *args, **kwargs):
+            for path, info in scan_tree(root, *args, **kwargs):
+                yield path, None if root == self.incoming and path == "IMG_1001.AAE" else info
+
+        with patch.object(worker, "scan_tree", side_effect=unreadable_aae):
+            result = self.run_job("scan", worker.scan_incoming)
+
+        files = self.files()
+        entry, = json.loads(files["IMG_1001.HEIC"]["companions"])
+        self.assertEqual(entry["path"], "IMG_1001.AAE")
+        self.assertEqual(entry["disposition"], "keep")
+        self.assertEqual(entry["reason"], "파일 상태를 읽을 수 없습니다.")
+        self.assertNotIn("fingerprint", entry)
+        self.assertEqual(json.loads(files["IMG_1001.MOV"]["companions"]), [])
+        self.assertEqual(result["unmatchedCompanions"], [])
+        self.assertTrue((self.incoming / "IMG_1001.AAE").is_file())
+
+    def test_live_photo_duplicate_owner_preserves_aae_until_photo_is_promoted(self):
+        for name, contents in {
+            "AAA.HEIC": b"same photo", "IMG_1003.HEIC": b"same photo",
+            "IMG_1003.MOV": b"live video", "IMG_1003.AAE": b"apple edits",
+        }.items():
+            (self.incoming / name).write_bytes(contents)
+        self.run_job("scan", worker.scan_incoming)
+        photo = self.files()["IMG_1003.HEIC"]
+        self.assertEqual(photo["status"], "duplicate")
+        entry, = json.loads(photo["companions"])
+        self.assertEqual(entry["disposition"], "keep")
+        self.assertEqual(entry["reason"], "원본이 이동 대상이 아니므로 보조 파일을 보존합니다.")
+        self.assertTrue(entry["fingerprint"])
+        self.assertEqual(json.loads(self.files()["IMG_1003.MOV"]["companions"]), [])
+        result = self.move("IMG_1003.MOV")
+        self.assertEqual(result["moved"], 1)
+        self.assertNotIn("auxDeleted", result)
+        self.assertEqual((self.incoming / "IMG_1003.AAE").read_bytes(), b"apple edits")
+        deletion = self.run_job("delete", worker.delete_selection, {"ids": [self.files()["AAA.HEIC"]["id"]]})
+        self.assertEqual(deletion["deleted"], 1)
+        promoted = self.files()["IMG_1003.HEIC"]
+        self.assertEqual(promoted["status"], "ready")
+        self.assertEqual(json.loads(promoted["companions"])[0]["disposition"], "delete-after-move")
+        result = self.move("IMG_1003.HEIC")
+        self.assertEqual(result["auxDeleted"], 1)
+        self.assertFalse((self.incoming / "IMG_1003.AAE").exists())
+
+    def test_ambiguous_aae_and_gopro_live_photo_proxies_stay_kept_after_promotion(self):
+        cases = {
+            "photos": ("HEIC", "JPG"), "videos": ("MOV", "MP4"),
+            "not-live": ("HEIC", "MP4"), "three": ("HEIC", "MOV", "MP4"),
+            "proxy": ("HEIC", "MOV"),
+        }
+        for stem, extensions in cases.items():
+            for extension in extensions:
+                (self.incoming / f"{stem}.{extension}").write_bytes(stem.encode())
+            for extension in (("THM", "LRV") if stem == "proxy" else ("AAE",)):
+                (self.incoming / f"{stem}.{extension}").write_bytes(b"aux")
+        self.run_job("scan", worker.scan_incoming)
+        files = self.files()
+        for stem, extensions in cases.items():
+            for extension in extensions:
+                row = files[f"{stem}.{extension}"]
+                for entry in json.loads(row["companions"]):
+                    # LRV has a single video candidate even in a photo+MOV pair.
+                    if entry["kind"] == "lrv":
+                        continue
+                    self.assertEqual(entry["disposition"], "keep")
+                    self.assertEqual(entry["reason"], "원본 후보가 여러 개입니다.")
+                    self.assertNotIn("fingerprint", entry)
+            ready, = [row for row in files.values() if Path(row["path"]).stem == stem and row["status"] == "ready"]
+            # Remove the earlier copy and refresh the group, including video-only groups.
+            (self.incoming / ready["path"]).unlink()
+            with catalog.database(write=True) as db:
+                db.execute("UPDATE scan_files SET status='deleted' WHERE id=?", (ready["id"],))
+            worker.refresh_deleted_group(self.managed, ready["sha"])
+            promoted, = [row for row in self.files().values() if Path(row["path"]).stem == stem and row["status"] == "ready"]
+            for entry in json.loads(promoted["companions"]):
+                if entry["kind"] != "lrv":
+                    self.assertEqual(entry["disposition"], "keep")
+                    self.assertNotIn("fingerprint", entry)
+            result = self.move(promoted["path"])
+            self.assertEqual(result["moved"], 1)
+            for entry in result["items"][0].get("companions", []):
+                if entry["kind"] != "lrv":
+                    self.assertEqual(entry["disposition"], "keep")
+                    self.assertTrue((self.incoming / entry["path"]).is_file())
+
+    def test_aae_exact_extension_matches_only_named_source_and_never_falls_back(self):
+        for name in ("IMG_2001.HEIC", "IMG_2001.JPG", "IMG_2001.HEIC.AAE",
+                     "MISSING.JPG", "MISSING.HEIC.AAE", "clip.MOV", "clip.MOV.aae"):
+            (self.incoming / name).write_bytes(name.encode())
+        result = self.run_job("scan", worker.scan_incoming)
+        self.assertEqual([entry["path"] for entry in result["unmatchedCompanions"]], ["MISSING.HEIC.AAE"])
+        self.assertEqual(json.loads(self.files()["IMG_2001.JPG"]["companions"]), [])
+        for name in ("IMG_2001.HEIC", "clip.MOV"):
+            entry, = json.loads(self.files()[name]["companions"])
+            self.assertEqual(entry["path"].casefold(), (name + ".aae").casefold())
+        result = self.move("IMG_2001.HEIC", "clip.MOV")
+        self.assertEqual(result["auxDeleted"], 2)
+        self.assertTrue((self.incoming / "MISSING.HEIC.AAE").is_file())
+        self.assertFalse((self.incoming / "IMG_2001.HEIC.AAE").exists())
+        self.assertFalse((self.incoming / "clip.MOV.aae").exists())
+
+    def test_orphan_aae_and_gl_aae_do_not_match_gopro_original(self):
+        for name in ("GH010636.MP4", "GL010636.AAE", "orphan.AAE"):
+            (self.incoming / name).write_bytes(name.encode())
+        result = self.run_job("scan", worker.scan_incoming)
+        self.assertEqual(json.loads(self.files()["GH010636.MP4"]["companions"]), [])
+        self.assertEqual([entry["path"] for entry in result["unmatchedCompanions"]], ["GL010636.AAE", "orphan.AAE"])
+        for entry in result["unmatchedCompanions"]:
+            self.assertEqual(entry["disposition"], "keep")
+            self.assertEqual(entry["reason"], "연결할 원본을 찾지 못했습니다.")
+            self.assertNotIn("fingerprint", entry)
+        self.assertEqual(self.move("GH010636.MP4")["moved"], 1)
+        self.assertTrue((self.incoming / "GL010636.AAE").is_file())
+        self.assertTrue((self.incoming / "orphan.AAE").is_file())
+
+    def test_changed_symlinked_and_absent_aae_are_not_counted_as_deleted(self):
+        for stem in ("changed", "symlinked", "absent"):
+            (self.incoming / f"{stem}.HEIC").write_bytes(stem.encode())
+            (self.incoming / f"{stem}.AAE").write_bytes(b"apple edits")
+        self.run_job("scan", worker.scan_incoming)
+        changed = self.incoming / "changed.AAE"
+        changed.write_bytes(b"new edits")
+        linked = self.incoming / "symlinked.AAE"
+        linked.unlink()
+        target = self.managed.parent / "protected.AAE"
+        target.write_bytes(b"outside edits")
+        linked.symlink_to(target)
+        (self.incoming / "absent.AAE").unlink()
+        for stem in ("changed", "symlinked", "absent"):
+            result = self.move(f"{stem}.HEIC")
+            self.assertEqual(result["moved"], 1)
+            self.assertNotIn("auxDeleted", result)
+            entry, = result["items"][0]["companions"]
+            self.assertEqual(entry["disposition"], "absent" if stem == "absent" else "review")
+            if stem != "absent":
+                self.assertEqual(result["companionReview"], 1)
+        self.assertEqual(changed.read_bytes(), b"new edits")
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(target.read_bytes(), b"outside edits")
+
+    def test_photo_delete_preserves_aae(self):
+        (self.incoming / "discard.HEIC").write_bytes(b"photo")
+        sidecar = self.incoming / "discard.AAE"
+        sidecar.write_bytes(b"apple edits")
+        self.run_job("scan", worker.scan_incoming)
+        result = self.run_job("delete", worker.delete_selection, {"ids": [self.files()["discard.HEIC"]["id"]]})
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["items"][0]["companions"][0]["disposition"], "keep")
+        self.assertEqual(sidecar.read_bytes(), b"apple edits")
 
     def test_deleted_incoming_preserves_remote_and_archive_thumbnail_references(self):
         for source in ('remote', 'archive'):

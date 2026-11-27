@@ -75,6 +75,7 @@ class UploadTests(unittest.TestCase):
         for extension in (".dng", ".raw", ".exe"):
             response = self.client.post("/api/incoming/uploads", json={"name": "a" + extension, "size": 1})
             self.assertEqual(response.status_code, 415)
+            self.assertIn("AAE", response.json()["detail"])
             self.assertEqual(response.headers["cache-control"], "no-store")
             self.assertEqual(response.headers["x-content-type-options"], "nosniff")
         for size in (0, -1, True, 1.5):
@@ -84,6 +85,16 @@ class UploadTests(unittest.TestCase):
             self.assertEqual(self.client.post("/api/incoming/uploads", json={"name": "a.jpg", "size": 4}).status_code, 413)
         self.assertEqual(self.client.get(self.url("../bad")).status_code, 404)
         self.assertEqual(self.client.get(self.url("bad")).status_code, 400)
+
+    def test_aae_uploads_are_published_as_companions_case_insensitively(self):
+        for extension in (".aae", ".AAE"):
+            with self.subTest(extension=extension):
+                upload_id = self.create("edits" + extension)
+                self.assertEqual(self.put(upload_id, b"abcdef").status_code, 200)
+                response = self.complete(upload_id)
+                self.assertEqual(response.status_code, 201, response.text)
+                self.assertEqual(response.json()["kind"], "companion")
+                self.assertEqual((self.incoming / response.json()["path"]).read_bytes(), b"abcdef")
 
     def test_path_hidden_unicode_and_symlink_security(self):
         for name in ("", ".", "..", ".a.jpg", "._a.jpg", "a/b.jpg", "a\\b.jpg", "a:.jpg", "x\x00.jpg", " .jpg", "가" * 74 + ".jpg"):

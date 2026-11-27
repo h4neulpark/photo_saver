@@ -108,7 +108,7 @@ class IncomingCleanupTests(unittest.TestCase):
         self.add_remote("other-storage.MP4", storage_id="different-omv")
         self.add_remote("other-root.MP4", archive_root="/previous-root")
         self.add_remote("unverified.MP4", verified=False)
-        sidecars = [source.with_suffix(extension) for extension in (".xmp", ".THM", ".LRV")]
+        sidecars = [source.with_suffix(extension) for extension in (".xmp", ".THM", ".LRV", ".AAE")]
         for sidecar in sidecars:
             sidecar.write_bytes(b"sidecar")
         with catalog.database(write=True) as db:

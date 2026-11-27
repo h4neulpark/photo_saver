@@ -138,6 +138,33 @@ test('ambiguous stems remain unchanged while exact companions map to their own s
   assert.deepEqual(api.created.map(item => item.name), ['IMG.HEIC', 'IMG.MOV', 'IMG.xmp', 'IMG (1).HEIC.xmp']);
 });
 
+test('AAE uploads follow a single renamed source by stem and exact filename', async () => {
+  const h = ready();
+  const api = server(h, (url, opts, sessions) => {
+    if (url.endsWith('/complete')) {
+      const session = sessions.get(url.split('/')[4]);
+      if (session.name === 'IMG_0001.HEIC') return reply({ name: 'IMG_0001 (1).HEIC', renamed: true }, 201);
+    }
+  });
+  await h.startIncomingUpload([file('IMG_0001.AAE'), file('IMG_0001.HEIC.AAE'), file('IMG_0001.HEIC')]);
+  assert.deepEqual(api.created.map(item => item.name), ['IMG_0001.HEIC', 'IMG_0001 (1).AAE', 'IMG_0001 (1).HEIC.AAE']);
+  assert.deepEqual(Array.from(h.view.deviceUpload.results, item => item.status), ['done', 'done', 'done']);
+});
+
+test('Live Photo AAE stems stay unchanged while exact AAE names follow each renamed source', async () => {
+  const h = ready();
+  const api = server(h, (url, opts, sessions) => {
+    if (url.endsWith('/complete')) {
+      const session = sessions.get(url.split('/')[4]);
+      if (session.name === 'IMG.HEIC') return reply({ name: 'IMG (1).HEIC', renamed: true }, 201);
+      if (session.name === 'IMG.MOV') return reply({ name: 'IMG (2).MOV', renamed: true }, 201);
+    }
+  });
+  await h.startIncomingUpload([file('IMG.AAE'), file('IMG.HEIC.AAE'), file('IMG.MOV.aae'), file('IMG.MOV'), file('IMG.HEIC')]);
+  assert.deepEqual(api.created.map(item => item.name), ['IMG.HEIC', 'IMG.MOV', 'IMG.AAE', 'IMG (1).HEIC.AAE', 'IMG (2).MOV.aae']);
+  assert.ok(Array.from(h.view.deviceUpload.results).every(item => item.status === 'done'));
+});
+
 test('transient network failure synchronizes GET offset before resuming', async () => {
   const h = ready();
   let failed = false;

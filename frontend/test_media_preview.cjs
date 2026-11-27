@@ -1058,6 +1058,7 @@ test('duplicate cleanup sends only removals after choosing an Incoming keeper an
   });
   await h.confirmIncomingCleanup();
   assert.equal(h.dialog.open, true);
+  assert.match(h.dialog.textContent, /Incoming에 남아 있는 XMP와 보조 파일\(THM·LRV·AAE\)은 보존합니다\./);
   assert.match(h.dialog.textContent, /DCIM\/a.xmp.*Incoming에 보존/);
   assert.match(h.dialog.textContent, /사본을 확인할 수 없습니다/);
   assert.match(h.dialog.querySelector('#cleanup-summary').textContent, /정리 2개.*보류 1개/);
@@ -1070,6 +1071,28 @@ test('duplicate cleanup sends only removals after choosing an Incoming keeper an
   await flushMicrotasks();
   const jobRequest = h.fetchCalls.find(call => call.url === '/api/jobs/duplicate-cleanup');
   assert.deepEqual(JSON.parse(jobRequest.opts.body), { items: [{ id: 'a', keeperKind: 'incoming', keeperId: 'b' }] });
+});
+
+test('AAE companions, auxiliary count fallback and move completion name all auxiliary types', () => {
+  const h = createHarness();
+  h.win.dispatchHashChange('#incoming');
+  h.state.incoming = [
+    makeIncoming('apple', { name: 'IMG.HEIC', companions: [{ path: 'DCIM/IMG.AAE', kind: 'aae', disposition: 'delete-after-move' }] }),
+    makeIncoming('fallback', { cameraAuxCount: 2 }),
+  ];
+  h.render();
+  assert.match(h.page.querySelector('[data-item-key="apple"]').textContent, /IMG\.AAE/);
+  assert.match(h.page.querySelector('[data-item-key="fallback"]').textContent, /THM·LRV·AAE 2개 원본 이동 후 정리/);
+  h.openIncomingPreview('apple');
+  assert.match(h.mediaPreview.textContent, /IMG\.AAE/);
+  h.closeMediaPreview();
+  h.state.latestIncomingResult = {
+    id: 77, kind: 'move', status: 'done',
+    result: { moved: 1, auxDeleted: 2, items: [{ path: 'IMG.HEIC', status: 'moved', companions: [{ path: 'IMG.AAE', kind: 'aae', disposition: 'deleted' }] }] },
+  };
+  h.render();
+  assert.match(h.page.querySelector('.incoming-result').textContent, /THM·LRV·AAE 2개 삭제\./);
+  assert.match(h.page.querySelector('.incoming-result').textContent, /IMG\.AAE/);
 });
 
 test('a new scan shows stage progress while the latest processing result remains available', () => {

@@ -461,15 +461,20 @@ class MediaPreviewTests(unittest.TestCase):
         self.add_managed("bad-xmp", "bad-xmp/a.xmp", kind="photo")
         self.add_managed("bad-thm", "bad-thm/a.thm", kind="photo")
         self.add_managed("bad-lrv", "bad-lrv/a.lrv", kind="video")
+        self.add_managed("bad-aae", "bad-aae/a.aae", kind="photo")
         self.add_managed("bad-kind-1", "bad-kind-1/a.mp4", kind="photo")
         self.add_managed("bad-kind-2", "bad-kind-2/a.jpg", kind="video")
-        for file_id in ("bad-xmp", "bad-thm", "bad-lrv", "bad-kind-1", "bad-kind-2"):
+        for file_id in ("bad-xmp", "bad-thm", "bad-lrv", "bad-aae", "bad-kind-1", "bad-kind-2"):
             res = run_request("GET", f"/api/managed/{file_id}/original")
             self.assertEqual(res["status"], 415, file_id)
             self.assert_media_headers(res["headers"])
             head = run_request("HEAD", f"/api/managed/{file_id}/original")
             self.assertEqual(head["status"], 415, file_id)
             self.assertEqual(head["total_bytes"], 0)
+
+        res = run_request("GET", "/api/managed/bad-aae/preview")
+        self.assertEqual(res["status"], 415)
+        self.assert_media_headers(res["headers"])
 
         # Permission error -> 403 without exposing internal path or raw message
         self.add_managed("perm", "perm/photo.jpg")

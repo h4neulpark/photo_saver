@@ -74,7 +74,7 @@ def validate_name(value):
     if not name or name.startswith(".") or UNSAFE.search(name) or len(name.encode("utf-8")) > 220 or Path(name).stem.strip() in ("", ".", ".."):
         raise HTTPException(400, "파일 이름을 확인하세요. 숨김 파일과 특수 문자는 사용할 수 없습니다.")
     if Path(name).suffix.lower() not in UPLOAD_EXTENSIONS:
-        raise HTTPException(415, "지원하지 않는 형식입니다. JPG·PNG·WEBP·HEIC·HEIF·MP4·MOV·XMP·THM·LRV 파일을 선택하세요.")
+        raise HTTPException(415, "지원하지 않는 형식입니다. JPG·PNG·WEBP·HEIC·HEIF·MP4·MOV·XMP·THM·LRV·AAE 파일을 선택하세요.")
     return name
 
 
